@@ -12,25 +12,107 @@ import torch
 from aircolibri_cli.thought_buffer import _auxiliary_forwards, capture_cache_snapshot, restore_cache_snapshot
 
 
+def _iter_q1_modules(model):
+    from src.quantized_projection import PackedLinear
+    from src.q1_cube_engine import Q1StreamedLinear
+
+    types_list = [PackedLinear, Q1StreamedLinear]
+    try:
+        from src.ideal_q1_engine import IdealQ1Linear
+        types_list.append(IdealQ1Linear)
+    except ImportError:
+        pass
+    cls_tuple = tuple(types_list)
+    return [m for m in model.modules() if isinstance(m, cls_tuple)]
+
+
+class Q1SkeletonDrafter:
+    """Lossless-speculation skeleton drafter using truncated MSB Q1 planes (P=2)."""
+
+    def __init__(self, runtime, active_planes: int = 2):
+        self.runtime = runtime
+        self.active_planes = int(active_planes)
+
+    @property
+    def supported(self) -> bool:
+        return bool(_iter_q1_modules(self.runtime.engine.model))
+
+    @torch.no_grad()
+    def draft(self, last_token: int, past, cursor: int, count: int) -> tuple[list[int], list[float]]:
+        if count <= 0:
+            return [], []
+        targets = _iter_q1_modules(self.runtime.engine.model)
+        if not targets:
+            return [], []
+        eng = self.runtime.engine
+        tokens: list[int] = []
+        probs: list[float] = []
+        with _auxiliary_forwards(self.runtime):
+            snap = capture_cache_snapshot(past)
+            try:
+                for mod in targets:
+                    bits_val = getattr(mod, "bits", None)
+                    if bits_val == 1 or bits_val is None:
+                        total_p = (
+                            getattr(mod, "total_planes", None)
+                            or getattr(mod, "q1_planes", None)
+                            or getattr(mod, "planes", None)
+                            or bits_val
+                            or self.active_planes
+                        )
+                    else:
+                        total_p = bits_val
+                    mod.active_planes = min(self.active_planes, int(total_p))
+                cur_tok = int(last_token)
+                cur_pos = int(cursor)
+                draft_past = past
+                for _ in range(count):
+                    logits, draft_past = eng._forward_step(
+                        torch.tensor([[cur_tok]], dtype=torch.long),
+                        draft_past,
+                        cache_position=torch.tensor([cur_pos], dtype=torch.long),
+                        prefill=False,
+                        prefill_end=False,
+                        return_all_logits=False,
+                        prefetch_next=False,
+                    )
+                    row = logits[0, -1, :] if logits.ndim == 3 else logits[0]
+                    row_f = row.float()
+                    next_tok = int(row_f.argmax().item())
+                    max_logit = float(row_f[next_tok].item())
+                    p = float((1.0 / torch.exp(row_f - max_logit).sum()).item())
+                    tokens.append(next_tok)
+                    probs.append(max(0.05, min(0.99, p)))
+                    cur_tok = next_tok
+                    cur_pos += 1
+            finally:
+                for mod in targets:
+                    mod.active_planes = None
+                restore_cache_snapshot(past, snap)
+        return tokens, probs
+
+
 class GeneralSpeculation:
     def __init__(self, runtime, mode="auto", head_path=None, head_budget_bytes=128*2**20):
         from src.aircolibri_integrated import _NORM_WEIGHT_CANDIDATES
         self.runtime, self.mode = runtime, mode
         self.native = None
         self.native_error = None
+        self.q1_drafter = Q1SkeletonDrafter(runtime, active_planes=2) if mode in ("auto", "q1") else None
         self.counters = Counter()
         self.state_budget_bytes = 64*2**20
         self.snapshot_peak_bytes = 0
         self.hidden = None
         self.capturing = False
         self.hook = None
+        self._draft_ctx = None
         modules = dict(runtime.engine.model.named_modules())
         for candidate in _NORM_WEIGHT_CANDIDATES:
             norm = modules.get(candidate.removesuffix(".weight"))
             if norm is not None:
                 self.hook = norm.register_forward_hook(self._capture)
                 break
-        if mode != "lookup":
+        if mode not in ("lookup", "q1", "off"):
             source = runtime.engine.model_source
             available = head_path is not None or (hasattr(source, "mtp_entries") and bool(source.mtp_entries()))
             if available:
@@ -45,6 +127,9 @@ class GeneralSpeculation:
             elif mode == "native":
                 self.close()
                 raise FileNotFoundError("Native speculation requires trained MTP weights; supply --mtp-head")
+        if mode == "q1" and not self.q1_drafter.supported:
+            self.close()
+            raise NotImplementedError("Q1 speculation requires PackedLinear or Q1StreamedLinear layers")
         if self.native is not None and self.hook is None:
             self.close()
             raise NotImplementedError("Cannot locate the native head's backbone hidden-state boundary")
@@ -65,13 +150,34 @@ class GeneralSpeculation:
         finally:
             self.capturing = False
 
-    def propose(self, history, count, native_ready):
+    def propose(self, history, count, native_ready, *, past=None, cursor=None, gate=None):
         from aircolibri_cli.unified_runtime import ColibriSpecGate, colibri_spec_lookup
-        if native_ready:
+        if self._draft_ctx is not None and past is None and cursor is None and gate is None:
+            past, cursor, gate = self._draft_ctx
+        src_q1 = getattr(ColibriSpecGate, "SRC_Q1", 2)
+        if self.mode == "off" or count <= 0:
+            return [], [], ColibriSpecGate.SRC_LOOKUP
+        if native_ready and self.mode in ("auto", "native"):
             tokens, probs = self.native.draft(count)
             return tokens, probs, ColibriSpecGate.SRC_MTP
-        tokens = colibri_spec_lookup(history, max_drafts=count)
-        return tokens, [0.75]*len(tokens), ColibriSpecGate.SRC_LOOKUP
+        if self.mode != "q1":
+            tokens = colibri_spec_lookup(history, max_drafts=count)
+            if tokens:
+                return tokens, [0.75]*len(tokens), ColibriSpecGate.SRC_LOOKUP
+        if self.mode in ("auto", "q1") and self.q1_drafter is not None and self.q1_drafter.supported and history and cursor is not None:
+            eng_dev = getattr(getattr(self.runtime.engine, "device", None), "type", "cpu")
+            allow_q1 = self.mode == "q1" or (
+                eng_dev == "cuda"
+                and (gate is None or not hasattr(gate, "expected_gain") or gate.expected_gain(src_q1, [0.72]*count) > 1.02)
+            )
+            if allow_q1:
+                try:
+                    tokens, probs = self.q1_drafter.draft(history[-1], past, cursor, count)
+                    if tokens:
+                        return tokens, probs, src_q1
+                except (NotImplementedError, torch.cuda.OutOfMemoryError):
+                    self.counters["q1_unsupported_steps"] += 1
+        return [], [], ColibriSpecGate.SRC_LOOKUP
 
     def _boundary(self, past):
         progressive = getattr(self.runtime.engine, "progressive", None)
@@ -184,15 +290,24 @@ class GeneralSpeculation:
                         depth = 0
                         self.counters["decoder_contract_plain_steps"] += 1
                     t_draft = time.perf_counter()
-                    drafts, probs, source = self.propose(all_ids, depth, native_ready)
-                    gate.record_draft_cost(source, time.perf_counter()-t_draft)
-                    depth = min(len(drafts), gate.pick_depth(source, probs)) if drafts else 0
+                    self._draft_ctx = (past, cursor, gate)
+                    try:
+                        drafts, probs, source = self.propose(all_ids, depth, native_ready)
+                    finally:
+                        self._draft_ctx = None
+                    gate_src = source if source < len(gate.d) else gate.SRC_LOOKUP
+                    gate.record_draft_cost(gate_src, time.perf_counter()-t_draft)
+                    depth = min(len(drafts), gate.pick_depth(gate_src, probs)) if drafts else 0
                     drafts, probs = drafts[:depth], probs[:depth]
                     snapshot = None
                     if depth:
                         try:
                             needed = self._snapshot_bytes(past)
-                            while depth and needed*(depth+1) > self.state_budget_bytes:
+                            contour = getattr(u, "stanok_contour", None)
+                            while depth and (
+                                needed * (depth + 1) > self.state_budget_bytes
+                                or (contour is not None and not contour.can_admit_bytes(needed * (depth + 1)))
+                            ):
                                 depth -= 1
                                 drafts, probs = drafts[:depth], probs[:depth]
                             if not depth:
@@ -248,11 +363,17 @@ class GeneralSpeculation:
                         routes.commit_capture(route_trace, keep)
                     gate.record_forward(len(inputs), time.perf_counter()-t_forward)
                     if depth:
-                        gate.record_result(source, min(depth, accepted+1), accepted, probs)
+                        gate.record_result(gate_src, min(depth, accepted+1), accepted, probs)
                         self.counters["verified_batches"] += 1
                         self.counters["drafts_proposed"] += depth
                         self.counters["drafts_accepted"] += accepted
-                        self.counters["native_batches" if source == gate.SRC_MTP else "lookup_batches"] += 1
+                        src_q1 = getattr(gate, "SRC_Q1", 2)
+                        if source == gate.SRC_MTP:
+                            self.counters["native_batches"] += 1
+                        elif source == src_q1:
+                            self.counters["q1_batches"] += 1
+                        else:
+                            self.counters["lookup_batches"] += 1
                     if native_ready:
                         # The next token for the final committed hidden state is
                         # either the mismatch/bonus or the terminal accepted EOS.
@@ -271,7 +392,9 @@ class GeneralSpeculation:
                 decode_s = time.perf_counter()-started
                 metrics = gate.summary()
                 metrics.update({key: self.counters[key]-before[key] for key in self.counters})
-                metrics.update(source="native_mtp" if native_ready else "prompt_lookup", native_head_rows=native_rows)
+                q1_used = (self.counters.get("q1_batches", 0) - before.get("q1_batches", 0)) > 0
+                src_name = "native_mtp" if native_ready else ("q1_skeleton" if (self.mode == "q1" or q1_used) else "prompt_lookup")
+                metrics.update(source=src_name, native_head_rows=native_rows)
                 yield {"kind": "final_state", "all_ids": all_ids, "past": past, "last_fed_h": None,
                        "consumed_tokens": cursor, "prefill_ms": prefill_ms, "decode_s": decode_s,
                        "decode_tokens": generated-1, "backbone_passes": passes, "spec_gate": metrics}
@@ -283,9 +406,11 @@ class GeneralSpeculation:
                 routes.cancel_capture()
 
     def stats(self):
-        return dict(self.counters, enabled=True, source="native_mtp" if self.native else "prompt_lookup",
+        src_name = "native_mtp" if self.native else ("q1_skeleton" if (self.mode == "q1" or self.counters.get("q1_batches", 0) > 0) else "prompt_lookup")
+        return dict(self.counters, enabled=self.mode != "off", source=src_name,
                     batching_supported=self.rowwise.supported,
                     native_head_bytes=self.native.weight_bytes if self.native else 0,
+                    q1_draft_supported=bool(self.q1_drafter and self.q1_drafter.supported),
                     state_budget_bytes=self.state_budget_bytes, snapshot_peak_bytes=self.snapshot_peak_bytes,
                     native_head_error=self.native_error)
 

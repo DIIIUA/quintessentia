@@ -34,6 +34,17 @@ import time
 import traceback
 from typing import Any
 import uuid
+from .runtime_config import model_context_limit
+
+
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    # Windows SO_REUSEADDR permits two active listeners and routes clients to the stale model.
+    allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 DISCOVER_MAGIC = b"AIRCOLIBRI_DISCOVER?"
@@ -438,7 +449,6 @@ async function sendPrompt() {
 
 DEFAULT_MAX_REQUEST_BYTES = 8 * 1024 * 1024
 DEFAULT_LOG_FILE = "logs/server.log"
-MAX_TOKENS_LIMIT = 32768
 
 
 class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -782,11 +792,7 @@ class AirColibriLANServer:
                     if not self._check_auth():
                         return
                     snap = srv.engine.status_snapshot() if hasattr(srv.engine, "status_snapshot") else {}
-                    max_ctx = int(
-                        (snap.get("vram_plan") or {}).get("max_context_tokens")
-                        or getattr(getattr(srv.engine, "plan", None), "max_context_tokens", 8192)
-                        or 8192
-                    )
+                    max_ctx = model_context_limit(getattr(srv.engine, "engine", srv.engine))
                     if path == "/api/v0/models":
                         self._send_json(
                             {
@@ -797,8 +803,10 @@ class AirColibriLANServer:
                                         "object": "model",
                                         "type": "llm",
                                         "state": "loaded",
-                                        "max_context_length": max_ctx,
-                                        "loaded_context_length": max_ctx,
+                                        "max_context_length": None,
+                                        "native_context_length": max_ctx,
+                                        "context_limit_enforced": False,
+                                        "loaded_context_length": None,
                                     }
                                 ],
                             }
@@ -813,8 +821,10 @@ class AirColibriLANServer:
                                     "object": "model",
                                     "created": srv.started_at,
                                     "owned_by": "aircolibri-lan",
-                                    "context_length": max_ctx,
-                                    "max_model_len": max_ctx,
+                                    "context_length": None,
+                                    "native_context_length": max_ctx,
+                                    "context_limit_enforced": False,
+                                    "max_model_len": None,
                                 }
                             ],
                         }
@@ -825,18 +835,14 @@ class AirColibriLANServer:
                     if not self._check_auth():
                         return
                     snap = srv.engine.status_snapshot() if hasattr(srv.engine, "status_snapshot") else {}
-                    max_ctx = int(
-                        (snap.get("vram_plan") or {}).get("max_context_tokens")
-                        or getattr(getattr(srv.engine, "plan", None), "max_context_tokens", 8192)
-                        or 8192
-                    )
+                    max_ctx = model_context_limit(getattr(srv.engine, "engine", srv.engine))
                     if path == "/api/extra/true_max_context_length":
-                        self._send_json({"value": max_ctx})
+                        self._send_json({"value": None, "native_context_length": max_ctx, "context_limit_enforced": False})
                         return
                     self._send_json(
                         {
                             "default_generation_settings": {
-                                "n_ctx": max_ctx,
+                                "n_ctx": None,
                                 "model": srv.engine.model_id,
                             },
                             "total_slots": 1,
@@ -897,7 +903,9 @@ class AirColibriLANServer:
                 except (TypeError, ValueError):
                     self._send_error(HTTPStatus.BAD_REQUEST, "`max_tokens` must be an integer")
                     return
-                max_tokens = max(1, min(MAX_TOKENS_LIMIT, max_tokens))
+                if max_tokens < 1:
+                    self._send_error(HTTPStatus.BAD_REQUEST, "`max_tokens` must be positive")
+                    return
                 stream = bool(body.get("stream", False))
                 enable_thinking = bool(body.get("enable_thinking", True))
                 use_session = bool(body.get("use_session_cache", True))
@@ -1056,7 +1064,7 @@ class AirColibriLANServer:
 
     def start_background(self) -> None:
         handler_cls = self._build_handler()
-        self._httpd = ThreadingHTTPServer((self.host, self.http_port), handler_cls)
+        self._httpd = _ExclusiveThreadingHTTPServer((self.host, self.http_port), handler_cls)
         self._httpd.daemon_threads = True
         self.http_port = int(self._httpd.server_address[1])
         if self.enable_beacon:

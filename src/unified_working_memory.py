@@ -16,6 +16,73 @@ from src.bounded_memory_manager import SlotArenaLayout, align_up
 from src.quantized_projection import packed_specs
 
 
+class _MockCudaEvent:
+    """CPU stand-in for torch.cuda.Event when allow_cpu_mock=True."""
+
+    def __init__(self, enable_timing=False):
+        self.enable_timing = enable_timing
+        self._signaled = True
+
+    def record(self, stream=None):
+        if stream is not None and hasattr(stream, 'enqueue_event'):
+            self._signaled = False
+            stream.enqueue_event(self)
+        else:
+            self._signaled = True
+
+    def query(self):
+        return self._signaled
+
+    def synchronize(self):
+        self._signaled = True
+
+    def complete(self):
+        self._signaled = True
+
+
+class CudaEventPool:
+    """Bounded pool of reusable CUDA events (enable_timing=False by default).
+
+    Tracks pool-created event IDs in `_owned_ids` so permanent slot/ring
+    events (e.g. RingSlot.compute_done_event) are never captured into the pool.
+    """
+
+    def __init__(self, device, max_pool_size=512, enable_timing=False):
+        self.device = device
+        self.max_pool_size = int(max_pool_size)
+        self.enable_timing = bool(enable_timing)
+        self._pool = []
+        self._owned_ids = set()
+        self.created = 0
+        self.reused = 0
+
+    def acquire(self, stream=None):
+        if self._pool:
+            ev = self._pool.pop()
+            self.reused += 1
+        else:
+            ev = (
+                torch.cuda.Event(enable_timing=self.enable_timing)
+                if self.device.type == 'cuda'
+                else _MockCudaEvent(enable_timing=self.enable_timing)
+            )
+            self._owned_ids.add(id(ev))
+            self.created += 1
+        if stream is not None:
+            ev.record(stream)
+        return ev
+
+    def release(self, ev):
+        if ev is None or id(ev) not in self._owned_ids:
+            return
+        if len(self._pool) < self.max_pool_size:
+            self._pool.append(ev)
+
+    def clear(self):
+        self._pool.clear()
+        self._owned_ids.clear()
+
+
 class UnifiedWorkingMemory:
     def __init__(self, pipeline, cache, extra_budget_bytes=0, min_region_experts=0):
         if pipeline.num_slots != 3 or pipeline.device.type != 'cuda':
@@ -28,9 +95,13 @@ class UnifiedWorkingMemory:
             raise ValueError('Negative preparation budget')
         self.device = pipeline.device
         self.cv = threading.Condition(threading.RLock())
+        self._waiters = 0
+        self.event_pool = CudaEventPool(self.device, max_pool_size=512, enable_timing=False)
         self.closed = False
         self.epoch = 0
         self.desired = set()
+        self.active_protected = set()
+        self.demand_inflight = 0
         self.directory = OrderedDict()
         self.access_clock = 0
         self.counts = Counter()
@@ -98,14 +169,33 @@ class UnifiedWorkingMemory:
         cache.shared_memory = self
         cache.num_slots = self.num_slots
 
+    def _notify_waiters(self):
+        if getattr(self, '_waiters', 0) > 0:
+            self.cv.notify_all()
+
     def _check(self):
         if self.closed:
             raise RuntimeError('Unified working memory is closed')
 
     def _fences(self, record):
-        record['readers'] = [e for e in record['readers'] if not e.query()]
-        return [e for e in [record['ready'], *record['readers']]
-                if e is not None and not e.query()]
+        pool = getattr(self, 'event_pool', None)
+        still = []
+        for e in record['readers']:
+            if e.query():
+                if pool is not None:
+                    pool.release(e)
+            else:
+                still.append(e)
+        record['readers'] = still
+        ready = record['ready']
+        if ready is not None and ready.query():
+            if pool is not None:
+                pool.release(ready)
+            record['ready'] = None
+            ready = None
+        if ready is not None:
+            return [ready, *still]
+        return list(still)
 
     def _views(self, record, host=False):
         cache_key = '_host_views' if host else '_gpu_views'
@@ -133,11 +223,12 @@ class UnifiedWorkingMemory:
     def _victim(self, key, protected, optional, auxiliary=False):
         preferred = int(key[0]) % 3
         choices = sorted(self.records, key=lambda r: (r['bank'] != preferred, r['pos']))
+        act_prot = getattr(self, 'active_protected', ())
         empty = [r for r in choices if r['key'] is None and not r['leases']]
         cold = [self.records[idx] for k, idx in self.directory.items()
-                if k not in protected and k not in self.desired and not self.records[idx]['leases']]
+                if k not in protected and k not in self.desired and k not in act_prot and not self.records[idx]['leases']]
         hot = [] if optional or auxiliary else [self.records[idx] for k, idx in self.directory.items()
-                if k not in protected and k in self.desired and not self.records[idx]['leases']]
+                if k not in protected and (k in self.desired or k in act_prot) and not self.records[idx]['leases']]
         for record in empty + cold + hot:
             if not optional or not self._fences(record):
                 return record
@@ -152,7 +243,8 @@ class UnifiedWorkingMemory:
             for src,dst in zip(packed,destinations)):
             raise ValueError('Packed expert shape/dtype mismatch')
         for event in self._fences(record):
-            stream.wait_event(event)
+            if stream is not None:
+                stream.wait_event(event)
         if record['key'] is not None:
             self.directory.pop(record['key'])
             self.counts['evictions'] += 1
@@ -160,33 +252,45 @@ class UnifiedWorkingMemory:
             # Optional writers are admitted only after prior H2D has finished,
             # so the pinned staging views can be overwritten on the CPU.
             packed = self._stage_packed(packed, record)
-        with torch.cuda.stream(stream):
-            start = torch.cuda.Event(enable_timing=True)
-            start.record(stream)
+        start = None
+        if self.device.type == 'cuda':
+            with torch.cuda.stream(stream):
+                if origin == 'prefetch' and getattr(self, 'enable_prefetch_timing', True):
+                    start = torch.cuda.Event(enable_timing=True)
+                    start.record(stream)
+                for dst, src in zip(destinations, packed):
+                    for name in dst:
+                        dst[name].copy_(src[name], non_blocking=True)
+                if origin == 'prefetch' and getattr(self, 'enable_prefetch_timing', True):
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record(stream)
+                else:
+                    event = self.event_pool.acquire(stream)
+        else:
             for dst, src in zip(destinations, packed):
                 for name in dst:
-                    dst[name].copy_(src[name], non_blocking=True)
-            event = torch.cuda.Event(enable_timing=True)
-            event.record(stream)
+                    dst[name].copy_(src[name], non_blocking=False)
+            event = self.event_pool.acquire(stream)
         if origin == 'prefetch':
             self._staging_complete(event)
         record.update(key=key, generation=record['generation']+1, ready=event,
                       readers=[], origin=origin, transfer_start=start,
                       last_used=-1,
-                      warm_epoch=self.epoch if key in self.desired else -1)
+                      warm_epoch=self.epoch if (key in self.desired or key in getattr(self, 'active_protected', ())) else -1)
         self.directory[key] = record['bank']*self.per_area + record['pos']
         self.area_writes[self.area_for(record)] += 1
         self.counts[origin+'_writes'] += 1
         self.counts[origin+'_bytes'] += self.expert_bytes
         return record
 
-    def set_desired(self, keys):
+    def set_desired(self, keys, active_protected=None):
         with self.cv:
             self._check()
             desired = set(keys)
             if len(desired) > self.num_slots-8:
                 raise ValueError('Preparation must leave eight demand/probe slots')
             self.desired = desired
+            self.active_protected = set(active_protected) if active_protected is not None else set()
             for key in self.desired:
                 if key in self.directory:
                     self.records[self.directory[key]]['warm_epoch'] = self.epoch
@@ -196,7 +300,7 @@ class UnifiedWorkingMemory:
         """Optional publisher; returns None when actual readers/DMA occupy space."""
         with self.cv:
             self._check()
-            if epoch != self.epoch or key not in self.desired:
+            if epoch != self.epoch or (key not in self.desired and key not in self.active_protected):
                 return 'stale', None
             if key in self.directory:
                 r = self.records[self.directory[key]]
@@ -216,19 +320,28 @@ class UnifiedWorkingMemory:
             events = [e for r in self.records if not r['leases'] and r['key'] not in self.desired
                       for e in self._fences(r)]
             if not events:
-                self.cv.wait_for(lambda: self.closed or cancelled() or any(not r['leases'] and
-                    (r['key'] is None or r['key'] not in self.desired) for r in self.records))
+                self._waiters += 1
+                try:
+                    self.cv.wait_for(lambda: self.closed or cancelled() or any(not r['leases'] and
+                        (r['key'] is None or r['key'] not in self.desired) for r in self.records))
+                finally:
+                    self._waiters -= 1
                 return
         events[0].synchronize()
 
     def _acquire(self, key, loader, protected, allow_evict, auxiliary):
-        stream = torch.cuda.current_stream(self.device)
+        stream = torch.cuda.current_stream(self.device) if self.device.type == 'cuda' else None if self.device.type == 'cuda' else None
         packed = None
         with self.cv:
             self._check()
             if key in self.directory:
                 return self._take(key, stream, allow_evict, auxiliary, hit=True)
-        packed = loader(*key)
+            self.demand_inflight += 1
+        try:
+            packed = loader(*key)
+        finally:
+            with self.cv:
+                self.demand_inflight -= 1
         with self.cv:
             self._check()
             if key in self.directory:
@@ -255,6 +368,7 @@ class UnifiedWorkingMemory:
         ready = record['ready']
         if ready is not None:
             if ready.query():
+                self.event_pool.release(ready)
                 record['ready'] = None
             else:
                 stream.wait_event(ready)
@@ -271,24 +385,54 @@ class UnifiedWorkingMemory:
         keys = [(int(layer), int(eid)) for eid in ids]
         if len(keys) > 8:
             raise ValueError('At most eight simultaneous expert readers')
-        acquired = []
+        stream = torch.cuda.current_stream(self.device) if self.device.type == 'cuda' else None
+        acquired = [None] * len(keys)
+        missing_idx = []
         try:
-            for key in keys:
-                acquired.append(self._acquire(key, loader, set(keys), allow_evict, auxiliary))
+            with self.cv:
+                self._check()
+                directory = self.directory
+                for idx, key in enumerate(keys):
+                    if key in directory:
+                        acquired[idx] = self._take(key, stream, allow_evict, auxiliary, hit=True)
+                    else:
+                        missing_idx.append(idx)
+            if missing_idx:
+                protected = set(keys)
+                for idx in missing_idx:
+                    acquired[idx] = self._acquire(keys[idx], loader, protected, allow_evict, auxiliary)
             yield acquired
         finally:
             with self.cv:
                 event = None
+                need_notify = False
                 for item in acquired:
+                    if item is None:
+                        continue
                     record = item['record']
                     if record is None:
                         continue
                     if event is None:
-                        event = torch.cuda.Event()
-                        event.record(torch.cuda.current_stream(self.device))
+                        cur_stream = torch.cuda.current_stream(self.device) if self.device.type == 'cuda' else None
+                        event = self.event_pool.acquire(cur_stream)
+                    if record['readers']:
+                        still = []
+                        for old_ev in record['readers']:
+                            if old_ev.query():
+                                self.event_pool.release(old_ev)
+                            else:
+                                still.append(old_ev)
+                        record['readers'] = still
                     record['readers'].append(event)
                     record['leases'] -= 1
-                self.cv.notify_all()
+                    self._on_lease_release(record)
+                    if record['leases'] == 0:
+                        need_notify = True
+                if need_notify:
+                    self._notify_waiters()
+
+    def _on_lease_release(self, record):
+        pass
 
     def dense_event(self, bank, kind):
         with self.cv:
@@ -309,6 +453,7 @@ class UnifiedWorkingMemory:
         with self.cv:
             self.epoch += 1
             self.desired.clear()
+            self.active_protected.clear()
             self.cv.notify_all()
 
     def stats(self):
@@ -332,12 +477,16 @@ class UnifiedWorkingMemory:
                 raise RuntimeError('Cannot close unified memory with active leases')
             self.closed = True
             self.cv.notify_all()
-        torch.cuda.synchronize(self.device)
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
         self.directory.clear()
         # Cached tensor views must not keep the arena alive after close.
         for record in self.records:
             record.pop('_gpu_views', None)
             record.pop('_host_views', None)
+            record['ready'] = None
+            record['readers'] = []
+        self.event_pool.clear()
         self.banks.clear()
         self.host_banks.clear()
         self.gpu = self.host = None

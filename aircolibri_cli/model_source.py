@@ -1116,6 +1116,8 @@ class _ParallelSliceStagingPool:
     ) -> list[tuple[str, int, int, int]]:
         if len(tasks) <= 1:
             return tasks
+        # Elevator sort by (file, offset) turns scattered expert reads into sequential sweeps.
+        tasks = sorted(tasks, key=lambda t: (t[0], t[1]))
         merged: list[tuple[str, int, int, int]] = []
         cur_p, cur_off, cur_dst, cur_n = tasks[0]
         for p, off, dst, n in tasks[1:]:

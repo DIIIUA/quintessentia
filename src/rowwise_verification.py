@@ -15,7 +15,7 @@ from aircolibri_cli.thought_buffer import capture_cache_snapshot
 class RowwiseVerification:
     # Other HF decoders can use different positional arguments, ALiBi/bias or
     # cache semantics. Keep ordinary decode until their row contract is covered.
-    SUPPORTED_TYPES = frozenset({"llama", "qwen2", "qwen3", "qwen3_5_text", "mamba", "mamba2",
+    SUPPORTED_TYPES = frozenset({"llama", "qwen2", "qwen3", "qwen3_5_text", "qwen3_5_moe_text", "mamba", "mamba2",
                                  "lfm2", "gemma2", "granitemoe", "olmoe"})
 
     def __init__(self, engine):

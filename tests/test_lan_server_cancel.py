@@ -222,19 +222,21 @@ def _get(port, path, headers=None, timeout=10):
 
 
 def test_context_discovery_endpoints_and_sse_disconnect_log(server, tmp_path):
+    from types import SimpleNamespace
     srv, eng = server(engine=FakeEngine(decode_steps=500, step_s=0.01))
+    eng.config = SimpleNamespace(max_position_embeddings=40960)
 
     st, m_v1 = _get(srv.http_port, "/v1/models")
-    assert st == 200 and m_v1["data"][0]["context_length"] == 8192 and m_v1["data"][0]["max_model_len"] == 8192
+    assert st == 200 and m_v1["data"][0]["context_length"] is None and m_v1["data"][0]["context_limit_enforced"] is False and m_v1["data"][0]["native_context_length"] == 40960
 
     st, m_lms = _get(srv.http_port, "/api/v0/models")
-    assert st == 200 and m_lms["data"][0]["max_context_length"] == 8192
+    assert st == 200 and m_lms["data"][0]["max_context_length"] is None
 
     st, props = _get(srv.http_port, "/props")
-    assert st == 200 and props["default_generation_settings"]["n_ctx"] == 8192
+    assert st == 200 and props["default_generation_settings"]["n_ctx"] is None
 
     st, kobold = _get(srv.http_port, "/api/extra/true_max_context_length")
-    assert st == 200 and kobold["value"] == 8192
+    assert st == 200 and kobold["value"] is None
 
     sock = _start_stream(srv.http_port, max_tokens=500)
     assert eng.first_token.wait(5)
@@ -245,3 +247,23 @@ def test_context_discovery_endpoints_and_sse_disconnect_log(server, tmp_path):
     assert "end cancelled" in log
     assert "end ok" not in log
 
+
+
+@pytest.mark.parametrize("requested", [40000, 1_000_000])
+def test_requested_output_is_not_silently_capped(server, requested):
+    class RecordingEngine(FakeEngine):
+        def stream_chat(self, *args, **kwargs):
+            self.requested = kwargs["max_new_tokens"]
+            yield from super().stream_chat(*args, **kwargs)
+    eng=RecordingEngine(decode_steps=1,step_s=0)
+    srv,_=server(engine=eng)
+    status,_=_post(srv.http_port,"/v1/chat/completions",{"messages":[{"role":"user","content":"hi"}],"max_tokens":requested})
+    assert status==200 and eng.requested==requested
+
+
+def test_second_server_cannot_shadow_the_loaded_model(server, tmp_path):
+    first,_=server(engine=FakeEngine())
+    second=AirColibriLANServer(FakeEngine(),host="127.0.0.1",http_port=first.http_port,enable_beacon=False,log_file=str(tmp_path/"second.log"))
+    try:
+        with pytest.raises(OSError):second.start_background()
+    finally:second.stop()

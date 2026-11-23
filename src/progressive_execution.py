@@ -64,6 +64,8 @@ class ProgressiveExecution:
         self.jobs = queue.Queue(maxsize=2)
         self.pending, self.ready, self.adopted = set(), {}, set()
         self.lock = threading.Lock()
+        self._read_lock = threading.Lock()
+        self._foreground_started = threading.Event()
         self.worker = None
         self.error = None
         self.gpu_enabled = bool(allow_gpu and torch.cuda.is_available())
@@ -83,10 +85,13 @@ class ProgressiveExecution:
         self.handles = []
         self.bound = {}
         self.deferred_warmup = None
-        for i, layer in enumerate(engine._decoder_layers()):
+        self._can_move_layer = True
+        layers = engine._decoder_layers()
+        self._num_layers = len(layers)
+        for i, layer in enumerate(layers):
             self.handles.append(layer.register_forward_pre_hook(self._before(i), with_kwargs=True))
             self.handles.append(layer.register_forward_hook(self._after(i)))
-        engine.active_slot_per_layer = [None] * len(engine._decoder_layers())
+        engine.active_slot_per_layer = [None] * self._num_layers
         engine._hook_handles = []
 
     def stats(self):
@@ -128,9 +133,12 @@ class ProgressiveExecution:
                     return
                 # Compile/load the original Colibri patch modules off the
                 # inference thread. A weight payload alone is not GPU readiness.
-                if self.engine.quant_bits:
+                if self.engine.quant_bits in (4, 6):
                     from src.colibri_nvrtc import get_kernels
                     get_kernels(self.gpu)
+                elif self.engine.quant_bits in (1, 2, 8):
+                    from src.colibri_q1_cube_nvrtc import get_q1_kernels
+                    get_q1_kernels(self.gpu)
                 if any(getattr(m, "_colibri_nvrtc_norm", False) for m in self.engine.model.modules()):
                     from src.colibri_deltanet_nvrtc import get_deltanet_kernels
                     get_deltanet_kernels(self.gpu)
@@ -143,20 +151,31 @@ class ProgressiveExecution:
                         return
                 stream = torch.cuda.Stream(device=self.gpu)
                 if self.global_payload is None:
+                    from src.aircolibri_integrated import _LM_HEAD_WEIGHT_CANDIDATES
+                    skip_head = bool(getattr(self.plan, 'streamed_lm_head', False))
+                    globals_src = (
+                        {k: v for k, v in self._globals.items() if k not in _LM_HEAD_WEIGHT_CANDIDATES}
+                        if skip_head else self._globals
+                    )
                     with torch.cuda.stream(stream):
-                        params = self._copy_payload(self._globals)
+                        params = self._copy_payload(globals_src)
                         buffers = self._copy_payload(self._buffers)
                     if params is None or buffers is None:
                         return
                     self.global_payload = (params, buffers)
                 stream.synchronize()
                 self.backend_ready.set()
+                ready_ts = time.perf_counter()
                 while not self.stopped.is_set():
-                    if len(self.ready) == self.plan.resident_layers:
+                    if getattr(self.engine, "puzzle_overlay", False) or len(self.ready) == self.plan.resident_layers:
                         from src.bounded_memory_manager import BoundedPinnedBufferPool
                         from src.gpu_ring_pipeline import GPURingPipeline
                         from src.aircolibri_integrated import _NoStreamingPipeline
-                        if self.plan.full_residency:
+                        if (
+                            self.plan.full_residency
+                            or getattr(self.plan, 'sub_layer_cubes', False)
+                            or getattr(self.engine, 'puzzle_overlay', False)
+                        ):
                             self.gpu_pipeline = _NoStreamingPipeline()
                         else:
                             self.gpu_pool = BoundedPinnedBufferPool(
@@ -171,8 +190,52 @@ class ProgressiveExecution:
                     try:
                         i, tensors = self.jobs.get(timeout=0.05)
                     except queue.Empty:
+                        dt = time.perf_counter() - ready_ts
+                        if not (
+                            (not self._foreground_started.is_set() and dt >= 0.35)
+                            or self.cpu_steps >= 1
+                            or (self.cpu_layers >= 1 and dt >= 0.35)
+                        ):
+                            continue
+                        next_i = None
+                        with self.lock:
+                            for idx in range(self.plan.resident_layers):
+                                if idx not in self.ready and idx not in self.pending:
+                                    next_i = idx
+                                    self.pending.add(idx)
+                                    break
+                        if next_i is None:
+                            continue
+                        i = tensors = None
+                        try:
+                            if self.stopped.is_set():
+                                continue
+                            cache_store = self.engine.weight_manager.ram_cache
+                            with self._read_lock:
+                                if self.stopped.is_set():
+                                    continue
+                                tensors = cache_store.get(next_i)
+                                if tensors is None:
+                                    tensors = self.engine.weight_manager.read_layer_tensors(
+                                        next_i, target_device=torch.device("cpu")
+                                    )
+                                    cache_store.put(next_i, tensors)
+                            if self.stopped.is_set():
+                                continue
+                            i = next_i
+                        finally:
+                            if i is None:
+                                with self.lock:
+                                    self.pending.discard(next_i)
+                        if i is None:
+                            continue
+                    if i >= self.plan.resident_layers or getattr(self.engine, "puzzle_overlay", False):
+                        with self.lock:
+                            self.pending.discard(i)
                         continue
-                    if i >= self.plan.resident_layers:
+                    with self.lock:
+                        already_ready = i in self.ready
+                    if already_ready:
                         with self.lock:
                             self.pending.discard(i)
                         continue
@@ -180,6 +243,8 @@ class ProgressiveExecution:
                         payload = self._copy_payload(tensors)
                     stream.synchronize()
                     if payload is None:
+                        with self.lock:
+                            self.pending.discard(i)
                         return
                     with self.lock:
                         self.ready[i] = payload
@@ -249,6 +314,7 @@ class ProgressiveExecution:
 
     def _before(self, i):
         def before(module, args, kwargs):
+            self._foreground_started.set()
             eng = self.engine
             if eng._step_cancel_check is not None:
                 eng._step_cancel_check()
@@ -258,14 +324,16 @@ class ProgressiveExecution:
             # at atomic adoption. Dense cache layers can follow readiness alone.
             moe = getattr(eng.model_source, "_expert_loader", None) is not None
             can_move_layer = (cache is None or hasattr(cache, "layers")) and not moe
+            self._can_move_layer = can_move_layer
             payload = self._gpu_payload(i) if can_move_layer else None
             cpu_payload = None
             if payload is None:
                 cache_store = eng.weight_manager.ram_cache
-                cpu_payload = cache_store.get(i)
-                if cpu_payload is None:
-                    cpu_payload = eng.weight_manager.read_layer_tensors(i, target_device=torch.device("cpu"))
-                    cache_store.put(i, cpu_payload)
+                with self._read_lock:
+                    cpu_payload = cache_store.get(i)
+                    if cpu_payload is None:
+                        cpu_payload = eng.weight_manager.read_layer_tensors(i, target_device=torch.device("cpu"))
+                        cache_store.put(i, cpu_payload)
                 # Make weights available before arithmetic on either device.
                 self._offer(i, cpu_payload)
                 payload = self._gpu_payload(i) if can_move_layer else None
@@ -301,9 +369,17 @@ class ProgressiveExecution:
                 for n, t in list(module.named_parameters()):
                     if not t.is_meta:
                         set_module_tensor_to_device(module, n, "meta", clear_cache=False)
+                from src.quantized_projection import PACKED_FIELDS
                 for n, t in list(module.named_buffers()):
-                    if n.rsplit(".", 1)[-1] in ("packed_lo", "packed_hi", "qscale", "qzero"):
+                    if n.rsplit(".", 1)[-1] in PACKED_FIELDS:
                         set_module_tensor_to_device(module, n, "meta", clear_cache=False)
+                return move_tensors(output, torch.device("cpu"))
+            next_idx = i + 1
+            if (next_idx < self._num_layers
+                    and self._can_move_layer
+                    and (self.plan is None or next_idx < self.plan.resident_layers)
+                    and self._gpu_payload(next_idx) is not None):
+                return output
             # Until global adoption the HF backbone's masks/rotary/norm live on CPU.
             return move_tensors(output, torch.device("cpu"))
         return after
@@ -328,8 +404,9 @@ class ProgressiveExecution:
             live = current.to(self.gpu) if not current.is_meta else t
             set_module_tensor_to_device(eng.model, n, self.gpu, value=live, dtype=t.dtype, clear_cache=False)
         self.global_payload = None
+        is_puzzle = bool(getattr(eng, "puzzle_overlay", False))
         eng.device = self.gpu
-        eng.vram_resident_layers = self.plan.resident_layers
+        eng.vram_resident_layers = 0 if is_puzzle else self.plan.resident_layers
         eng.num_slots = self.plan.ring_slots
         eng.tail_to_head_prefetch = self.plan.ring_slots > 1 and not self.plan.full_residency
         if self.gpu_pool is not None:
@@ -345,11 +422,30 @@ class ProgressiveExecution:
             eng.model_source.prepare_model(eng.model, device=self.gpu, dtype=eng.dtype,
                                            expert_cache_bytes=expert_budget, quant_bits=eng.quant_bits)
             new_cache = getattr(eng.model_source, "_expert_loader", None)
+            if eng.quant_bits == 1 and hasattr(new_cache, "set_q1_planes"):
+                new_cache.set_q1_planes(getattr(eng, "q1_planes", 1))
             if seeds is not None and hasattr(new_cache, "adopt_cpu_packed"):
                 new_cache.adopt_cpu_packed(seeds)
         from src.colibri_deltanet_nvrtc import install_deltanet_nvrtc_kernels
         install_deltanet_nvrtc_kernels(eng.model, patch_norms=True, patch_zero_centered_norm=True)
-        eng._install_pipeline_hooks()
+        sub_cubes = bool(getattr(self.plan, 'sub_layer_cubes', False)) and not is_puzzle
+        sub_head = bool(getattr(self.plan, 'streamed_lm_head', False))
+        puzzle_slot_bytes = max(
+            256 * 1024,
+            int(getattr(eng, "puzzle_slot_budget_bytes", None) or getattr(self.plan, "slot_bytes", 0) or 2 * 1024**2),
+        )
+        if sub_cubes or sub_head:
+            eng._install_q1_cube_streaming(
+                slot_budget_bytes=puzzle_slot_bytes if is_puzzle else max(256 * 1024, int(self.plan.slot_bytes or 2 * 1024**2)),
+                sub_layer_cubes=sub_cubes,
+                streamed_lm_head=sub_head,
+            )
+        elif eng.quant_bits == 1 and not getattr(eng, "fast_qwen", False):
+            eng._install_ideal_q1_lm_head()
+        if not sub_cubes and not is_puzzle:
+            eng._install_pipeline_hooks()
+        if is_puzzle:
+            eng._install_q1_puzzle_overlay(slot_budget_bytes=puzzle_slot_bytes)
         past = move_tensors(past, self.gpu)
         if self.deferred_warmup is not None:
             self.deferred_warmup.activate()
@@ -375,7 +471,8 @@ class ProgressiveExecution:
             for name, tensor in list(layer.named_buffers()):
                 if tensor.is_meta:
                     continue
-                if name.rsplit(".", 1)[-1] in ("packed_lo", "packed_hi", "qscale", "qzero"):
+                from src.quantized_projection import PACKED_FIELDS
+                if name.rsplit(".", 1)[-1] in PACKED_FIELDS:
                     set_module_tensor_to_device(layer, name, "meta", clear_cache=False)
                 elif tensor.device.type != "cpu":
                     set_module_tensor_to_device(layer, name, "cpu", value=tensor.cpu(),
@@ -426,13 +523,28 @@ class ProgressiveExecution:
         ple = eng._compute_per_layer_inputs(tokens)
         if ple is not None:
             kwargs["per_layer_inputs"] = ple
-        outputs = eng.model(inputs_embeds=inputs, input_ids=None, **kwargs)
+        tracker = getattr(eng, 'survivor_tracker', None)
+        is_prefill_step = (past is None or tokens.shape[-1] > 1) if prefill is None else bool(prefill)
+        is_last_chunk = is_prefill_step and bool(True if prefill_end is None else prefill_end)
+        is_aux = bool(self.auxiliary_depth or getattr(eng, '_auxiliary_depth', 0)
+                      or (warmup is not None and warmup.auxiliary_depth))
+        if tracker is not None:
+            tracker.begin_prefill_chunk(is_last_chunk=is_last_chunk, auxiliary=is_aux)
+        try:
+            outputs = eng.model(inputs_embeds=inputs, input_ids=None, **kwargs)
+        finally:
+            if tracker is not None:
+                tracker.end_prefill_chunk()
+                if is_last_chunk and not is_aux:
+                    tracker.sync_draft_vocab()
         new_past = getattr(outputs, eng._cache_kwarg, None) if eng._cache_kwarg else None
         self.cpu_steps += 1
         if warmup is not None:
             warmup.end_step()
         if self.error is not None and self.gpu_enabled and not self.auxiliary_depth:
             new_past = self._continue_on_cpu(new_past)
+        if self.gpu_pipeline is not None and not self.complete and self.error is None and not self.bundle_ready.is_set():
+            self.bundle_ready.set()
         return (outputs.logits if return_all_logits else outputs.logits[:, -1, :]), new_past
 
     def pause(self):
@@ -492,28 +604,43 @@ class DeferredWarmup:
     def __init__(self, engine, options):
         from src.probability_warmup import PrefillRegionMap
         self.engine, self.options, self.active = engine, options, None
-        loader = getattr(engine.model_source, "_expert_loader", None)
-        eligible = getattr(loader, "cpu_quant_layers", ())
-        if engine.config.model_type not in {"granitemoe", "olmoe"} or len(eligible) < 3:
+        self._auto_unified_attached = False
+        source = getattr(engine, "model_source", None)
+        loader = getattr(source, "_expert_loader", None) if source is not None else None
+        eligible = sorted(getattr(loader, "cpu_quant_layers", ()))
+        unified = bool(options.get("unified_memory", False))
+        kind = getattr(engine.config, "model_type", "")
+        if not unified and (kind not in {"granitemoe", "olmoe"} or len(eligible) < 3):
             raise ValueError("Progressive warmup requires HF Granite/OLMoE Q4/Q6")
-        numbers = {i: loader.base.num_experts_by_layer[i] for i in sorted(eligible)}
-        capacity = min(int(options.get("region_experts", 12)), min(numbers.values()))
-        self.region_map = PrefillRegionMap(numbers, capacity)
-        self.counts = {i: [0]*n for i, n in numbers.items()}
+        if eligible:
+            numbers = {
+                i: int(loader.base._layer_meta[i]["num_experts"] if hasattr(loader.base, "_layer_meta")
+                       else loader.base.num_experts_by_layer[i])
+                for i in eligible
+            }
+            capacity = min(int(options.get("region_experts", 12)), min(numbers.values()))
+            self.region_map = PrefillRegionMap(numbers, capacity)
+            self.counts = {i: [0]*n for i, n in numbers.items()}
+        else:
+            numbers = {}
+            self.region_map = None
+            self.counts = {}
         self.collecting = False
         self.auxiliary_depth = 0
         self.is_prefill = False
         self.verification_depth = 0
         self.prefill_end = False
         self.handles = []
+        layers = engine._decoder_layers()
+        routed_containers = getattr(source, "_routed_expert_container", {}) or {}
         for i in numbers:
-            layer = engine._decoder_layers()[i]
-            experts = (layer.block_sparse_moe if engine.config.model_type == "granitemoe" else layer.mlp).experts
+            exp_path = routed_containers.get(i) or ("block_sparse_moe.experts" if kind == "granitemoe" else "mlp.experts")
+            experts = layers[i].get_submodule(exp_path)
             self.handles.append(experts.register_forward_pre_hook(self._observe(i)))
 
     def _observe(self, i):
         def observe(module, args):
-            if self.auxiliary_depth or self.verification_depth:
+            if len(args) < 2 or self.auxiliary_depth or self.verification_depth or self.region_map is None:
                 return
             if self.is_prefill:
                 for eid in args[1].detach().reshape(-1).tolist():
@@ -524,7 +651,7 @@ class DeferredWarmup:
         return observe
 
     def begin_step(self, tokens, past, *, prefill=None, prefill_end=True):
-        if self.auxiliary_depth:
+        if self.auxiliary_depth or self.region_map is None:
             return
         self.is_prefill = (past is None or tokens.shape[-1] > 1) if prefill is None else bool(prefill)
         self.prefill_end = prefill_end
@@ -533,7 +660,7 @@ class DeferredWarmup:
             self.collecting = True
 
     def end_step(self):
-        if self.auxiliary_depth:
+        if self.auxiliary_depth or self.region_map is None:
             return
         if self.is_prefill and self.prefill_end:
             for i, counts in self.counts.items():
@@ -545,16 +672,44 @@ class DeferredWarmup:
         for h in self.handles:
             h.remove()
         self.handles.clear()
+        pipeline = getattr(self.engine, "pipeline", None)
+        if self._auto_unified_attached and (
+            not hasattr(pipeline, "slot_strides") or getattr(pipeline, "num_slots", 0) != 3
+        ):
+            if getattr(self.engine, "probability_warmup", None) is self:
+                self.engine.probability_warmup = None
+            return
         active = ProbabilityWarmup(self.engine, **self.options)
-        # Include all completed CPU chunks if GPU joins mid-prefill.
-        active.region_map = self.region_map
-        active.building_counts = self.counts
-        active.collecting = self.collecting
+        active._auto_unified_attached = self._auto_unified_attached
+        if self.region_map is not None and active.region_map is not None:
+            # Include all completed CPU chunks if GPU joins mid-prefill.
+            active.region_map = self.region_map
+            active.building_counts = self.counts
+            active.collecting = self.collecting
         self.active = active
         self.engine.probability_warmup = active
 
+    def detach_and_restore(self):
+        if self.active is not None:
+            self.active.detach_and_restore()
+            self.active = None
+        else:
+            prog = getattr(self.engine, "progressive", None)
+            if prog is not None and prog.cpu_steps > 0:
+                raise RuntimeError("Cannot detach unified memory after forward step 0")
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+        prog = getattr(self.engine, "progressive", None)
+        if prog is not None and getattr(prog, "deferred_warmup", None) is self:
+            prog.deferred_warmup = None
+        if getattr(self.engine, "probability_warmup", None) is self:
+            self.engine.probability_warmup = None
+
     def stats(self):
-        return self.active.stats() if self.active is not None else {"cpu_first_pending": True, "map": self.region_map.stats()}
+        if self.active is not None:
+            return self.active.stats()
+        return {"cpu_first_pending": True, "map": self.region_map.stats() if self.region_map is not None else None}
 
     def reset(self):
         if self.active is not None:

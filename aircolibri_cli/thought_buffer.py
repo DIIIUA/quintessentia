@@ -35,11 +35,13 @@ def _auxiliary_forwards(u_eng: Any):
     captured = getattr(u_eng, "captured", None)
     progressive = getattr(engine, "progressive", None)
     saved = dict(captured) if captured is not None else None
+    engine._auxiliary_depth = int(getattr(engine, "_auxiliary_depth", 0)) + 1
     try:
         with progressive.auxiliary_forwards() if progressive is not None else nullcontext():
             with warmup.auxiliary_forwards() if warmup is not None else nullcontext():
                 yield
     finally:
+        engine._auxiliary_depth = max(0, int(getattr(engine, "_auxiliary_depth", 1)) - 1)
         if saved is not None:
             captured.clear()
             captured.update(saved)
@@ -378,6 +380,11 @@ class InitialProbabilityAnchor:
         if self.phi0 is None:
             self.phi0 = pmi.clone()
             self.phi_buf = pmi.clone()
+            survivor_tracker = getattr(u_eng, "survivor_tracker", None) or getattr(
+                getattr(u_eng, "engine", None), "survivor_tracker", None
+            )
+            if survivor_tracker is not None and hasattr(survivor_tracker, "apply_to_anchor"):
+                survivor_tracker.apply_to_anchor(self)
         else:
             self.phi0 = self.phi0.to(device=pmi.device)
             if self.phi_buf is not None:
@@ -386,6 +393,11 @@ class InitialProbabilityAnchor:
                 self.revise_input(pmi)
             else:
                 self._merge_working_field(pmi, weight=0.35)
+            survivor_tracker = getattr(u_eng, "survivor_tracker", None) or getattr(
+                getattr(u_eng, "engine", None), "survivor_tracker", None
+            )
+            if survivor_tracker is not None and hasattr(survivor_tracker, "apply_to_anchor"):
+                survivor_tracker.apply_to_anchor(self)
         self._steps_since_reanchor = 0
         if torch.cuda.is_available() and z0.is_cuda:
             torch.cuda.synchronize(z0.device)

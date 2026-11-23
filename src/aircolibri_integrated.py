@@ -152,12 +152,20 @@ class AirColibriModel:
         universal_quantization: bool = False,
         cpu_first_plan=None,
         progressive_gpu: bool = True,
+        sub_layer_cubes: bool = False,
+        streamed_lm_head: bool = False,
+        q1_slot_budget_bytes: Optional[int] = None,
+        q1_planes: int = 4,
+        q1_early_stop: bool = True,
+        puzzle_overlay: bool = False,
+        puzzle_slice_ratio: float = 0.35,
+        puzzle_slot_budget_bytes: Optional[int] = None,
     ):
         if pipeline_mode not in ("sequential", "double_buffer", "triple_ring", "triple_ring_prefetch"):
             raise ValueError("Unsupported pipeline mode")
         if control_mode not in ("off", "observe", "enforce"):
             raise ValueError("Unsupported control mode")
-        if weight_format not in ("bf16", "q4", "q6", "q4_g16_asym", "q4_g32_asym", "q4_g64_asym"):
+        if weight_format not in ("bf16", "q1", "q2", "q4", "q6", "q8", "q4_g16_asym", "q4_g32_asym", "q4_g64_asym"):
             raise ValueError("Unsupported weight format")
         if q4_group_size not in (16, 32, 64):
             raise ValueError("Q4 group size must be 16, 32 or 64")
@@ -181,7 +189,20 @@ class AirColibriModel:
         self.dtype = dtype
         self.vram_resident_layers = vram_resident_layers
         self.cache_policy = cache_policy
-        self.quant_bits = (6 if weight_format == "q6" else 4 if weight_format.startswith("q4") else 0) if universal_quantization or weight_format == "q6" else 0
+        self.q1_planes = max(1, min(8, int(q1_planes)))
+        self.q1_early_stop = bool(q1_early_stop)
+        if weight_format == "q1":
+            self.quant_bits = 1
+        elif weight_format == "q2":
+            self.quant_bits = 2
+        elif weight_format == "q6":
+            self.quant_bits = 6
+        elif weight_format == "q8":
+            self.quant_bits = 8
+        elif universal_quantization and weight_format.startswith("q4"):
+            self.quant_bits = 4
+        else:
+            self.quant_bits = 0
         self.is_q4 = weight_format.startswith("q4") and not self.quant_bits
         self.weight_format = f"packed_q{self.quant_bits}" if self.quant_bits else f"q4_g{q4_group_size}_asym" if self.is_q4 else "bf16"
         self.quantize_lm_head = bool(quantize_lm_head and self.is_q4)
@@ -194,6 +215,16 @@ class AirColibriModel:
         self._q4_scratch: Optional[torch.Tensor] = None
         self.embed_tokens_weight: Optional[torch.Tensor] = None
         self._step_cancel_check = None
+        self.sub_layer_cubes = bool(sub_layer_cubes)
+        self.streamed_lm_head = bool(streamed_lm_head)
+        self.q1_slot_budget_bytes = int(q1_slot_budget_bytes) if q1_slot_budget_bytes is not None else None
+        self.q1_arena = None
+        self.survivor_tracker = None
+        self.puzzle_overlay = bool(puzzle_overlay)
+        self.puzzle_slice_ratio = max(0.0, min(1.0, float(puzzle_slice_ratio)))
+        self.puzzle_slot_budget_bytes = int(puzzle_slot_budget_bytes) if puzzle_slot_budget_bytes is not None else None
+        self.puzzle_controller = None
+        self._auxiliary_depth = 0
 
         # 1. Загрузка конфигурации и токенизатора
         if model_source is not None:
@@ -249,7 +280,7 @@ class AirColibriModel:
             from aircolibri_cli.unified_runtime import _model_shape_inventory
             from src.quantized_projection import projection_map
             layer_shapes, _, _ = _model_shape_inventory(Path(model_dir), model_source, num_hidden_layers)
-            quantized_projections = projection_map(self.model, layer_shapes, self.quant_bits, self.q4_group_size, replace=True)
+            quantized_projections = projection_map(self.model, layer_shapes, self.quant_bits, self.q4_group_size, replace=True, q1_planes=self.q1_planes)
 
         # 2. Инициализация менеджера памяти
         self.weight_manager = StableWeightManager(
@@ -266,8 +297,9 @@ class AirColibriModel:
             weight_reader=self.weight_reader,
             model_source=model_source,
             quantized_projections=quantized_projections,
-            staging_device=self.device if cpu_first_plan is not None else None,
-            defer_staging=cpu_first_plan is not None,
+            staging_device=(self.device if cpu_first_plan is not None else (torch.device("cpu") if (self.sub_layer_cubes or self.puzzle_overlay) else None)),
+            defer_staging=bool(cpu_first_plan is not None or self.sub_layer_cubes or self.puzzle_overlay),
+            q1_planes=self.q1_planes,
         )
 
         # Bind source-specific expert loading without hiding implementation errors.
@@ -278,6 +310,9 @@ class AirColibriModel:
             if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
                 prepare_args = {key: value for key, value in prepare_args.items() if key in params}
             model_source.prepare_model(self.model, **prepare_args)
+            expert_loader = getattr(model_source, "_expert_loader", None)
+            if self.quant_bits == 1 and hasattr(expert_loader, "set_q1_planes"):
+                expert_loader.set_q1_planes(self.q1_planes)
         if self.device.type == "cuda" or cpu_first_plan is not None:
             from src.colibri_deltanet_nvrtc import install_deltanet_nvrtc_kernels
 
@@ -331,6 +366,23 @@ class AirColibriModel:
 
         # 4. Постоянные веса и VRAM-резидентные слои
         self._setup_permanent_weights()
+        effective_sub_cubes = bool(self.sub_layer_cubes and not self.puzzle_overlay)
+        if cpu_first_plan is None and (effective_sub_cubes or self.streamed_lm_head):
+            cube_slot_budget = max(
+                64 * 1024,
+                int(
+                    (self.puzzle_slot_budget_bytes if self.puzzle_overlay else None)
+                    or self.q1_slot_budget_bytes
+                    or 2 * 1024**2
+                ),
+            )
+            self._install_q1_cube_streaming(
+                slot_budget_bytes=cube_slot_budget,
+                sub_layer_cubes=effective_sub_cubes,
+                streamed_lm_head=self.streamed_lm_head,
+            )
+        elif cpu_first_plan is None and self.quant_bits == 1 and not self.fast_qwen:
+            self._install_ideal_q1_lm_head()
         self.weight_manager.globals.release_handle()
         if self.progressive is not None:
             self.progressive.capture_globals()
@@ -338,7 +390,7 @@ class AirColibriModel:
         # 5. Инициализация GPU Ring Pipeline на едином layout без union-раздувания.
         # When every layer is resident nothing is streamed, so no ring arena is allocated
         # (it used to waste 120-475 MiB of VRAM on 8 GB cards).
-        if all_layers_resident or cpu_first_plan is not None:
+        if all_layers_resident or cpu_first_plan is not None or self.sub_layer_cubes or self.puzzle_overlay:
             self.pipeline = _NoStreamingPipeline()
         else:
             self.pipeline = GPURingPipeline(
@@ -352,12 +404,14 @@ class AirColibriModel:
         self.tail_prefetched = False
 
         # 6. Загружаем VRAM-резидентные слои
-        for r_idx in range(0 if cpu_first_plan is not None else self.vram_resident_layers):
+        for r_idx in range(0 if (cpu_first_plan is not None or self.puzzle_overlay) else self.vram_resident_layers):
             self._load_resident_layer(r_idx)
 
         # 7. Установка стриминговых хуков на декодер-слои
-        if cpu_first_plan is None:
+        if cpu_first_plan is None and not self.sub_layer_cubes and not self.puzzle_overlay:
             self._install_pipeline_hooks()
+        if cpu_first_plan is None and self.puzzle_overlay:
+            self._install_q1_puzzle_overlay()
         if native_policy is not None:
             self.weight_manager.ram_cache.admission = native_policy.admit
             self.weight_manager.ram_cache.on_access = native_policy.record_access
@@ -461,8 +515,9 @@ class AirColibriModel:
             required = set(raw_params)
             for _, q, s, z in q4_bindings:
                 required.update((q, s, z))
+            from src.quantized_projection import PACKED_FIELDS
             required.update(k for k in self._collect_layer_buffers(layer_module)
-                            if k.rsplit(".", 1)[-1] in ("packed_lo", "packed_hi", "qscale", "qzero"))
+                            if k.rsplit(".", 1)[-1] in PACKED_FIELDS)
             missing = required - tensors.keys()
             if missing:
                 raise ValueError(f"Layer {layer_idx} is missing required tensors: {sorted(missing)}")
@@ -569,7 +624,8 @@ class AirColibriModel:
 
         # LM Head на GPU (lm_head, embed_out, head, output_projection)
         lm_w_path = next((c for c in _LM_HEAD_WEIGHT_CANDIDATES if c in model_param_names), "lm_head.weight")
-        if "lm_head.weight" in self.weight_manager.globals:
+        defer_head_q1 = bool((self.streamed_lm_head or (self.quant_bits == 1 and not self.fast_qwen)) and self.progressive is None)
+        if "lm_head.weight" in self.weight_manager.globals and not defer_head_q1:
             out_emb = (
                 self.model.get_output_embeddings()
                 if hasattr(self.model, "get_output_embeddings")
@@ -579,7 +635,7 @@ class AirColibriModel:
                 self._quantize_lm_head_from_slice(out_emb)
             else:
                 self._load_bf16_lm_head_from_slice(lm_w_path)
-        if "lm_head.bias" in self.weight_manager.globals:
+        if "lm_head.bias" in self.weight_manager.globals and not defer_head_q1:
             lm_b_path = lm_w_path[:-7] + ".bias"
             lm_b = self.weight_manager.globals.pop("lm_head.bias").to(device=self.device, dtype=self.dtype)
             if lm_b_path in model_param_names:
@@ -624,6 +680,359 @@ class AirColibriModel:
 
         gc.collect()
 
+    def _ensure_q1_arena(self, slot_budget_bytes: int):
+        from src.q1_cube_engine import Q1RoleCycleArena
+        if self.q1_arena is None or self.q1_arena.device != self.device:
+            self.q1_arena = Q1RoleCycleArena(int(slot_budget_bytes), self.device)
+        return self.q1_arena
+
+    def _install_ideal_q1_lm_head(self, *, slot_budget_bytes: Optional[int] = None, arena: Any = None) -> None:
+        """Install IdealQ1LMHead (with optional early-stop and arena streaming) on output embeddings."""
+        from src.ideal_q1_engine import IdealQ1LMHead
+        model_param_names = {n for n, _ in self.model.named_parameters(remove_duplicate=False)}
+        lm_w_path = next((c for c in _LM_HEAD_WEIGHT_CANDIDATES if c in model_param_names), "lm_head.weight")
+        head_mod_path = lm_w_path[:-7] if lm_w_path.endswith(".weight") else "lm_head"
+        parent_path, _, leaf_name = head_mod_path.rpartition(".")
+        parent_mod = self.model.get_submodule(parent_path) if parent_path else self.model
+        cur_head = getattr(parent_mod, leaf_name, None)
+        if isinstance(cur_head, IdealQ1LMHead):
+            return
+        lm_bias = None
+        if "lm_head.bias" in self.weight_manager.globals:
+            lm_bias = self.weight_manager.globals.pop("lm_head.bias")
+        elif cur_head is not None and getattr(cur_head, "bias", None) is not None and not cur_head.bias.is_meta:
+            lm_bias = cur_head.bias.detach().cpu()
+        q1_head = None
+        if "lm_head.weight" in self.weight_manager.globals:
+            sl = self.weight_manager.globals.get_tensor_slice("lm_head.weight")
+            vocab_sz, hid_sz = sl.get_shape()
+            gs = self.q4_group_size if hid_sz % self.q4_group_size == 0 else (32 if hid_sz % 32 == 0 else 16)
+            q1_head = IdealQ1LMHead(
+                int(hid_sz), int(vocab_sz),
+                weight_slice=sl,
+                planes=getattr(self, "q1_planes", 4), group_size=gs,
+                bias=lm_bias, early_stop=getattr(self, "q1_early_stop", True),
+                device=self.device, slot_budget_bytes=slot_budget_bytes, arena=arena,
+            )
+            del self.weight_manager.globals["lm_head.weight"]
+        elif cur_head is not None and isinstance(getattr(cur_head, "weight", None), torch.Tensor) and not cur_head.weight.is_meta:
+            w_cpu = cur_head.weight.detach().cpu()
+            vocab_sz, hid_sz = w_cpu.shape
+            gs = self.q4_group_size if hid_sz % self.q4_group_size == 0 else (32 if hid_sz % 32 == 0 else 16)
+            q1_head = IdealQ1LMHead(
+                int(hid_sz), int(vocab_sz),
+                read_rows=lambda s, e, _w=w_cpu: _w[s:e],
+                planes=getattr(self, "q1_planes", 4), group_size=gs,
+                bias=lm_bias, early_stop=getattr(self, "q1_early_stop", True),
+                device=self.device, slot_budget_bytes=slot_budget_bytes, arena=arena,
+            )
+            del w_cpu
+        elif "model.embed_tokens.weight" in self.weight_manager.globals:
+            sl = self.weight_manager.globals.get_tensor_slice("model.embed_tokens.weight")
+            vocab_sz, hid_sz = sl.get_shape()
+            gs = self.q4_group_size if hid_sz % self.q4_group_size == 0 else (32 if hid_sz % 32 == 0 else 16)
+            q1_head = IdealQ1LMHead(
+                int(hid_sz), int(vocab_sz),
+                weight_slice=sl,
+                planes=getattr(self, "q1_planes", 4), group_size=gs,
+                bias=lm_bias, early_stop=getattr(self, "q1_early_stop", True),
+                device=self.device, slot_budget_bytes=slot_budget_bytes, arena=arena,
+            )
+        if q1_head is not None:
+            setattr(parent_mod, leaf_name, q1_head)
+
+    def _install_q1_cube_streaming(
+        self,
+        *,
+        slot_budget_bytes: int,
+        sub_layer_cubes: bool = False,
+        streamed_lm_head: bool = False,
+    ) -> None:
+        """Install bounded 2-stream Q1 cube modules for sub-layer and/or sub-lm_head streaming."""
+        from src.q1_cube_engine import Q1StreamedLMHead, Q1StreamedLinear
+        from src.quantized_projection import PACKED_FIELDS, PackedLinear, _slice_packed_rows, unpack_weight
+
+        self.sub_layer_cubes = bool(sub_layer_cubes)
+        self.streamed_lm_head = bool(streamed_lm_head)
+        self.q1_slot_budget_bytes = int(slot_budget_bytes)
+        arena = self._ensure_q1_arena(slot_budget_bytes)
+        q1_bits = self.quant_bits if self.quant_bits in (1, 2, 4, 6, 8) else 6
+
+        if streamed_lm_head:
+            if self.quant_bits == 1 and not self.fast_qwen:
+                self._install_ideal_q1_lm_head(slot_budget_bytes=arena.slot_budget_bytes, arena=arena)
+            else:
+                model_param_names = {n for n, _ in self.model.named_parameters(remove_duplicate=False)}
+                lm_w_path = next((c for c in _LM_HEAD_WEIGHT_CANDIDATES if c in model_param_names), "lm_head.weight")
+                head_mod_path = lm_w_path[:-7] if lm_w_path.endswith(".weight") else "lm_head"
+                parent_path, _, leaf_name = head_mod_path.rpartition(".")
+                parent_mod = self.model.get_submodule(parent_path) if parent_path else self.model
+                cur_head = getattr(parent_mod, leaf_name, None)
+                if not isinstance(cur_head, Q1StreamedLMHead):
+                    lm_bias = None
+                    if "lm_head.bias" in self.weight_manager.globals:
+                        lm_bias = self.weight_manager.globals.pop("lm_head.bias")
+                    elif cur_head is not None and getattr(cur_head, "bias", None) is not None and not cur_head.bias.is_meta:
+                        lm_bias = cur_head.bias.detach().cpu()
+
+                    if "lm_head.weight" in self.weight_manager.globals:
+                        sl = self.weight_manager.globals.get_tensor_slice("lm_head.weight")
+                        vocab_sz, hid_sz = sl.get_shape()
+                        gs = self.q4_group_size if hid_sz % self.q4_group_size == 0 else (32 if hid_sz % 32 == 0 else 16)
+                        c_tile = 128 if (hid_sz >= 128 and 128 % gs == 0) else max(32, gs)
+                        q1_head = Q1StreamedLMHead(
+                            int(hid_sz), int(vocab_sz),
+                            weight_slice=sl,
+                            bits=q1_bits, group_size=gs,
+                            r_tile=min(256, int(vocab_sz)), c_tile=c_tile,
+                            bias=lm_bias, slot_budget_bytes=arena.slot_budget_bytes, arena=arena,
+                        )
+                        del self.weight_manager.globals["lm_head.weight"]
+                    elif cur_head is not None and isinstance(getattr(cur_head, "weight", None), torch.Tensor) and not cur_head.weight.is_meta:
+                        w_cpu = cur_head.weight.detach().cpu()
+                        vocab_sz, hid_sz = w_cpu.shape
+                        gs = self.q4_group_size if hid_sz % self.q4_group_size == 0 else (32 if hid_sz % 32 == 0 else 16)
+                        c_tile = 128 if (hid_sz >= 128 and 128 % gs == 0) else max(32, gs)
+                        q1_head = Q1StreamedLMHead(
+                            int(hid_sz), int(vocab_sz),
+                            read_rows=lambda s, e, _w=w_cpu: _w[s:e],
+                            bits=q1_bits, group_size=gs,
+                            r_tile=min(256, int(vocab_sz)), c_tile=c_tile,
+                            bias=lm_bias, slot_budget_bytes=arena.slot_budget_bytes, arena=arena,
+                        )
+                        del w_cpu
+                    elif "model.embed_tokens.weight" in self.weight_manager.globals:
+                        sl = self.weight_manager.globals.get_tensor_slice("model.embed_tokens.weight")
+                        vocab_sz, hid_sz = sl.get_shape()
+                        gs = self.q4_group_size if hid_sz % self.q4_group_size == 0 else (32 if hid_sz % 32 == 0 else 16)
+                        c_tile = 128 if (hid_sz >= 128 and 128 % gs == 0) else max(32, gs)
+                        q1_head = Q1StreamedLMHead(
+                            int(hid_sz), int(vocab_sz),
+                            weight_slice=sl,
+                            bits=q1_bits, group_size=gs,
+                            r_tile=min(256, int(vocab_sz)), c_tile=c_tile,
+                            bias=lm_bias, slot_budget_bytes=arena.slot_budget_bytes, arena=arena,
+                        )
+                    else:
+                        q1_head = None
+                    if q1_head is not None:
+                        setattr(parent_mod, leaf_name, q1_head)
+
+        if sub_layer_cubes:
+            layers = self._decoder_layers()
+            num_layers = len(layers)
+            if not hasattr(self, "_hook_handles"):
+                self._hook_handles = []
+            self.active_slot_per_layer = [None] * num_layers
+            for layer_idx in range(self.vram_resident_layers, num_layers):
+                layer_module = layers[layer_idx]
+                tensors = self.weight_manager.read_layer_tensors(layer_idx, target_device=torch.device("cpu"))
+                submods = dict(layer_module.named_modules())
+                for mod_name, submod in list(submods.items()):
+                    if not mod_name:
+                        continue
+                    p_name, _, leaf = mod_name.rpartition(".")
+                    parent = submods[p_name]
+                    if isinstance(submod, PackedLinear):
+                        packed_sub = {
+                            f: tensors.pop(f"{mod_name}.{f}")
+                            for f in PACKED_FIELDS
+                            if f"{mod_name}.{f}" in tensors
+                        }
+                        bias_t = tensors.pop(f"{mod_name}.bias", None)
+                        c_tile = 128 if (submod.in_features >= 128 and 128 % submod.group_size == 0) else max(32, submod.group_size)
+                        if submod.bits in (4, 6, 8):
+                            q1_mod = Q1StreamedLinear(
+                                submod.in_features, submod.out_features,
+                                packed_dict=packed_sub,
+                                bits=submod.bits, group_size=submod.group_size,
+                                r_tile=min(64, submod.out_features), c_tile=c_tile,
+                                bias=bias_t, slot_budget_bytes=arena.slot_budget_bytes, arena=arena,
+                            )
+                        else:
+                            stream_bits = getattr(submod, "q1_planes", 1) if submod.bits == 1 else submod.bits
+                            q1_mod = Q1StreamedLinear(
+                                submod.in_features, submod.out_features,
+                                read_rows=lambda s, e, _p=packed_sub, _gs=submod.group_size, _dt=self.dtype: unpack_weight(_slice_packed_rows(_p, s, e), _gs, _dt),
+                                bits=stream_bits, group_size=submod.group_size,
+                                r_tile=min(64, submod.out_features), c_tile=c_tile,
+                                bias=bias_t, slot_budget_bytes=arena.slot_budget_bytes, arena=arena,
+                            )
+                        setattr(parent, leaf, q1_mod)
+                    elif type(submod) is torch.nn.Linear and f"{mod_name}.weight" in tensors:
+                        if any(part in ("gate", "router", "router_proj") or part.endswith("_gate") for part in mod_name.split(".")):
+                            continue
+                        in_f, out_f = submod.in_features, submod.out_features
+                        if in_f >= 32 and in_f % 16 == 0:
+                            gs = 64 if in_f % 64 == 0 else (32 if in_f % 32 == 0 else 16)
+                            c_tile = 128 if (in_f >= 128 and 128 % gs == 0) else max(32, gs)
+                            w_cpu = tensors.pop(f"{mod_name}.weight")
+                            bias_t = tensors.pop(f"{mod_name}.bias", None)
+                            q1_mod = Q1StreamedLinear(
+                                in_f, out_f,
+                                read_rows=lambda s, e, _w=w_cpu: _w[s:e],
+                                bits=q1_bits, group_size=gs,
+                                r_tile=min(64, out_f), c_tile=c_tile,
+                                bias=bias_t, slot_budget_bytes=arena.slot_budget_bytes, arena=arena,
+                            )
+                            del w_cpu
+                            setattr(parent, leaf, q1_mod)
+                raw_params = {k for k, _ in layer_module.named_parameters()}
+                buf_dtypes = self._collect_layer_buffers(layer_module)
+                for k in list(tensors.keys()):
+                    if k in raw_params:
+                        val = tensors.pop(k).to(device=self.device, dtype=self.dtype)
+                        set_module_tensor_to_device(layer_module, k, self.device, value=val, dtype=self.dtype, clear_cache=False)
+                    elif k in buf_dtypes:
+                        b_dt = buf_dtypes[k]
+                        val = tensors.pop(k).to(device=self.device, dtype=b_dt)
+                        set_module_tensor_to_device(layer_module, k, self.device, value=val, dtype=b_dt, clear_cache=False)
+                tensors.clear()
+                for _, sm in layer_module.named_modules():
+                    for bn, bv in list(sm._buffers.items()):
+                        if bv is not None and not bv.is_meta and bv.device != self.device:
+                            sm._buffers[bn] = bv.to(device=self.device)
+
+                def _q1_pre(module, _args):
+                    if self._step_cancel_check is not None:
+                        self._step_cancel_check()
+
+                def _q1_post(module, _args, output):
+                    if self.progressive is not None and self.progressive.complete:
+                        self.progressive.gpu_layers += 1
+                    return output
+
+                self._hook_handles.append(layer_module.register_forward_pre_hook(_q1_pre))
+                self._hook_handles.append(layer_module.register_forward_hook(_q1_post))
+
+    def _install_q1_puzzle_overlay(self, *, slot_budget_bytes: Optional[int] = None):
+        """Install dynamic 3D Q1PuzzleOverlay (Ideal Q1 P=1 base + connected Q8 delta slices)."""
+        if getattr(self, "puzzle_controller", None) is not None:
+            return self.puzzle_controller
+        from src.q1_puzzle_overlay import install_q1_puzzle_overlay
+        from src.quantization_q4 import dequantize_q4_tensor
+        from src.quantized_projection import PACKED_FIELDS, PackedLinear, unpack_weight
+
+        budget = (
+            slot_budget_bytes
+            if slot_budget_bytes is not None
+            else (
+                getattr(self, "puzzle_slot_budget_bytes", None)
+                or getattr(self, "q1_slot_budget_bytes", None)
+                or 2 * 1024**2
+            )
+        )
+        budget = max(64 * 1024, int(budget))
+        arena = self._ensure_q1_arena(budget)
+
+        layers = self._decoder_layers()
+        num_layers = len(layers)
+        if not hasattr(self, "_hook_handles"):
+            self._hook_handles = []
+
+        if self.vram_resident_layers < num_layers and not getattr(self, "sub_layer_cubes", False):
+            for handle in list(self._hook_handles):
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+            self._hook_handles.clear()
+            if getattr(self, "pipeline", None) is not None and not isinstance(self.pipeline, _NoStreamingPipeline):
+                self.pipeline.close()
+                self.pipeline = _NoStreamingPipeline()
+        if self.vram_resident_layers < num_layers:
+            self.active_slot_per_layer = [None] * num_layers
+
+        def _layer_has_meta(layer_module: torch.nn.Module) -> bool:
+            for p in layer_module.parameters():
+                if p.is_meta:
+                    return True
+            for _, b in layer_module.named_buffers():
+                if b is not None and b.is_meta:
+                    return True
+            return False
+
+        def _extract_layer_weights(layer_idx: int, *, materialize_non_proj: bool) -> Dict[str, torch.Tensor]:
+            layer_module = layers[layer_idx]
+            tensors = self.weight_manager.read_layer_tensors(layer_idx, target_device=torch.device("cpu"))
+            proj_weights: Dict[str, torch.Tensor] = {}
+            submods = dict(layer_module.named_modules())
+            for mod_name, submod in submods.items():
+                if not mod_name or any(part in ("gate", "router", "router_proj") or part.endswith("_gate") for part in mod_name.split(".")):
+                    continue
+                if isinstance(submod, PackedLinear):
+                    packed_sub = {f: tensors.pop(f"{mod_name}.{f}") for f in PACKED_FIELDS if f"{mod_name}.{f}" in tensors}
+                    if packed_sub:
+                        proj_weights[f"{mod_name}.weight"] = unpack_weight(packed_sub, submod.group_size, self.dtype)
+                    if f"{mod_name}.bias" in tensors:
+                        proj_weights[f"{mod_name}.bias"] = tensors.pop(f"{mod_name}.bias")
+                elif isinstance(submod, ColibriQ4Linear):
+                    q_k, s_k, z_k = q4_subkey_names(f"{mod_name}.weight")
+                    if q_k in tensors and s_k in tensors and z_k in tensors:
+                        proj_weights[f"{mod_name}.weight"] = dequantize_q4_tensor(
+                            tensors.pop(q_k), tensors.pop(s_k), tensors.pop(z_k),
+                            group_size=submod.group_size, dtype=self.dtype,
+                        )
+                    if f"{mod_name}.bias" in tensors:
+                        proj_weights[f"{mod_name}.bias"] = tensors.pop(f"{mod_name}.bias")
+                elif type(submod) is torch.nn.Linear:
+                    if f"{mod_name}.weight" in tensors:
+                        proj_weights[f"{mod_name}.weight"] = tensors.pop(f"{mod_name}.weight")
+                    if f"{mod_name}.bias" in tensors:
+                        proj_weights[f"{mod_name}.bias"] = tensors.pop(f"{mod_name}.bias")
+
+            if materialize_non_proj:
+                raw_params = {k for k, _ in layer_module.named_parameters()}
+                buf_dtypes = self._collect_layer_buffers(layer_module)
+                for k in list(tensors.keys()):
+                    if k in raw_params:
+                        val = tensors.pop(k).to(device=self.device, dtype=self.dtype)
+                        set_module_tensor_to_device(layer_module, k, self.device, value=val, dtype=self.dtype, clear_cache=False)
+                    elif k in buf_dtypes:
+                        b_dt = buf_dtypes[k]
+                        val = tensors.pop(k).to(device=self.device, dtype=b_dt)
+                        set_module_tensor_to_device(layer_module, k, self.device, value=val, dtype=b_dt, clear_cache=False)
+                for _, sm in layer_module.named_modules():
+                    for bn, bv in list(sm._buffers.items()):
+                        if bv is not None and not bv.is_meta and bv.device != self.device:
+                            sm._buffers[bn] = bv.to(device=self.device)
+            tensors.clear()
+            return proj_weights
+
+        if not self._hook_handles:
+            for layer_module in layers:
+                def _puzzle_pre(module, _args):
+                    if self._step_cancel_check is not None:
+                        self._step_cancel_check()
+
+                def _puzzle_post(module, _args, output):
+                    if self.progressive is not None and self.progressive.complete:
+                        self.progressive.gpu_layers += 1
+                    return output
+
+                self._hook_handles.append(layer_module.register_forward_pre_hook(_puzzle_pre))
+                self._hook_handles.append(layer_module.register_forward_hook(_puzzle_post))
+
+        def _layer_weight_provider(layer_idx: int) -> Dict[str, torch.Tensor]:
+            layer_module = layers[layer_idx]
+            need_mat = bool(layer_idx >= self.vram_resident_layers or _layer_has_meta(layer_module))
+            return _extract_layer_weights(layer_idx, materialize_non_proj=need_mat)
+
+        gs = int(getattr(self, "q4_group_size", 64))
+        self.puzzle_controller = install_q1_puzzle_overlay(
+            self.model,
+            slice_ratio=getattr(self, "puzzle_slice_ratio", 0.35),
+            group_size=gs,
+            slot_budget_bytes=arena.slot_budget_bytes,
+            arena=arena,
+            device=self.device,
+            layer_weight_provider=_layer_weight_provider,
+        )
+        for layer_idx, layer_module in enumerate(layers):
+            if _layer_has_meta(layer_module):
+                _extract_layer_weights(layer_idx, materialize_non_proj=True).clear()
+        return self.puzzle_controller
+
     def _install_pipeline_hooks(self) -> None:
         """Устанавливает pre/post хуки кольцевого конвейера на каждый слой."""
         num_layers = _cfg_num_layers(self.config)
@@ -665,8 +1074,9 @@ class AirColibriModel:
                     target = self.pipeline.get_slot_for_loading(i)
                     self.pipeline.load_tensors_async(target, pinned, pinned_pool=self.weight_manager.pinned_pool)
                 slot = self.pipeline.acquire_slot_for_compute(i)
+                from src.quantized_projection import PACKED_FIELDS
                 required = set(layer_param_names[i])
-                required.update(k for k in layer_buffer_dtypes[i] if k.rsplit(".", 1)[-1] in ("packed_lo", "packed_hi", "qscale", "qzero"))
+                required.update(k for k in layer_buffer_dtypes[i] if k.rsplit(".", 1)[-1] in PACKED_FIELDS)
                 for _, q, s, z in layer_q4_bindings[i]:
                     required.update((q, s, z))
                 missing = required - slot.loaded_keys
@@ -803,7 +1213,12 @@ class AirColibriModel:
         ple_inputs = self._compute_per_layer_inputs(step_tokens)
 
         # Первоначальное заполнение кольца перед началом слоев
-        if self.num_slots > 1 or self.pipeline_mode != "sequential":
+        if (
+            (self.num_slots > 1 or self.pipeline_mode != "sequential")
+            and not self.sub_layer_cubes
+            and not self.puzzle_overlay
+            and getattr(self.pipeline, "num_slots", 0) > 0
+        ):
             first_s = self.vram_resident_layers
             initial_depth = 1 if warmup and warmup.dynamic_regions else self.num_slots
             for s in range(first_s, min(first_s + initial_depth, num_layers)):
@@ -827,11 +1242,25 @@ class AirColibriModel:
                 extra["cache_position"] = cache_position.to(device=self.device)
             if getattr(self, "_supports_logits_to_keep", False):
                 extra["logits_to_keep"] = 0 if return_all_logits else 1
-            outputs = self.model(
-                inputs_embeds=inputs_embeds,
-                input_ids=None,
-                **extra,
-            )
+            tracker = getattr(self, "survivor_tracker", None)
+            is_prefill_step = (past_key_values is None or step_tokens.shape[-1] > 1) if prefill is None else bool(prefill)
+            is_last_chunk = is_prefill_step and bool(prefill_end)
+            is_aux = bool(getattr(self, "_auxiliary_depth", 0)
+                          or (warmup is not None and getattr(warmup, "_auxiliary_depth", 0))
+                          or (self.progressive is not None and self.progressive.auxiliary_depth))
+            if tracker is not None:
+                tracker.begin_prefill_chunk(is_last_chunk=is_last_chunk, auxiliary=is_aux)
+            try:
+                outputs = self.model(
+                    inputs_embeds=inputs_embeds,
+                    input_ids=None,
+                    **extra,
+                )
+            finally:
+                if tracker is not None:
+                    tracker.end_prefill_chunk()
+                    if is_last_chunk and not is_aux:
+                        tracker.sync_draft_vocab()
         except BaseException as exc:
             if not getattr(exc, "_is_cooperative_cancel", False):
                 self._failed = True
@@ -855,21 +1284,38 @@ class AirColibriModel:
         kwargs['unified_memory'] = True
         return self.enable_probability_warmup(**kwargs)
 
-    def enable_probability_warmup(self, **kwargs):
-        """Opt-in HF MoE preparation; unified_memory=True joins ring/cache/producer.
+    def enable_probability_warmup(self, _auto_unified: bool = False, **kwargs):
+        """Opt-in HF MoE / Dense / GGUF preparation; unified_memory=True joins ring/cache/producer.
 
-        Enable before the first forward. The unified budget is the current ring
-        plus cache payload plus gpu_budget_bytes; conversion reserves are retained.
+        Enable before the first forward. If unified memory was auto-attached at startup
+        and no forward step has executed yet, an explicit call cleanly replaces it.
         """
-        if getattr(self, "probability_warmup", None) is not None:
-            raise RuntimeError("Probability warmup is already enabled")
+        from src.quantized_experts import QuantizedExpertCache
+        expert_loader = getattr(self.model_source, "_expert_loader", None) if self.model_source is not None else None
+        if kwargs.get("unified_memory") and isinstance(expert_loader, QuantizedExpertCache) and expert_loader.bits in (1, 2):
+            if _auto_unified:
+                return None
+            raise ValueError("Unified working memory is only supported for Q4/Q6/Q8 MoE caches")
+        existing = getattr(self, "probability_warmup", None)
+        if existing is not None:
+            can_replace = bool(
+                getattr(existing, "_auto_unified_attached", False)
+                and getattr(existing, "step", 0) == 0
+                and (self.progressive is None or self.progressive.cpu_steps == 0)
+            )
+            if can_replace and hasattr(existing, "detach_and_restore"):
+                existing.detach_and_restore()
+            else:
+                raise RuntimeError("Probability warmup is already enabled")
         if self.progressive is not None and not self.progressive.complete:
             from src.progressive_execution import DeferredWarmup
             self.probability_warmup = DeferredWarmup(self, kwargs)
+            self.probability_warmup._auto_unified_attached = bool(_auto_unified)
             self.progressive.deferred_warmup = self.probability_warmup
             return self.probability_warmup
         from src.probability_warmup import ProbabilityWarmup
         self.probability_warmup = ProbabilityWarmup(self, **kwargs)
+        self.probability_warmup._auto_unified_attached = bool(_auto_unified)
         return self.probability_warmup
 
     def prefill_wavefront(self, step_tokens: torch.Tensor, chunk_size: int,
@@ -887,6 +1333,8 @@ class AirColibriModel:
         self._step_cancel_check = None
         if getattr(self, "probability_warmup", None) is not None:
             self.probability_warmup.reset()
+        if getattr(self, "survivor_tracker", None) is not None:
+            self.survivor_tracker.reset()
         self.tail_prefetched = False
         if getattr(self, "active_slot_per_layer", None):
             for i in range(len(self.active_slot_per_layer)):
@@ -960,6 +1408,13 @@ class AirColibriModel:
         """Удаляет хуки и освобождает ресурсы GPU и CPU."""
         if getattr(self, "progressive", None) is not None:
             self.progressive.close()
+        if getattr(self, "survivor_tracker", None) is not None:
+            self.survivor_tracker.close()
+            self.survivor_tracker = None
+        if getattr(self, "puzzle_controller", None) is not None:
+            self.puzzle_controller.close()
+            self.puzzle_controller = None
+        self.q1_arena = None
         if getattr(self, "probability_warmup", None) is not None:
             self.probability_warmup.close()
             self.probability_warmup = None

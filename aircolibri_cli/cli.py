@@ -53,6 +53,7 @@ from aircolibri_cli.runtime_config import (
 )
 
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_MODEL = 0, 1, 2, 3
+WEIGHT_FORMAT_CHOICES = ("auto", "q1_cubes", "q1", "q2", "q4", "q6", "q8", "bf16")
 
 
 def _add_engine_args(p: argparse.ArgumentParser) -> None:
@@ -75,21 +76,34 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         default="normal",
         help="normal: almost all free VRAM with a safety reserve (default); turbo: all free VRAM",
     )
-    p.add_argument("--max-context", type=int, default=None, help="Context tokens to reserve VRAM for (default 8192, 4096 on <=5 GB cards)")
+    p.add_argument("--max-context", type=int, default=None, help="KV memory-planning reservation; does not cap requests. Model architecture and available memory determine actual capacity.")
     p.add_argument("--prefill-chunk", type=int, default=None, help="Prompt tokens per prefill chunk (default 512, 256 on <=5 GB cards)")
     p.add_argument("--prefill-wavefront", action="store_true",
                    help="Experimental Llama prefill: overlap prompt chunks across three CUDA stages")
     p.add_argument("--no-mtp", action="store_true", help="Disable the speculative MTP head")
-    p.add_argument("--speculation", choices=("auto", "off", "lookup", "native"), default="auto",
-                   help="Shared streamed verification: native trained head when available, otherwise prompt lookup")
+    p.add_argument("--speculation", choices=("auto", "off", "lookup", "native", "q1"), default="auto",
+                   help="Shared streamed verification: native MTP head, prompt lookup, or Q1 2-plane self-speculation")
     p.add_argument("--mtp-head", type=str, default=None, help="Separate trained MTP safetensors for the selected model")
     p.add_argument("--mtp-head-budget-mib", type=int, default=128)
     p.add_argument("--region-pruning", action=argparse.BooleanOptionalAction, default=True,
                    help="Exclude proven zero-weight routed experts and cancel obsolete current-scope preparation")
+    p.add_argument("--thought-anchor", action=argparse.BooleanOptionalAction, default=False,
+                   help="Retain initial probability field Phi_0 with bounded log-odds steering across generation")
+    p.add_argument("--max-slot-mib", type=float, default=None,
+                   help="Cap per-slot VRAM budget in MiB (enables Q1 sub-layer / sub-lm_head cube streaming when below a layer or lm_head)")
     p.add_argument("--progressive-start", "--cpu-first", action=argparse.BooleanOptionalAction, default=True,
                    help="Start CPU and GPU preparation together; devices take work when ready (default); --no-progressive-start selects the GPU-first reference")
-    p.add_argument("--weight-format", choices=("auto", "bf16", "q4", "q6"), default="auto",
-                   help="Runtime weights: auto keeps the native Qwen Q4 path, otherwise uses universal Q6")
+    p.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto",
+                   help="Runtime weights: auto keeps native Qwen Q4 or universal Q6; explicit q1_cubes/q1/q2/q4/q6/q8/bf16")
+    p.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None,
+                   help="Explicit prefix depth; q1_cubes defaults to the complete 16-leaf tree, legacy q1 to 4")
+    p.add_argument("--cube-blueprint", help="Method 1 JSON map selecting Method 2 cube prefixes per projection")
+    p.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable dynamic Plane-0 vocabulary early-stop on Ideal Q1 LM head (default: on)")
+    p.add_argument("--puzzle-overlay", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable dynamic 3D Q1PuzzleOverlay (Ideal Q1 P=1 skeleton + contact-assembled delta cubes)")
+    p.add_argument("--puzzle-slice-ratio", type=float, default=0.35,
+                   help="Fraction of delta-cubes selected per dynamic slice S_t when --puzzle-overlay is enabled (0.0..1.0, default: 0.35)")
     p.add_argument("--max-drafts", type=int, default=2, help="Max speculative draft depth (1..3, default: 2)")
     p.add_argument(
         "--fast-vocab",
@@ -125,6 +139,13 @@ def _engine_from_args(args: argparse.Namespace) -> AirColibriUnifiedEngine:
         mtp_head_path=getattr(args, "mtp_head", None),
         mtp_head_budget_mib=getattr(args, "mtp_head_budget_mib", 128),
         prune_regions=getattr(args, "region_pruning", True),
+        thought_anchor=getattr(args, "thought_anchor", False),
+        max_slot_mib=getattr(args, "max_slot_mib", None),
+        q1_planes=getattr(args, "q1_planes", 4),
+        cube_blueprint=getattr(args, "cube_blueprint", None),
+        q1_early_stop=getattr(args, "q1_early_stop", True),
+        puzzle_overlay=getattr(args, "puzzle_overlay", False),
+        puzzle_slice_ratio=getattr(args, "puzzle_slice_ratio", 0.35),
     )
 
 
@@ -174,14 +195,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             report["startup_memory_probe"] = measure_gpu_memory(0)
             free_b, total_b = (report["startup_memory_probe"][k] for k in ("free_bytes", "total_bytes"))
             try:
+                max_slot_mib = getattr(args, "max_slot_mib", None)
+                extra_plan = {"max_slot_bytes": int(float(max_slot_mib) * 1024**2)} if max_slot_mib is not None else {}
+                wf_doc = getattr(args, "weight_format", "auto")
+                q1_p_doc = getattr(args, "q1_planes", None) or (16 if wf_doc == "q1_cubes" else 4)
+                if wf_doc in ("q1", "q1_cubes") or q1_p_doc != 4:
+                    extra_plan["q1_planes"] = q1_p_doc
                 profile, plan, _has_mtp = plan_for_checkpoint(
                     model_dir,
                     mode=args.vram_mode,
                     total_bytes=total_b,
                     free_bytes=free_b,
                     enable_mtp=not getattr(args, "no_mtp", False),
-                    weight_format=getattr(args, "weight_format", "auto"),
+                    weight_format=wf_doc,
                     prefill_wavefront=getattr(args, "prefill_wavefront", False),
+                    **extra_plan,
                 )
                 report["runtime_profile"] = profile
                 report["mtp_weights_present"] = bool(profile.get("mtp_weights"))
@@ -264,12 +292,14 @@ def cmd_models(args):
     return EXIT_OK
 
 
-def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vram_mode="normal"):
+def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vram_mode="normal",
+                        q1_planes=4, q1_early_stop=True):
     import torch
     from .unified_runtime import AirColibriUnifiedEngine
     with AirColibriUnifiedEngine(folder, aircolibri_root=root, device=device, weight_format=weight_format,
         vram_mode=vram_mode, enable_mtp=False, speculation="off", verbose=False,
-        max_context_tokens=512, prefill_chunk_tokens=8) as engine:
+        max_context_tokens=512, prefill_chunk_tokens=8, q1_planes=q1_planes,
+        q1_early_stop=q1_early_stop) as engine:
         ids = engine.tokenizer("Hi", return_tensors="pt").input_ids
         with torch.inference_mode():
             logits, cache = engine.engine._forward_step(ids, prefill=True, prefill_end=True, prefetch_next=False)
@@ -287,7 +317,9 @@ def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vr
 def cmd_prepare(args):
     root = find_aircolibri_root(args.aircolibri_root)
     folder = resolve_model_dir(args.model, root, allow_download=bool(args.model) and not Path(args.model).exists())
-    report = _verify_preparation(folder, root=root, device=args.device, weight_format=args.weight_format, vram_mode=args.vram_mode)
+    report = _verify_preparation(folder, root=root, device=args.device, weight_format=args.weight_format,
+                                 vram_mode=args.vram_mode, q1_planes=getattr(args, "q1_planes", 4),
+                                 q1_early_stop=getattr(args, "q1_early_stop", True))
     from .model_hub import register_model, save_json
     register_model(root, folder)
     if args.json_out:
@@ -303,8 +335,10 @@ def cmd_download(args):
                                              filename=args.file, revision=args.revision)
     try:
         if not args.no_verify:
-            receipt["preparation"] = _verify_preparation(folder, root=root, device=args.device,
-                weight_format=args.weight_format, vram_mode=args.vram_mode)
+            receipt["preparation"] = _verify_preparation(
+                folder, root=root, device=args.device, weight_format=args.weight_format,
+                vram_mode=args.vram_mode, q1_planes=getattr(args, "q1_planes", 4),
+                q1_early_stop=getattr(args, "q1_early_stop", True))
             receipt["status"] = "ready"
         save_json(marker, receipt)
         if args.json_out:
@@ -516,7 +550,9 @@ def build_parser() -> argparse.ArgumentParser:
                                                if command == "download" else "Verify a model's first forward and automatic runtime packing"))
         p_model.add_argument("--aircolibri-root", default=None)
         p_model.add_argument("--device", choices=("auto","cpu"), default="auto")
-        p_model.add_argument("--weight-format", choices=("auto","bf16","q4","q6"), default="auto")
+        p_model.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto")
+        p_model.add_argument("--q1-planes", type=int, choices=tuple(range(1, 9)), default=4)
+        p_model.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True)
         p_model.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
         p_model.add_argument("--json-out", default=None)
         if command == "download":
@@ -535,7 +571,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--download-dir", default=None)
     p_doc.add_argument("--device", choices=("auto", "cpu"), default="auto")
     p_doc.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
-    p_doc.add_argument("--weight-format", choices=("auto", "bf16", "q4", "q6"), default="auto")
+    p_doc.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto")
+    p_doc.add_argument("--q1-planes", type=int, choices=tuple(range(1, 9)), default=4)
+    p_doc.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True)
+    p_doc.add_argument("--max-slot-mib", type=float, default=None)
     p_doc.add_argument("--json-out", type=str, default=None)
     p_doc.set_defaults(func=cmd_doctor)
 

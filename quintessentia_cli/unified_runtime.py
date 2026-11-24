@@ -30,7 +30,7 @@ from typing import Any, Callable, Iterator
 import torch
 
 
-from .runtime_config import (PROJECT_ROOT, VRAM_MODES, ContextBudgetExceeded, GenerationCancelled,
+from .runtime_config import (model_context_limit, PROJECT_ROOT, VRAM_MODES, ContextBudgetExceeded, GenerationCancelled,
                              find_quintessentia_root, checkpoint_manifest_path)
 
 
@@ -149,6 +149,8 @@ class QuintessentiaSpecGate:
 
     SRC_MTP = 0
     SRC_LOOKUP = 1
+    SRC_Q1 = 2
+    NUM_SOURCES = 3
     PBINS = 10
 
     def __init__(self, max_drafts: int = 2, force_off: bool = False):
@@ -157,20 +159,21 @@ class QuintessentiaSpecGate:
         self.acc = [
             [0.80, 0.58, 0.45, 0.40],
             [0.65, 0.52, 0.45, 0.40],
+            [0.72, 0.50, 0.38, 0.30],
         ]
-        self.acc_w = [[2.0] * 4, [2.0] * 4]
+        self.acc_w = [[2.0] * 4 for _ in range(self.NUM_SOURCES)]
         self.t = [0.0] * 6
         self.t_w = [0.0] * 6
         self.rho = 0.12
         self.rho_w = 1.0
-        self.d = [0.0, 0.0]
-        self.d_w = [0.0, 0.0]
-        self.pb = [[(b + 0.5) / self.PBINS for b in range(self.PBINS)] for _ in range(2)]
-        self.pb_w = [[2.0] * self.PBINS for _ in range(2)]
-        self.prop = [[0, 0, 0, 0], [0, 0, 0, 0]]
-        self.hit = [[0, 0, 0, 0], [0, 0, 0, 0]]
-        self.verifies = [0, 0]
-        self.declined = [0, 0]
+        self.d = [0.0] * self.NUM_SOURCES
+        self.d_w = [0.0] * self.NUM_SOURCES
+        self.pb = [[(b + 0.5) / self.PBINS for b in range(self.PBINS)] for _ in range(self.NUM_SOURCES)]
+        self.pb_w = [[2.0] * self.PBINS for _ in range(self.NUM_SOURCES)]
+        self.prop = [[0, 0, 0, 0] for _ in range(self.NUM_SOURCES)]
+        self.hit = [[0, 0, 0, 0] for _ in range(self.NUM_SOURCES)]
+        self.verifies = [0] * self.NUM_SOURCES
+        self.declined = [0] * self.NUM_SOURCES
 
     @staticmethod
     def _ema(val: float, weight: float, sample: float, memory: float) -> tuple[float, float]:
@@ -187,7 +190,8 @@ class QuintessentiaSpecGate:
                 self.rho, self.rho_w = self._ema(self.rho, self.rho_w, r, 8.0)
 
     def record_draft_cost(self, src: int, seconds: float) -> None:
-        self.d[src], self.d_w[src] = self._ema(self.d[src], self.d_w[src], seconds, 8.0)
+        if 0 <= src < self.NUM_SOURCES:
+            self.d[src], self.d_w[src] = self._ema(self.d[src], self.d_w[src], seconds, 8.0)
 
     def rows_cost(self, rows: int) -> float:
         if rows <= 1:
@@ -218,6 +222,37 @@ class QuintessentiaSpecGate:
         v2 = (1.0 + a1 + a1 * a2) / (self.rows_cost(3) + extra_d)
         return v2 > v1 and v2 > 1.02
 
+    def expected_gain(self, src: int, probs: list[float]) -> float:
+        k_avail = min(len(probs), self.max_drafts)
+        if k_avail <= 0:
+            return 1.0
+        if self.off:
+            return 1.5
+        best_val = 1.0
+        e = 1.0
+        prod = 1.0
+        measured_d = (
+            self.d[src] / self.t[1]
+            if (0 <= src < self.NUM_SOURCES and self.d_w[src] > 0.0 and self.t_w[1] > 0.0 and self.t[1] > 0.0)
+            else None
+        )
+        for j in range(k_avail):
+            aj = self.calibrated_p(src, probs[j], j)
+            prod *= aj
+            e += prod
+            if measured_d is not None:
+                d_rel = measured_d
+            elif src == self.SRC_Q1:
+                d_rel = 0.25 * (j + 1)
+            elif src == self.SRC_MTP:
+                d_rel = 0.03 * (j + 1)
+            else:
+                d_rel = 0.0
+            val = e / (self.rows_cost(j + 2) + d_rel)
+            if val > best_val:
+                best_val = val
+        return best_val
+
     def pick_depth(self, src: int, probs: list[float]) -> int:
         k_avail = min(len(probs), self.max_drafts)
         if k_avail == 0:
@@ -241,7 +276,7 @@ class QuintessentiaSpecGate:
         return best_k
 
     def record_result(self, src: int, judged: int, accepted: int, probs: list[float] | None = None) -> None:
-        if judged < 1:
+        if judged < 1 or not (0 <= src < self.NUM_SOURCES):
             return
         self.verifies[src] += 1
         for j in range(min(judged, 4)):
@@ -259,8 +294,10 @@ class QuintessentiaSpecGate:
         mtp_hit = sum(self.hit[0])
         lkp_prop = sum(self.prop[1])
         lkp_hit = sum(self.hit[1])
-        tot_prop = mtp_prop + lkp_prop
-        tot_hit = mtp_hit + lkp_hit
+        q1_prop = sum(self.prop[2])
+        q1_hit = sum(self.hit[2])
+        tot_prop = mtp_prop + lkp_prop + q1_prop
+        tot_hit = mtp_hit + lkp_hit + q1_hit
         return {
             "mtp_verifies": self.verifies[0],
             "mtp_proposed": mtp_prop,
@@ -270,6 +307,10 @@ class QuintessentiaSpecGate:
             "lookup_proposed": lkp_prop,
             "lookup_accepted": lkp_hit,
             "lookup_accept_rate_pct": round(100.0 * lkp_hit / max(1, lkp_prop), 2),
+            "q1_verifies": self.verifies[2],
+            "q1_proposed": q1_prop,
+            "q1_accepted": q1_hit,
+            "q1_accept_rate_pct": round(100.0 * q1_hit / max(1, q1_prop), 2),
             "overall_accept_rate_pct": round(100.0 * tot_hit / max(1, tot_prop), 2),
             "declined_low_confidence": sum(self.declined),
             "measured_rho_extra_row_cost": round(self.rho, 4),
@@ -513,11 +554,22 @@ def forward_step_all_logits(
         extra["use_cache"] = True
     if cache_kw == "past_key_values" or mask_arg is not None:
         extra["attention_mask"] = mask_arg
-    outputs = engine.model(
-        inputs_embeds=inputs_embeds,
-        input_ids=None,
-        **extra,
-    )
+    tracker = getattr(engine, "survivor_tracker", None)
+    is_prefill_call = bool(logits_to_keep == 1 and (past_key_values is None or step_tokens.shape[-1] > 1))
+    is_aux_call = bool(getattr(engine, "_auxiliary_depth", 0))
+    if tracker is not None:
+        tracker.begin_prefill_chunk(is_last_chunk=is_prefill_call, auxiliary=is_aux_call)
+    try:
+        outputs = engine.model(
+            inputs_embeds=inputs_embeds,
+            input_ids=None,
+            **extra,
+        )
+    finally:
+        if tracker is not None:
+            tracker.end_prefill_chunk()
+            if is_prefill_call and not is_aux_call:
+                tracker.sync_draft_vocab()
     next_cache = getattr(outputs, "past_key_values", None)
     if next_cache is None and cache_kw and cache_kw != "past_key_values":
         next_cache = getattr(outputs, cache_kw, None)
@@ -966,6 +1018,10 @@ def install_quintessentia_anchor_ring_schedule(engine: Any, resident_set: set[in
 
     num_layers = engine.config.num_hidden_layers
     stream_layers = [i for i in range(num_layers) if i not in resident_set]
+    next_stream_layer: dict[int, int | None] = {
+        l_id: (stream_layers[pos + 1] if pos + 1 < len(stream_layers) else None)
+        for pos, l_id in enumerate(stream_layers)
+    }
     slot_queues: list[list[int]] = [[] for _ in range(engine.num_slots)]
     next_in_slot_queue: dict[int, int | None] = {}
     for s_idx in stream_layers:
@@ -975,6 +1031,7 @@ def install_quintessentia_anchor_ring_schedule(engine: Any, resident_set: set[in
             next_in_slot_queue[l_id] = q[pos + 1] if (pos + 1 < len(q)) else None
 
     tail_prefetched_slot = [False] * engine.num_slots
+    dynamic_tail_prefetched = [False]
     layer_q4_bindings = []
     layer_param_names = []
     for layer_mod in engine.model.model.layers:
@@ -992,15 +1049,29 @@ def install_quintessentia_anchor_ring_schedule(engine: Any, resident_set: set[in
             if cancel_fn is not None:
                 cancel_fn()
             i = module._air_layer_idx
+            warm = getattr(engine, "probability_warmup", None)
+            dynamic = bool(warm is not None and warm.dynamic_regions)
+            if dynamic:
+                warm.before_layer(i)
             if i in resident_set:
                 return
             slot = engine.pipeline.acquire_slot_for_compute(i)
             engine.active_slot_per_layer[i] = slot
+            slot_map = getattr(slot, "active_tensors", None) or slot.tensors
             for submod, q_k, s_k, z_k in layer_q4_bindings[i]:
-                submod.bind_q4_tensors(slot.tensors[q_k], slot.tensors[s_k], slot.tensors[z_k])
+                submod.bind_q4_tensors(slot_map[q_k], slot_map[s_k], slot_map[z_k])
             for k in layer_param_names[i]:
-                if k in slot.tensors:
-                    set_module_tensor_to_device(module, k, engine.device, value=slot.tensors[k], clear_cache=False)
+                if k in slot_map:
+                    set_module_tensor_to_device(module, k, engine.device, value=slot_map[k], clear_cache=False)
+            if dynamic:
+                nxt_s = next_stream_layer.get(i)
+                if nxt_s is not None:
+                    nxt_sid = nxt_s % engine.num_slots
+                    nxt_slot = engine.pipeline.slots[nxt_sid]
+                    if nxt_slot.current_layer_idx != nxt_s or not nxt_slot.loaded_keys:
+                        pinned_t = engine.weight_manager.load_layer_to_pinned_slot(nxt_s, target_slot_idx=nxt_sid)
+                        ready_slot = engine.pipeline.get_slot_for_loading(nxt_s)
+                        engine.pipeline.load_tensors_async(ready_slot, pinned_t, pinned_pool=engine.weight_manager.pinned_pool)
 
         def _post_hook(module, _args, output):
             i = module._air_layer_idx
@@ -1009,6 +1080,19 @@ def install_quintessentia_anchor_ring_schedule(engine: Any, resident_set: set[in
             slot = engine.active_slot_per_layer[i]
             engine.pipeline.release_slot_after_compute(slot)
             engine.active_slot_per_layer[i] = None
+
+            warm = getattr(engine, "probability_warmup", None)
+            if warm is not None and warm.dynamic_regions:
+                if next_stream_layer.get(i) is None and engine.tail_to_head_prefetch and engine._prefetch_next_step and stream_layers:
+                    first_l = stream_layers[0]
+                    first_sid = first_l % engine.num_slots
+                    first_slot = engine.pipeline.slots[first_sid]
+                    if first_slot.state.value == "FREE" and not dynamic_tail_prefetched[0]:
+                        pinned_t = engine.weight_manager.load_layer_to_pinned_slot(first_l, target_slot_idx=first_sid)
+                        next_slot = engine.pipeline.get_slot_for_loading(first_l)
+                        engine.pipeline.load_tensors_async(next_slot, pinned_t, pinned_pool=engine.weight_manager.pinned_pool)
+                        dynamic_tail_prefetched[0] = True
+                return output
 
             sid = slot.slot_id
             nxt_l = next_in_slot_queue[i]
@@ -1031,36 +1115,64 @@ def install_quintessentia_anchor_ring_schedule(engine: Any, resident_set: set[in
         step_tokens: torch.Tensor, past_key_values: Any = None, prefetch_next: bool = True, **model_kwargs
     ):
         engine._prefetch_next_step = prefetch_next
+        warm = getattr(engine, "probability_warmup", None)
+        is_prefill = past_key_values is None or step_tokens.shape[-1] > 1
+        if warm is not None:
+            warm.begin_step(step_tokens, past_key_values, prefill=is_prefill, prefill_end=True)
         inputs_embeds = engine._embed_step_tokens(step_tokens)
-        for sid, q in enumerate(slot_queues):
-            if not q:
-                continue
-            if tail_prefetched_slot[sid]:
-                tail_prefetched_slot[sid] = False
-                continue
-            first_l = q[0]
-            pinned_t = engine.weight_manager.load_layer_to_pinned_slot(first_l, target_slot_idx=sid)
-            slot = engine.pipeline.get_slot_for_loading(first_l)
-            engine.pipeline.load_tensors_async(slot, pinned_t, pinned_pool=engine.weight_manager.pinned_pool)
+        if warm is not None and warm.dynamic_regions:
+            if stream_layers:
+                if dynamic_tail_prefetched[0]:
+                    dynamic_tail_prefetched[0] = False
+                else:
+                    first_l = stream_layers[0]
+                    first_sid = first_l % engine.num_slots
+                    pinned_t = engine.weight_manager.load_layer_to_pinned_slot(first_l, target_slot_idx=first_sid)
+                    slot = engine.pipeline.get_slot_for_loading(first_l)
+                    engine.pipeline.load_tensors_async(slot, pinned_t, pinned_pool=engine.weight_manager.pinned_pool)
+        else:
+            for sid, q in enumerate(slot_queues):
+                if not q:
+                    continue
+                if tail_prefetched_slot[sid]:
+                    tail_prefetched_slot[sid] = False
+                    continue
+                first_l = q[0]
+                pinned_t = engine.weight_manager.load_layer_to_pinned_slot(first_l, target_slot_idx=sid)
+                slot = engine.pipeline.get_slot_for_loading(first_l)
+                engine.pipeline.load_tensors_async(slot, pinned_t, pinned_pool=engine.weight_manager.pinned_pool)
         B, S = step_tokens.shape
         mask_arg = (
             _DECODE_NO_MASK
             if (B == 1 and 1 <= S <= 4 and past_key_values is not None and _cache_seq_len(past_key_values) > 0)
             else None
         )
-        outputs = engine.model(
-            inputs_embeds=inputs_embeds,
-            input_ids=None,
-            attention_mask=mask_arg,
-            past_key_values=past_key_values,
-            use_cache=True,
-            **model_kwargs,
-        )
+        tracker = getattr(engine, "survivor_tracker", None)
+        is_aux_ring = bool(getattr(engine, "_auxiliary_depth", 0) or (warm is not None and getattr(warm, "_auxiliary_depth", 0)))
+        if tracker is not None:
+            tracker.begin_prefill_chunk(is_last_chunk=bool(is_prefill), auxiliary=is_aux_ring)
+        try:
+            outputs = engine.model(
+                inputs_embeds=inputs_embeds,
+                input_ids=None,
+                attention_mask=mask_arg,
+                past_key_values=past_key_values,
+                use_cache=True,
+                **model_kwargs,
+            )
+        finally:
+            if tracker is not None:
+                tracker.end_prefill_chunk()
+                if is_prefill and not is_aux_ring:
+                    tracker.sync_draft_vocab()
+        if warm is not None:
+            warm.end_step(outputs.logits, outputs.past_key_values)
         return outputs.logits, outputs.past_key_values
 
     def _reset_anchor_ring() -> None:
         for idx_s in range(len(tail_prefetched_slot)):
             tail_prefetched_slot[idx_s] = False
+        dynamic_tail_prefetched[0] = False
 
     engine._anchor_ring_prepare = True
     engine._anchor_ring_forward = _anchor_ring_forward
@@ -1465,6 +1577,8 @@ class VRAMPlan:
     prefill_chunk_tokens: int
     max_context_tokens: int
     weights_bytes: int
+    sub_layer_cubes: bool = False
+    streamed_lm_head: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -1488,6 +1602,9 @@ def plan_vram(
     prefill_chunk_tokens: int | None = None,
     ring_slots: int = 3,
     prefill_wavefront: bool = False,
+    allow_cube_subdivision: bool = False,
+    max_slot_bytes: int | None = None,
+    min_cube_slot_bytes: int = 2 * MiB,
 ) -> VRAMPlan:
     """Splits the *available* VRAM between weights and a guaranteed working reserve.
 
@@ -1497,12 +1614,16 @@ def plan_vram(
 
     When the weights do not fit, the remaining budget is cut into ``ring_slots`` equal slots that
     rotate roles (computing -> clean -> receiving the next weights) so the next layer is already
-    in VRAM when the current one finishes; as many layers as fit stay resident.
+    in VRAM when the current one finishes; as many layers as fit stay resident. When
+    ``allow_cube_subdivision=True`` (or ``max_slot_bytes`` caps per-slot VRAM below a full layer
+    or ``lm_head``), layers and/or ``lm_head`` subdivide into 2D Q1 cubes along ``A -> B -> C(0) -> A``.
     """
     if mode not in VRAM_MODES:
         raise ValueError(
             f"vram_mode must be one of {VRAM_MODES} (got {mode!r}); fixed `4gb`/`8gb` profiles were removed"
         )
+    if max_slot_bytes is not None and int(max_slot_bytes) <= 0:
+        raise ValueError("max_slot_bytes must be positive")
     low_vram = total_bytes <= 5 * GiB
     chunk = int(prefill_chunk_tokens or (256 if low_vram else 512))
     max_ctx = int(max_context_tokens or (4096 if low_vram else 8192))
@@ -1522,19 +1643,73 @@ def plan_vram(
     budget = max(0, int(free_bytes) - reserve)
 
     n = len(layer_bytes)
-    weights_all = sum(layer_bytes) + lm_head_bytes
-    if budget >= weights_all + mtp_bytes:
-        return VRAMPlan(mode, total_bytes, free_bytes, reserve, budget, n, n, 0, 0, True, mtp_bytes > 0,
-                        chunk, max_ctx, weights_all + mtp_bytes)
+    max_layer = max(layer_bytes) if layer_bytes else 0
+    explicit_sub_layer = max_slot_bytes is not None and max_layer > 0 and int(max_slot_bytes) < max_layer
+    explicit_sub_head = max_slot_bytes is not None and lm_head_bytes > 0 and int(max_slot_bytes) < lm_head_bytes
 
-    slot = max(layer_bytes) if layer_bytes else 0
+    weights_all = sum(layer_bytes) + lm_head_bytes
+    if not explicit_sub_layer and not explicit_sub_head and budget >= weights_all + mtp_bytes:
+        return VRAMPlan(mode, total_bytes, free_bytes, reserve, budget, n, n, 0, 0, True, mtp_bytes > 0,
+                        chunk, max_ctx, weights_all + mtp_bytes, False, False)
+
     ring_slots = max(3, min(4, int(ring_slots)))
+    if explicit_sub_layer or explicit_sub_head:
+        if not allow_cube_subdivision:
+            raise RuntimeError(
+                f"Not enough per-slot VRAM ({int(max_slot_bytes) / MiB:.1f} MiB) without Q1 cube subdivision"
+            )
+        cap = int(max_slot_bytes)
+        slot = min(max_layer, cap) if max_layer > 0 else cap
+        stream_head = bool(explicit_sub_head)
+        eff_head = 0 if stream_head else lm_head_bytes
+        if budget < eff_head + ring_slots * slot:
+            if not stream_head and budget >= ring_slots * min(slot, max(1, budget // ring_slots)) and budget >= ring_slots * min(cap, min_cube_slot_bytes):
+                stream_head = True
+                eff_head = 0
+                slot = min(slot, budget // ring_slots)
+            elif stream_head and budget >= ring_slots * min(cap, min_cube_slot_bytes):
+                slot = min(slot, budget // ring_slots)
+            else:
+                raise RuntimeError(
+                    f"Not enough free VRAM for mode={mode}: budget {budget / MiB:.0f} MiB < "
+                    f"{(eff_head + ring_slots * slot) / MiB:.0f} MiB"
+                )
+        weights = eff_head + ring_slots * slot
+        return VRAMPlan(mode, total_bytes, free_bytes, reserve, budget, n, 0, ring_slots, slot, False,
+                        False, chunk, max_ctx, weights,
+                        sub_layer_cubes=bool(explicit_sub_layer or (max_layer > 0 and slot < max_layer)),
+                        streamed_lm_head=stream_head)
+
+    slot = max_layer
     base = lm_head_bytes + ring_slots * slot
     if budget < base:
-        raise RuntimeError(
-            f"Not enough free VRAM for mode={mode}: budget {budget / MiB:.0f} MiB < "
-            f"{base / MiB:.0f} MiB (LM head + {ring_slots} ring slots). Close other GPU programs or use --vram-mode turbo."
-        )
+        if not allow_cube_subdivision:
+            raise RuntimeError(
+                f"Not enough free VRAM for mode={mode}: budget {budget / MiB:.0f} MiB < "
+                f"{base / MiB:.0f} MiB (LM head + {ring_slots} ring slots). Close other GPU programs or use --vram-mode turbo."
+            )
+        min_ring = ring_slots * int(min_cube_slot_bytes)
+        if budget < min_ring:
+            raise RuntimeError(
+                f"Not enough free VRAM for mode={mode}: budget {budget / MiB:.0f} MiB < "
+                f"{min_ring / MiB:.0f} MiB minimum Q1 cube streaming ring. Close other GPU programs or use --device cpu."
+            )
+        if budget >= lm_head_bytes + min_ring:
+            slot_cap = (budget - lm_head_bytes) // ring_slots
+            if max_slot_bytes is not None:
+                slot_cap = min(slot_cap, int(max_slot_bytes))
+            sub_slot = max(int(min_cube_slot_bytes), min(max_layer, slot_cap)) if max_layer > 0 else slot_cap
+            weights = lm_head_bytes + ring_slots * sub_slot
+            return VRAMPlan(mode, total_bytes, free_bytes, reserve, budget, n, 0, ring_slots, sub_slot, False,
+                            False, chunk, max_ctx, weights, sub_layer_cubes=True, streamed_lm_head=False)
+        slot_cap = budget // ring_slots
+        if max_slot_bytes is not None:
+            slot_cap = min(slot_cap, int(max_slot_bytes))
+        sub_slot = max(int(min_cube_slot_bytes), slot_cap)
+        weights = ring_slots * sub_slot
+        return VRAMPlan(mode, total_bytes, free_bytes, reserve, budget, n, 0, ring_slots, sub_slot, False,
+                        False, chunk, max_ctx, weights, sub_layer_cubes=True, streamed_lm_head=True)
+
     enable_mtp = mtp_bytes > 0 and budget - base - mtp_bytes >= min(layer_bytes or [0]) * 4
     room = budget - base - (mtp_bytes if enable_mtp else 0)
     resident = 0
@@ -1549,7 +1724,7 @@ def plan_vram(
     resident = min(resident, n - 1)
     weights = lm_head_bytes + used + ring_slots * slot + (mtp_bytes if enable_mtp else 0)
     return VRAMPlan(mode, total_bytes, free_bytes, reserve, budget, n, resident, ring_slots, slot, False,
-                    enable_mtp, chunk, max_ctx, weights)
+                    enable_mtp, chunk, max_ctx, weights, False, False)
 
 
 def _model_shape_inventory(model_dir: Path, source: Any, num_layers: int) -> tuple[list[dict[str, tuple]], dict[str, tuple], dict[str, tuple]]:
@@ -1575,6 +1750,29 @@ def _model_shape_inventory(model_dir: Path, source: Any, num_layers: int) -> tup
     return layers, _shapes(model_dir / "model-globals.safetensors"), _shapes(model_dir / "model-mtp.safetensors")
 
 
+SUPPORTED_RUNTIME_WEIGHT_FORMATS = ("auto", "q1_cubes", "q1", "q2", "q4", "q6", "q8", "bf16")
+
+
+def _q1_lm_head_telemetry(model: Any) -> dict[str, Any] | None:
+    if model is None:
+        return None
+    out_emb = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else getattr(model, "lm_head", None)
+    if out_emb is None or (type(out_emb).__name__ != "IdealQ1LMHead" and not hasattr(out_emb, "vocab_rows_pruned_pct")):
+        return None
+    raw = out_emb.stats() if hasattr(out_emb, "stats") and callable(out_emb.stats) else {}
+    planes = int(raw.get("q1_planes", getattr(out_emb, "q1_planes", getattr(out_emb, "planes", 1))))
+    eff = float(raw.get("effective_bits", raw.get("avg_effective_bits", float(planes))))
+    pruned = float(raw.get("vocab_rows_pruned_pct", 0.0))
+    early = bool(raw.get("early_stop_enabled", getattr(out_emb, "early_stop", False)))
+    return {
+        **raw,
+        "effective_bits": round(eff, 4),
+        "vocab_rows_pruned_pct": round(pruned, 2),
+        "early_stop_enabled": early,
+        "q1_planes": planes,
+    }
+
+
 def plan_for_checkpoint(
     model_dir: str | Path,
     *,
@@ -1588,10 +1786,13 @@ def plan_for_checkpoint(
     prefill_wavefront: bool = False,
     force_universal: bool = False,
     projection_metadata: dict | None = None,
+    allow_cube_subdivision: bool = True,
+    max_slot_bytes: int | None = None,
+    q1_planes: int | None = None,
 ) -> tuple[dict[str, Any], VRAMPlan, bool]:
     """Plan from headers and meta modules, including the actual packed projections.
 
-    Native MTP remains guarded by the specialized Qwen geometry. Generic Q4/Q6
+    Native MTP remains guarded by the specialized Qwen geometry. Generic Q1/Q2/Q4/Q6/Q8
     uses architecture modules and bounded dense/expert kernels.
     """
     from .model_source import open_model_source, raw_text_config_dict, runtime_profile
@@ -1600,13 +1801,27 @@ def plan_for_checkpoint(
     profile = runtime_profile(folder)
     if prefill_wavefront and profile.get("model_type") != "llama":
         raise ValueError("Experimental wavefront prefill currently supports Llama models only")
-    if weight_format not in ("auto", "bf16", "q4", "q6"):
-        raise ValueError("weight_format must be auto, bf16, q4 or q6")
+    if weight_format not in SUPPORTED_RUNTIME_WEIGHT_FORMATS:
+        raise ValueError(f"weight_format must be one of {SUPPORTED_RUNTIME_WEIGHT_FORMATS}")
+    q1_p = int(q1_planes if q1_planes is not None else (16 if weight_format == "q1_cubes" else 4))
+    if not 1 <= q1_p <= (16 if weight_format == "q1_cubes" else 8):
+        raise ValueError("q1_planes exceeds the representation depth (q1_cubes supports 16)")
     profile = dict(profile)
     fast = bool(profile["fast_qwen"]) and weight_format in ("auto", "q4") and not force_universal
     selected_format = ("q4" if fast else "q6") if weight_format == "auto" else weight_format
-    profile.update(fast_qwen=fast, weight_format=selected_format,
-                   backend="qwen35-q4" if fast else f"universal-{selected_format}")
+    profile.update(
+        fast_qwen=fast,
+        weight_format=selected_format,
+        backend=(
+            "qwen35-q4"
+            if fast
+            else "unified-q1-cubes"
+            if selected_format == "q1_cubes"
+            else f"universal-{selected_format}"
+        ),
+    )
+    if selected_format in ("q1", "q1_cubes"):
+        profile["q1_planes"] = q1_p
     cfg = raw_text_config_dict(folder)
     num_layers = int(
         cfg.get("num_hidden_layers")
@@ -1630,9 +1845,51 @@ def plan_for_checkpoint(
         if "mtp.fc.weight" in mtp_sh:
             mtp_bytes += q4_bytes_for_shape(tuple(mtp_sh["mtp.fc.weight"]))
         has_mtp = "mtp.fc.weight" in mtp_sh
+    elif selected_format == "q1_cubes":
+        layer_bytes = []
+        packed_count = 0
+        for shapes in layers:
+            size = 0
+            for name, shape in shapes.items():
+                sh = tuple(shape)
+                lname = str(name).lower()
+                is_router = (
+                    len(sh) == 2
+                    and int(sh[0]) <= 512
+                    and (
+                        lname.endswith(".gate.weight")
+                        or lname.endswith(".router.weight")
+                        or lname.endswith(".router.layer.weight")
+                        or ".router." in lname
+                    )
+                )
+                if len(sh) == 2 and lname.endswith(".weight") and not is_router and int(sh[1]) >= 64 and int(sh[1]) % 64 == 0:
+                    n_out, k_in = int(sh[0]), int(sh[1])
+                    # Shared qscale[0] Binary Halving Q1 storage: packed_lo + qscale[0] + qzero + Sinkhorn row/col scales
+                    size += q1_p * n_out * (k_in // 8) + 2 * n_out * (k_in // 64) * 2 + 2 * (n_out + k_in)
+                    packed_count += 1
+                else:
+                    size += bf16_bytes_for_shape(sh)
+            layer_bytes.append(size)
+        profile["packed_projections"] = packed_count
+        profile["q1_cubes_layer_bytes"] = list(layer_bytes)
+        shape = tuple(globals_sh.get("lm_head.weight", (int(cfg.get("vocab_size") or 1), cfg_hidden)))
+        bf16_lm_b = bf16_bytes_for_shape(shape)
+        if len(shape) == 2 and bf16_lm_b >= 256 * MiB and int(shape[1]) >= 64 and int(shape[1]) % 64 == 0:
+            v_sz, h_sz = int(shape[0]), int(shape[1])
+            lm_root = 16 if q1_p > 8 else 8
+            lm_cubes = max(1, min(lm_root, max(5, q1_p)))
+            lm_head_bytes = lm_cubes * v_sz * (h_sz // 8) + 2 * v_sz * (h_sz // 64) * 2 + 2 * (v_sz + h_sz)
+        else:
+            lm_head_bytes = bf16_lm_b
+        profile["q1_cubes_lm_head_bytes"] = int(lm_head_bytes)
+        mtp_bytes = 0
+        has_mtp = False
     else:
         quant_map = {}
+        sel_bits = 0
         if selected_format != "bf16":
+            sel_bits = int(selected_format[1:])
             from accelerate import init_empty_weights
             from transformers import AutoModelForCausalLM
             from .model_source import load_runtime_config
@@ -1642,7 +1899,7 @@ def plan_for_checkpoint(
             else:
                 with init_empty_weights():
                     probe_model = AutoModelForCausalLM.from_config(load_runtime_config(folder), dtype=torch.bfloat16)
-                quant_map = projection_map(probe_model, layers, int(selected_format[-1]))
+                quant_map = projection_map(probe_model, layers, sel_bits, q1_planes=q1_p)
                 del probe_model
         layer_bytes = []
         for idx, shapes in enumerate(layers):
@@ -1653,33 +1910,92 @@ def plan_for_checkpoint(
                 if spec is None:
                     size += bf16_bytes_for_shape(tuple(shape))
                 else:
-                    size += sum(math.prod(sh) * torch.empty((), dtype=dt).element_size()
-                                for sh, dt in packed_specs(key, spec["shape"], int(selected_format[-1])).values())
+                    size += sum(
+                        math.prod(sh) * torch.empty((), dtype=dt).element_size()
+                        for sh, dt in packed_specs(key, spec["shape"], sel_bits, q1_planes=q1_p).values()
+                    )
             layer_bytes.append(size)
         profile["packed_projections"] = sum(len(v) for v in quant_map.values())
-        shape = globals_sh.get("lm_head.weight", (int(cfg.get("vocab_size") or 1), cfg_hidden))
-        lm_head_bytes = bf16_bytes_for_shape(tuple(shape))
+        shape = tuple(globals_sh.get("lm_head.weight", (int(cfg.get("vocab_size") or 1), cfg_hidden)))
+        if selected_format == "q1" and len(shape) == 2 and shape[1] >= 16 and shape[1] % 16 == 0:
+            v_sz, h_sz = int(shape[0]), int(shape[1])
+            gs = 64 if h_sz % 64 == 0 else (32 if h_sz % 32 == 0 else 16)
+            lm_head_bytes = sum(
+                math.prod(sh) * torch.empty((), dtype=dt).element_size()
+                for sh, dt in packed_specs("lm_head.weight", (v_sz, h_sz), 1, gs, q1_planes=q1_p).values()
+            )
+        else:
+            lm_head_bytes = bf16_bytes_for_shape(shape)
         mtp_bytes = 0
         has_mtp = False
     kv, rec, hidden_size, intermediate = state_bytes_from_config(cfg)
-    plan = plan_vram(
-        mode,
-        total_bytes=total_bytes,
-        free_bytes=free_bytes,
-        layer_bytes=layer_bytes,
-        lm_head_bytes=lm_head_bytes,
-        mtp_bytes=mtp_bytes if (enable_mtp and has_mtp and fast) else 0,
-        kv_bytes_per_token=kv,
-        recurrent_state_bytes=rec,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate,
-        max_context_tokens=max_context_tokens,
-        prefill_chunk_tokens=prefill_chunk_tokens,
-        prefill_wavefront=prefill_wavefront,
-    )
+    eff_allow_cube_sub = bool(allow_cube_subdivision and not prefill_wavefront and selected_format != "q1_cubes")
+    try:
+        plan = plan_vram(
+            mode,
+            total_bytes=total_bytes,
+            free_bytes=free_bytes,
+            layer_bytes=layer_bytes,
+            lm_head_bytes=lm_head_bytes,
+            mtp_bytes=mtp_bytes if (enable_mtp and has_mtp and fast) else 0,
+            kv_bytes_per_token=kv,
+            recurrent_state_bytes=rec,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate,
+            max_context_tokens=max_context_tokens,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            prefill_wavefront=prefill_wavefront,
+            allow_cube_subdivision=eff_allow_cube_sub,
+            max_slot_bytes=max_slot_bytes,
+        )
+    except RuntimeError:
+        if selected_format != "q1_cubes":
+            raise
+        # Binary Halving Q1 Cube mode streams strictly 1 active layer at a time (A->B->C(0)->A, 0 B standby),
+        # so it succeeds whenever free VRAM fits lm_head + 1 active layer even if a 3-slot ring would not.
+        max_layer = max(layer_bytes) if layer_bytes else 0
+        probe_plan = plan_vram(
+            mode,
+            total_bytes=total_bytes,
+            free_bytes=free_bytes,
+            layer_bytes=[0] * len(layer_bytes),
+            lm_head_bytes=0,
+            mtp_bytes=0,
+            kv_bytes_per_token=kv,
+            recurrent_state_bytes=rec,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate,
+            max_context_tokens=max_context_tokens,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            prefill_wavefront=False,
+            allow_cube_subdivision=True,
+            max_slot_bytes=None,
+        )
+        if probe_plan.budget_bytes < lm_head_bytes + max_layer:
+            raise
+        plan = VRAMPlan(
+            mode,
+            total_bytes,
+            free_bytes,
+            probe_plan.reserve_bytes,
+            probe_plan.budget_bytes,
+            len(layer_bytes),
+            0,
+            1,
+            max_layer,
+            False,
+            False,
+            probe_plan.prefill_chunk_tokens,
+            probe_plan.max_context_tokens,
+            lm_head_bytes + max_layer,
+            False,
+            False,
+        )
     profile = dict(profile)
     profile["mtp_weights"] = has_mtp
     profile["mtp_enabled"] = bool(has_mtp and fast and enable_mtp and plan.enable_mtp)
+    profile["sub_layer_cubes"] = bool(plan.sub_layer_cubes)
+    profile["streamed_lm_head"] = bool(plan.streamed_lm_head)
     return profile, plan, has_mtp and fast
 
 
@@ -1737,6 +2053,113 @@ def _eos_token_set(eos_token_id: Any) -> set[int]:
     return set()
 
 
+@dataclass
+class SamplingConfig:
+    """Fast GPU token sampling + anti-loop penalty parameters."""
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    penalty_window: int = 256
+    seed: int | None = None
+
+    @property
+    def is_greedy_plain(self) -> bool:
+        return (
+            float(self.temperature) <= 0.0
+            and float(self.repetition_penalty) == 1.0
+            and float(self.presence_penalty) == 0.0
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "temperature": round(float(self.temperature), 4),
+            "top_p": round(float(self.top_p), 4),
+            "top_k": int(self.top_k),
+            "repetition_penalty": round(float(self.repetition_penalty), 4),
+            "presence_penalty": round(float(self.presence_penalty), 4),
+            "penalty_window": int(self.penalty_window),
+            "seed": self.seed,
+        }
+
+
+@torch.no_grad()
+def sample_next_token(
+    logits_row: torch.Tensor,
+    gen_history: list[int] | None,
+    cfg: SamplingConfig | None,
+    *,
+    rng: torch.Generator | None = None,
+) -> int:
+    """Selects next token id on GPU/CPU with optional anti-loop penalties and top-k/top-p sampling.
+
+    When `cfg is None` or `cfg.is_greedy_plain`, runs zero-overhead exact `argmax`.
+    Penalties apply strictly to `gen_history` (model-generated tokens, never the user prompt).
+    """
+    row = logits_row.reshape(-1)
+    if cfg is None or cfg.is_greedy_plain:
+        return int(row.argmax(dim=-1).item())
+
+    scores = row.float().clone()
+    vocab = int(scores.numel())
+
+    rp = float(cfg.repetition_penalty)
+    pp = float(cfg.presence_penalty)
+    if (rp != 1.0 or pp != 0.0) and gen_history:
+        win = int(cfg.penalty_window)
+        tail = gen_history[-win:] if win > 0 else gen_history
+        uniq = sorted({int(t) for t in tail if 0 <= int(t) < vocab})
+        if uniq:
+            idx = torch.tensor(uniq, dtype=torch.long, device=scores.device)
+            vals = scores.index_select(0, idx)
+            if rp != 1.0:
+                vals = torch.where(vals < 0.0, vals * rp, vals / rp)
+            if pp != 0.0:
+                vals = vals - pp
+            scores.index_copy_(0, idx, vals)
+
+    temp = float(cfg.temperature)
+    if temp <= 0.0:
+        return int(scores.argmax(dim=-1).item())
+
+    scores = scores / temp
+    top_k = int(cfg.top_k)
+    top_p = float(cfg.top_p)
+
+    def _multinomial_pick(p: torch.Tensor) -> int:
+        if rng is not None and rng.device != p.device:
+            p = p.to(rng.device)
+        return int(torch.multinomial(p, num_samples=1, generator=rng).item())
+
+    if 0 < top_k < vocab:
+        top_v, top_i = torch.topk(scores, k=top_k)
+        probs = torch.softmax(top_v, dim=-1)
+        if 0.0 < top_p < 1.0:
+            cdf = torch.cumsum(probs, dim=-1)
+            keep = (cdf - probs) <= top_p
+            keep[0] = True
+            probs = torch.where(keep, probs, torch.zeros_like(probs))
+            probs = probs / probs.sum().clamp_min(1e-12)
+        pos = _multinomial_pick(probs)
+        return int(top_i[pos].item())
+
+    if 0.0 < top_p < 1.0:
+        sorted_v, sorted_i = torch.sort(scores, descending=True)
+        probs = torch.softmax(sorted_v, dim=-1)
+        cdf = torch.cumsum(probs, dim=-1)
+        keep = (cdf - probs) <= top_p
+        keep[0] = True
+        probs = torch.where(keep, probs, torch.zeros_like(probs))
+        probs = probs / probs.sum().clamp_min(1e-12)
+        pos = _multinomial_pick(probs)
+        return int(sorted_i[pos].item())
+
+    probs = torch.softmax(scores, dim=-1)
+    return _multinomial_pick(probs)
+
+
 class QuintessentiaUnifiedEngine:
     """High-level self-contained unified engine for CLI `ask`, `chat`, and LAN `serve`."""
 
@@ -1761,27 +2184,129 @@ class QuintessentiaUnifiedEngine:
         mtp_head_path: str | Path | None = None,
         mtp_head_budget_mib: int = 128,
         prune_regions: bool = True,
+        thought_anchor: bool = False,
+        max_slot_mib: float | int | None = None,
+        max_slot_bytes: int | None = None,
+        q1_planes: int | None = None,
+        q1_early_stop: bool = True,
+        puzzle_overlay: bool = False,
+        puzzle_slice_ratio: float = 0.35,
+        cube_root_bits: int = 16,
+        cube_blueprint: Any = None,
+        cube_relay: bool = True,
+        q1_micro_agent_tol: float | None = None,
+        q1_moe_fabric: bool = False,
+        q1_expert_relay: bool = False,
+        q1_expert_rest_tol: float | None = None,
+        q1_expert_rest_min: int = 3,
+        q1_imprint_puzzle: bool = False,
+        q1_imprint_depths: tuple[int, int, int, int] = (5, 4, 3, 2),
+        q1_fixation_cov_thresh: float = 1.0,
+        q1_graphify_feedback: Any = False,
     ):
         if device not in ("auto", "cpu"):
             raise ValueError("device must be auto or cpu")
-        if speculation not in ("auto", "off", "lookup", "native") or mtp_head_budget_mib <= 0:
+        if q1_micro_agent_tol is not None and (
+                not math.isfinite(float(q1_micro_agent_tol)) or float(q1_micro_agent_tol) < 0):
+            raise ValueError("q1_micro_agent_tol must be finite and nonnegative")
+        if q1_micro_agent_tol is not None and weight_format != "q1_cubes":
+            raise ValueError("q1_micro_agent_tol requires weight_format=q1_cubes")
+        self.q1_micro_agent_tol = None if q1_micro_agent_tol is None else float(q1_micro_agent_tol)
+        if q1_moe_fabric and weight_format != "q1_cubes":
+            raise ValueError("q1_moe_fabric requires weight_format=q1_cubes")
+        self.q1_moe_fabric = bool(q1_moe_fabric)
+        if q1_expert_rest_tol is not None and (
+                not math.isfinite(float(q1_expert_rest_tol)) or float(q1_expert_rest_tol) < 0):
+            raise ValueError("q1_expert_rest_tol must be finite and nonnegative")
+        if not math.isfinite(float(q1_fixation_cov_thresh)) or not (0.0 <= float(q1_fixation_cov_thresh) <= 1.0):
+            raise ValueError("q1_fixation_cov_thresh must be between 0.0 and 1.0")
+        from src.stanok_contour import normalize_feedback_mode
+        _fb_mode = normalize_feedback_mode(q1_graphify_feedback)
+        if (
+            q1_expert_relay
+            or q1_expert_rest_tol is not None
+            or q1_imprint_puzzle
+            or float(q1_fixation_cov_thresh) < 1.0
+            or _fb_mode != "off"
+        ) and weight_format != "q1_cubes":
+            raise ValueError(
+                "q1_expert_relay, q1_expert_rest_tol, q1_imprint_puzzle, q1_fixation_cov_thresh, and q1_graphify_feedback require weight_format=q1_cubes"
+            )
+        self.q1_expert_relay = bool(q1_expert_relay)
+        self.q1_expert_rest_tol = None if q1_expert_rest_tol is None else float(q1_expert_rest_tol)
+        self.q1_expert_rest_min = max(1, int(q1_expert_rest_min))
+        self.q1_imprint_puzzle = bool(q1_imprint_puzzle)
+        self.q1_imprint_depths = tuple(int(x) for x in q1_imprint_depths)
+        self.q1_fixation_cov_thresh = float(q1_fixation_cov_thresh)
+        self.q1_graphify_feedback = _fb_mode if _fb_mode != "off" else False
+        if speculation not in ("auto", "off", "lookup", "native", "q1") or mtp_head_budget_mib <= 0:
             raise ValueError("Invalid speculation mode or native head budget")
+        if weight_format not in SUPPORTED_RUNTIME_WEIGHT_FORMATS:
+            raise ValueError("Unsupported runtime weight format")
+        if q1_planes is None:
+            q1_planes = cube_root_bits if weight_format == "q1_cubes" else 4
+        if not 1 <= int(q1_planes) <= (16 if weight_format == "q1_cubes" else 8):
+            raise ValueError("q1_planes exceeds the representation depth (q1_cubes supports 16)")
+        if cube_root_bits not in (2, 4, 8, 16):
+            raise ValueError("cube_root_bits must be 2, 4, 8 or 16")
+        if weight_format == "q1_cubes" and int(q1_planes) > cube_root_bits:
+            raise ValueError("q1_planes cannot exceed cube_root_bits")
+        if not (0.0 <= float(puzzle_slice_ratio) <= 1.0) or math.isnan(float(puzzle_slice_ratio)):
+            raise ValueError("puzzle_slice_ratio must be between 0.0 and 1.0")
+        if max_slot_bytes is not None:
+            resolved_slot_bytes = int(max_slot_bytes)
+        elif max_slot_mib is not None:
+            resolved_slot_bytes = int(float(max_slot_mib) * MiB)
+        else:
+            resolved_slot_bytes = None
+        if resolved_slot_bytes is not None and resolved_slot_bytes <= 0:
+            raise ValueError("max_slot_mib / max_slot_bytes must be positive")
         if speculation == "auto" and not enable_mtp:
             speculation = "off"
         if speculation == "off":
             enable_mtp = False
         self.speculator = self._region_controller = None
+        self.survivor_tracker = None
+        self.stanok_contour = None
+        self.probability_bus = None
+        self.cold_warmup_scale = None
+        self._q1_cubes_runner = None
+        self.thought_anchor_enabled = bool(thought_anchor)
+        self._session_thought_anchor = None
+        self._active_sampling: SamplingConfig | None = None
+        self._sampling_rng: torch.Generator | None = None
+        self.max_slot_bytes = resolved_slot_bytes
+        self.q1_planes = int(q1_planes)
+        self.cube_root_bits = int(cube_root_bits)
+        self.cube_relay = bool(cube_relay)
+        from src.stanok_contour import load_cube_blueprint
+        self.cube_blueprint, self.cube_expert_blueprint, bp_max_depth = load_cube_blueprint(
+            cube_blueprint, expected_root_bits=self.cube_root_bits
+        )
+        if self.cube_blueprint and weight_format != "q1_cubes":
+            raise ValueError("A cube blueprint requires weight_format=q1_cubes")
+        if bp_max_depth > 0:
+            self.q1_planes = max(self.q1_planes, bp_max_depth)
+        self.q1_early_stop = bool(q1_early_stop)
+        self.puzzle_overlay = bool(puzzle_overlay)
+        self.puzzle_slice_ratio = float(puzzle_slice_ratio)
         self.root = find_quintessentia_root(quintessentia_root)
         # Historical spelling remains accepted by local experiments; it no
         # longer means that GPU startup waits for CPU work.
         if cpu_first is not None:
             progressive_start = bool(cpu_first)
-        if progressive_start or device == "cpu":
+        use_direct_q1_cubes_gpu = bool(weight_format == "q1_cubes" and device != "cpu" and torch.cuda.is_available())
+        if (progressive_start and not use_direct_q1_cubes_gpu) or device == "cpu":
             self._init_progressive(model_dir, vram_mode, enable_mtp, enable_vocab_pruner,
                                  max_drafts, verbose, max_context_tokens,
                                  prefill_chunk_tokens, allow_download, weight_format,
                                  prefill_wavefront, allow_gpu=device != "cpu")
-            self._configure_general_stream(speculation, mtp_head_path, mtp_head_budget_mib, prune_regions)
+            self._configure_general_stream(
+                speculation,
+                mtp_head_path,
+                mtp_head_budget_mib,
+                bool(prune_regions and self.profile.get("weight_format") != "q1_cubes"),
+            )
             return
         from src.quintessentia_engine import PriorityRanker
         from src.quintessentia_integrated import QuintessentiaModel
@@ -1816,6 +2341,9 @@ class QuintessentiaUnifiedEngine:
         self.memory_probe = measure_gpu_memory(self.device)
         free_b, total_b = self.memory_probe["free_bytes"], self.memory_probe["total_bytes"]
         self.total_vram_gib = round(total_b / GiB, 2)
+        extra_plan_kw = {"max_slot_bytes": self.max_slot_bytes} if self.max_slot_bytes is not None else {}
+        if weight_format in ("q1", "q1_cubes") or self.q1_planes != 4:
+            extra_plan_kw["q1_planes"] = self.q1_planes
         self.profile, self.plan, has_mtp = plan_for_checkpoint(
             self.model_dir,
             mode=vram_mode,
@@ -1826,7 +2354,13 @@ class QuintessentiaUnifiedEngine:
             prefill_chunk_tokens=prefill_chunk_tokens,
             weight_format=weight_format,
             prefill_wavefront=prefill_wavefront,
-            force_universal=(mtp_head_path is not None or speculation in ("native", "lookup")),
+            force_universal=(
+                mtp_head_path is not None
+                or speculation in ("native", "lookup", "q1")
+                or self.max_slot_bytes is not None
+                or self.puzzle_overlay
+            ),
+            **extra_plan_kw,
         )
         self.fast_qwen = bool(self.profile["fast_qwen"])
         self.vram_mode = vram_mode
@@ -1939,7 +2473,114 @@ class QuintessentiaUnifiedEngine:
                 self.draft_vocab.seed_from_corpus_tokens(seed_ids)
                 self.mtp_head = QuintessentiaNativeMTPHead(self.engine, self.gk, self.draft_vocab)
                 self.mtp_vram_mib = round(self.mtp_head.q4_vram_bytes() / MiB, 2)
+        elif self.profile["weight_format"] == "q1_cubes":
+            from src.binary_halving_q1 import attach_q1_cubes_to_engine
+
+            self.engine = QuintessentiaModel(
+                str(self.model_dir),
+                pipeline_mode="sequential",
+                vram_resident_layers=0,
+                max_ram_layers=0,
+                max_ram_bytes=0,
+                cache_policy="lru",
+                num_slots=1,
+                weight_format="bf16",
+                universal_quantization=False,
+                quantize_lm_head=False,
+                use_fused_q4_gemv=False,
+                model_source=self.model_source,
+                weight_reader=self.pread_reader,
+                expert_cache_bytes=0,
+            )
+            has_moe = bool(
+                self.model_source is not None and getattr(self.model_source, "_expert_loader", None) is not None
+            )
+            layer_b_list = list(self.profile.get("q1_cubes_layer_bytes") or [])
+            lm_head_b = int(self.profile.get("q1_cubes_lm_head_bytes", 0))
+            avail_after_head = max(0, int(self.plan.budget_bytes) - lm_head_b)
+            if has_moe:
+                if avail_after_head >= 512 * MiB:
+                    moe_gpu_bytes = min(1536 * MiB, max(256 * MiB, int(avail_after_head * 0.45)))
+                else:
+                    moe_gpu_bytes = max(0, int(avail_after_head * 0.35))
+                trunk_room = max(0, avail_after_head - moe_gpu_bytes - 256 * MiB)
+                if layer_b_list and sum(layer_b_list) <= trunk_room:
+                    resident = num_layers
+                elif layer_b_list:
+                    max_l = max(layer_b_list)
+                    res_room = max(0, trunk_room - max_l)
+                    resident = 0
+                    used_res = 0
+                    for lb in layer_b_list:
+                        if used_res + lb > res_room:
+                            break
+                        used_res += lb
+                        resident += 1
+                    resident = min(resident, max(0, num_layers - 1))
+                else:
+                    resident = 0
+            else:
+                moe_gpu_bytes = 0
+                resident = num_layers if self.plan.full_residency else int(self.plan.resident_layers)
+
+            ram_budget = _streaming_ram_budget_bytes() or (2048 * MiB)
+            if has_moe:
+                layer_host_bytes = min(1024 * MiB, ram_budget // 3)
+                moe_host_bytes = min(8192 * MiB, max(0, ram_budget - layer_host_bytes))
+            else:
+                layer_host_bytes = min(8192 * MiB, ram_budget)
+                moe_host_bytes = 0
+            is_v4_isolated = (self.q1_graphify_feedback == "mirror_scales")
+            if not is_v4_isolated:
+                from src.stanok_contour import StanokContainmentContour, UnifiedProbabilityBus
+                if self.stanok_contour is None:
+                    self.stanok_contour = StanokContainmentContour(
+                        device=self.device, enabled=(self.device.type == "cuda")
+                    )
+                if self.probability_bus is None:
+                    self.probability_bus = UnifiedProbabilityBus(self.stanok_contour)
+            self._q1_cubes_runner = attach_q1_cubes_to_engine(
+                self.engine,
+                cubes_per_proj=self.q1_planes,
+                root_bits=self.cube_root_bits,
+                layer_proj_cubes=self.cube_blueprint,
+                layer_expert_cubes=self.cube_expert_blueprint,
+                enable_relay=False if is_v4_isolated else self.cube_relay,
+                micro_agent_tol=self.q1_micro_agent_tol,
+                moe_fabric=self.q1_moe_fabric,
+                enable_expert_relay=False if is_v4_isolated else self.q1_expert_relay,
+                expert_rest_tol=self.q1_expert_rest_tol,
+                expert_rest_min=self.q1_expert_rest_min,
+                imprint_puzzle=self.q1_imprint_puzzle,
+                imprint_depths=self.q1_imprint_depths,
+                fixation_cov_thresh=self.q1_fixation_cov_thresh,
+                stanok_contour=None if is_v4_isolated else self.stanok_contour,
+                graphify_feedback=self.q1_graphify_feedback,
+                mirror_v4_trunk=is_v4_isolated,
+                resident_layers=resident,
+                host_cache_bytes=layer_host_bytes,
+                moe_gpu_cache_bytes=moe_gpu_bytes,
+                moe_host_cache_bytes=moe_host_bytes,
+            )
+            if is_v4_isolated:
+                from src.mirror_scales_v4 import MirrorColdWarmupScale, warmup_v4_cuda_kernels
+                self.cold_warmup_scale = MirrorColdWarmupScale(
+                    mode="plateau", min_layers_warm=2, plateau_confirm=2, max_warmup_seconds=6.0
+                )
+                self.cold_warmup_scale.run_warmup(
+                    kernel_warmup_fn=lambda: warmup_v4_cuda_kernels(self.device),
+                    layer_warmup_fn=self._q1_cubes_runner.warmup_resident_layer,
+                    total_resident_layers=resident,
+                )
+            self.anchor_schedule = {
+                "resident_layers": list(range(resident)),
+                "streamed_layers": list(range(resident, num_layers)),
+            }
+            self.mtp_enabled = False
+            self.enable_vocab_pruner = False
         else:
+            sub_cubes = bool(getattr(self.plan, "sub_layer_cubes", False))
+            sub_head = bool(getattr(self.plan, "streamed_lm_head", False))
             resident = num_layers if self.plan.full_residency else int(self.plan.resident_layers)
             expert_cache_bytes = max(0, int(self.plan.budget_bytes - self.plan.weights_bytes - 256 * MiB))
             self.engine = QuintessentiaModel(
@@ -1957,6 +2598,16 @@ class QuintessentiaUnifiedEngine:
                 model_source=self.model_source,
                 weight_reader=self.pread_reader,
                 expert_cache_bytes=expert_cache_bytes,
+                sub_layer_cubes=sub_cubes,
+                streamed_lm_head=sub_head,
+                q1_slot_budget_bytes=self.plan.slot_bytes if (sub_cubes or sub_head) else None,
+                q1_planes=self.q1_planes,
+                q1_early_stop=self.q1_early_stop,
+                puzzle_overlay=self.puzzle_overlay,
+                puzzle_slice_ratio=self.puzzle_slice_ratio,
+                puzzle_slot_budget_bytes=(
+                    self.max_slot_bytes or (self.plan.slot_bytes if self.plan.slot_bytes > 0 else 16 * MiB)
+                ) if self.puzzle_overlay else None,
             )
             self.anchor_schedule = {
                 "resident_layers": list(range(resident)),
@@ -1971,21 +2622,27 @@ class QuintessentiaUnifiedEngine:
         self.generations_started = 0
         self.generations_cancelled = 0
 
+        is_q1_cubes = self.profile.get("weight_format") == "q1_cubes"
+        self._attach_unified_primary_components(
+            allow_dynamic_memory=bool(not self.prefill_wavefront and not is_q1_cubes)
+        )
+
         if self.fast_qwen:
             warm_ids = self.engine.tokenizer("Привет!", return_tensors="pt").input_ids[0].tolist()
             for _ in self._stream_token_ids(warm_ids, max_new_tokens=4, stop_on_eos=True, cached_prefix_len=0, past_kv=None):
                 pass
-            self._release_transient_state()
+            self.reset_session()
 
         self.boot_seconds = round(time.perf_counter() - t_boot0, 2)
         self.resident_vram_mib = round(torch.cuda.memory_allocated(self.device) / MiB, 2)
         if verbose:
             ec = self.expert_cache_stats()
-            ec_str = (
-                f", ExpertCache: {ec['slots']} slots ({ec['arena_mib']} MiB)"
-                if (ec is not None and ec.get("slots", 0) > 0)
-                else ""
-            )
+            if ec is not None and ec.get("slots", 0) > 0:
+                ec_str = f", ExpertCache: {ec['slots']} slots ({ec['arena_mib']} MiB)"
+            elif ec is not None and "total_model_experts" in ec:
+                ec_str = f", Q1MoECache: L1/L2 ({ec['total_model_experts']} experts)"
+            else:
+                ec_str = ""
             print(
                 f"[Quintessentia] Ready in {self.boot_seconds}s | Resident VRAM: {self.resident_vram_mib} MiB "
                 f"(backend {self.profile['backend']}, MTP: {'on' if self.mtp_enabled else 'off'}, "
@@ -1994,7 +2651,67 @@ class QuintessentiaUnifiedEngine:
             )
 
         if not self.fast_qwen:
-            self._configure_general_stream(speculation, mtp_head_path, mtp_head_budget_mib, prune_regions)
+            self._configure_general_stream(
+                speculation, mtp_head_path, mtp_head_budget_mib, bool(prune_regions and not is_q1_cubes)
+            )
+
+    def _attach_unified_primary_components(self, *, allow_dynamic_memory: bool = True) -> None:
+        """Attach the Unified Primary Engine mechanisms by default (A->B->C(0)->A + Survivor Tracker)."""
+        eng = self.engine
+        if eng is None:
+            return
+        src = getattr(eng, "model_source", None)
+        exp_cache = getattr(src, "_expert_loader", None) if src is not None else None
+        moe_q1_q2 = bool(exp_cache is not None and getattr(exp_cache, "bits", None) in (1, 2))
+        if allow_dynamic_memory and not moe_q1_q2 and not getattr(self, "puzzle_overlay", False):
+            prog = getattr(eng, "progressive", None)
+            if prog is not None and not prog.complete:
+                if prog.gpu_enabled:
+                    try:
+                        eng.enable_unified_memory(_auto_unified=True, gpu_budget_bytes=0, host_cache_bytes=64 * MiB)
+                    except ValueError:
+                        pass
+            elif (
+                not getattr(self.plan, "full_residency", False)
+                and not getattr(self.plan, "sub_layer_cubes", False)
+                and getattr(getattr(eng, "pipeline", None), "num_slots", 0) == 3
+            ):
+                try:
+                    eng.enable_unified_memory(_auto_unified=True, gpu_budget_bytes=0, host_cache_bytes=64 * MiB)
+                except ValueError:
+                    pass
+        if self.survivor_tracker is None:
+            from src.survivor_probability_path import SurvivorProbabilityTracker
+            self.survivor_tracker = SurvivorProbabilityTracker(
+                eng,
+                draft_vocab=self.draft_vocab,
+                mirror_mode=(self.q1_graphify_feedback == "mirror_scales"),
+            )
+            eng.survivor_tracker = self.survivor_tracker
+        if self.q1_graphify_feedback == "mirror_scales":
+            # V4 Isolated Mirror Scales: NO UnifiedProbabilityBus, NO StanokContainmentContour coupling!
+            eng.stanok_contour = None
+            eng.probability_bus = None
+            return
+        from src.stanok_contour import StanokContainmentContour, UnifiedProbabilityBus
+        if self.stanok_contour is None:
+            dev = getattr(eng, "device", self.device)
+            self.stanok_contour = StanokContainmentContour(
+                device=dev, enabled=(torch.device(dev).type == "cuda")
+            )
+        if self.probability_bus is None:
+            self.probability_bus = UnifiedProbabilityBus(self.stanok_contour)
+        imprint_ov = None
+        q1_runner = getattr(self, "_q1_cubes_runner", None)
+        if q1_runner is not None and getattr(q1_runner, "moe_cache", None) is not None:
+            imprint_ov = getattr(q1_runner.moe_cache, "_imprint_overlay", None)
+        self.probability_bus.bind(
+            survivor_tracker=self.survivor_tracker,
+            route_exclusion=self._region_controller,
+            imprint_overlay=imprint_ov,
+        )
+        eng.stanok_contour = self.stanok_contour
+        eng.probability_bus = self.probability_bus
 
     def _configure_general_stream(self, mode, head_path, head_budget_mib, prune_regions):
         try:
@@ -2002,9 +2719,17 @@ class QuintessentiaUnifiedEngine:
                 from src.route_exclusion import RouteExclusion
                 self._region_controller = RouteExclusion(self.engine)
                 self.engine.route_exclusion = self._region_controller
+                if self.probability_bus is not None:
+                    self.probability_bus.bind(route_exclusion=self._region_controller)
             if mode != "off" and self.max_drafts:
                 from src.general_speculation import GeneralSpeculation
-                self.speculator = GeneralSpeculation(self, mode, head_path, head_budget_mib*MiB)
+                self.speculator = GeneralSpeculation(
+                    self,
+                    mode,
+                    head_path,
+                    head_budget_mib*MiB,
+                    mirror_mode=(self.q1_graphify_feedback == "mirror_scales"),
+                )
                 self.mtp_enabled = self.speculator.native is not None
         except BaseException:
             self.close()
@@ -2018,7 +2743,7 @@ class QuintessentiaUnifiedEngine:
         from src.quintessentia_integrated import QuintessentiaModel
         if mode not in VRAM_MODES:
             raise ValueError(f"vram_mode must be one of {VRAM_MODES}")
-        if weight_format not in ("auto", "bf16", "q4", "q6"):
+        if weight_format not in SUPPORTED_RUNTIME_WEIGHT_FORMATS:
             raise ValueError("Unsupported runtime weight format")
         self.engine = self.pread_reader = self.model_source = self.native_policy = None
         self.device = torch.device("cpu")
@@ -2030,7 +2755,14 @@ class QuintessentiaUnifiedEngine:
         self.model_format = getattr(self.model_source, "kind", "quintessentia")
         self.profile = runtime_profile(self.model_dir)
         fmt = ("q4" if self.profile["fast_qwen"] else "q6") if weight_format == "auto" else weight_format
-        self.profile = dict(self.profile, fast_qwen=False, backend="progressive-hf", weight_format=fmt)
+        self.profile = dict(
+            self.profile,
+            fast_qwen=False,
+            backend="unified-q1-cubes-cpu" if fmt == "q1_cubes" else "progressive-hf",
+            weight_format=fmt,
+        )
+        if fmt in ("q1", "q1_cubes"):
+            self.profile["q1_planes"] = self.q1_planes
         config = load_runtime_config(self.model_dir)
         layers = int(getattr(config, "num_hidden_layers", 0) or getattr(config, "n_layer", 0)
                      or getattr(config, "n_layers", 0))
@@ -2066,12 +2798,17 @@ class QuintessentiaUnifiedEngine:
             from .gpu_memory import measure_gpu_memory
             self.memory_probe = measure_gpu_memory(gpu)
             free, total = self.memory_probe["free_bytes"], self.memory_probe["total_bytes"]
+            extra_plan_kw = {"max_slot_bytes": self.max_slot_bytes} if self.max_slot_bytes is not None else {}
+            q1_p = getattr(self, "q1_planes", 4)
+            if fmt in ("q1", "q1_cubes") or q1_p != 4:
+                extra_plan_kw["q1_planes"] = q1_p
             _, plan, _ = plan_for_checkpoint(
                 self.model_dir, mode=mode, total_bytes=total, free_bytes=free,
                 enable_mtp=False, max_context_tokens=context,
                 prefill_chunk_tokens=self.prefill_chunk_tokens, weight_format=fmt,
                 prefill_wavefront=prefill_wavefront, force_universal=True,
-                projection_metadata=initializing_engine.weight_manager.quantized_projections)
+                projection_metadata=initializing_engine.weight_manager.quantized_projections,
+                **extra_plan_kw)
             self.plan = plan
             self.gpu_name = torch.cuda.get_device_name(gpu)
             self.total_vram_gib = round(total / GiB, 2)
@@ -2081,14 +2818,76 @@ class QuintessentiaUnifiedEngine:
 
         boot = time.perf_counter()
         try:
-            self.engine = QuintessentiaModel(
-                str(self.model_dir), device=torch.device("cpu"),
-                vram_resident_layers=0, max_ram_layers=2,
-                max_ram_bytes=_streaming_ram_budget_bytes(), cache_policy="lru", num_slots=3,
-                weight_format=fmt, universal_quantization=True,
-                use_fused_q4_gemv=False, model_source=self.model_source,
-                weight_reader=self.pread_reader, cpu_first_plan=prepare_gpu_plan,
-                expert_cache_bytes=64*MiB, progressive_gpu=allow_gpu)
+            if fmt == "q1_cubes":
+                from src.binary_halving_q1 import attach_q1_cubes_to_engine
+
+                self.engine = QuintessentiaModel(
+                    str(self.model_dir),
+                    device=torch.device("cpu"),
+                    pipeline_mode="sequential",
+                    vram_resident_layers=0,
+                    max_ram_layers=0,
+                    max_ram_bytes=0,
+                    cache_policy="lru",
+                    num_slots=1,
+                    weight_format="bf16",
+                    universal_quantization=False,
+                    use_fused_q4_gemv=False,
+                    model_source=self.model_source,
+                    weight_reader=self.pread_reader,
+                    cpu_first_plan=None,
+                    expert_cache_bytes=0,
+                    progressive_gpu=False,
+                )
+                ram_b = _streaming_ram_budget_bytes() or (512 * MiB)
+                is_v4_isolated = (self.q1_graphify_feedback == "mirror_scales")
+                if not is_v4_isolated:
+                    from src.stanok_contour import StanokContainmentContour, UnifiedProbabilityBus
+                    if self.stanok_contour is None:
+                        self.stanok_contour = StanokContainmentContour(device=torch.device("cpu"), enabled=False)
+                    if self.probability_bus is None:
+                        self.probability_bus = UnifiedProbabilityBus(self.stanok_contour)
+                self._q1_cubes_runner = attach_q1_cubes_to_engine(
+                    self.engine,
+                    cubes_per_proj=self.q1_planes,
+                    root_bits=self.cube_root_bits,
+                    layer_proj_cubes=self.cube_blueprint,
+                    layer_expert_cubes=self.cube_expert_blueprint,
+                    enable_relay=False if is_v4_isolated else self.cube_relay,
+                    micro_agent_tol=self.q1_micro_agent_tol,
+                    moe_fabric=self.q1_moe_fabric,
+                    enable_expert_relay=False if is_v4_isolated else self.q1_expert_relay,
+                    expert_rest_tol=self.q1_expert_rest_tol,
+                    expert_rest_min=self.q1_expert_rest_min,
+                    imprint_puzzle=self.q1_imprint_puzzle,
+                    imprint_depths=self.q1_imprint_depths,
+                    fixation_cov_thresh=self.q1_fixation_cov_thresh,
+                    stanok_contour=None if is_v4_isolated else self.stanok_contour,
+                    graphify_feedback=self.q1_graphify_feedback,
+                    mirror_v4_trunk=is_v4_isolated,
+                    resident_layers=0,
+                    host_cache_bytes=min(512 * MiB, ram_b // 3),
+                    moe_gpu_cache_bytes=0,
+                    moe_host_cache_bytes=min(1024 * MiB, ram_b - min(512 * MiB, ram_b // 3)),
+                )
+                self._attach_unified_primary_components(allow_dynamic_memory=False)
+            else:
+                direct_cpu_puzzle = bool(self.puzzle_overlay and not allow_gpu)
+                self.engine = QuintessentiaModel(
+                    str(self.model_dir), device=torch.device("cpu"),
+                    vram_resident_layers=layers if direct_cpu_puzzle else 0,
+                    max_ram_layers=max(4, min(max(1, layers), 16)),
+                    max_ram_bytes=_streaming_ram_budget_bytes(), cache_policy="lru",
+                    num_slots=1 if direct_cpu_puzzle else 3,
+                    weight_format=fmt, universal_quantization=True,
+                    use_fused_q4_gemv=False, model_source=self.model_source,
+                    weight_reader=self.pread_reader,
+                    cpu_first_plan=None if direct_cpu_puzzle else prepare_gpu_plan,
+                    expert_cache_bytes=64*MiB, progressive_gpu=allow_gpu,
+                    q1_planes=self.q1_planes, q1_early_stop=self.q1_early_stop,
+                    puzzle_overlay=self.puzzle_overlay, puzzle_slice_ratio=self.puzzle_slice_ratio,
+                    puzzle_slot_budget_bytes=self.max_slot_bytes)
+                self._attach_unified_primary_components(allow_dynamic_memory=bool(allow_gpu and not prefill_wavefront))
         except BaseException:
             self.close()
             raise
@@ -2096,7 +2895,7 @@ class QuintessentiaUnifiedEngine:
         metric_device = self._gpu_metric_device()
         self.resident_vram_mib = round(torch.cuda.memory_allocated(metric_device)/MiB, 2) if metric_device is not None else 0.0
         if verbose:
-            policy = "Common CPU/GPU start" if self.engine.progressive.gpu_enabled else "CPU streaming"
+            policy = "Common CPU/GPU start" if getattr(self.engine.progressive, "gpu_enabled", False) else "CPU streaming"
             print(f"[Quintessentia] {policy} | {self.model_id} ({fmt}); work follows device readiness", flush=True)
 
     @property
@@ -2104,6 +2903,9 @@ class QuintessentiaUnifiedEngine:
         return self.engine.tokenizer
 
     def expert_cache_stats(self) -> dict[str, Any] | None:
+        q1_runner = getattr(self, "_q1_cubes_runner", None)
+        if q1_runner is not None and q1_runner.moe_cache is not None:
+            return q1_runner.moe_cache.stats()
         src = getattr(self, "model_source", None)
         if src is not None and hasattr(src, "expert_cache_stats"):
             return src.expert_cache_stats()
@@ -2163,17 +2965,20 @@ class QuintessentiaUnifiedEngine:
         self._release_transient_state()
 
     def enable_unified_memory(self, **kwargs):
-        """Opt-in common weight arena, before generation on a three-slot HF MoE plan."""
-        if self.generations_started or self.fast_qwen:
-            raise ValueError('Enable unified memory before generation on the HF MoE backend')
+        """Configure or override the unified working-memory arena before generation starts."""
+        if self.generations_started:
+            raise ValueError('Enable unified memory before generation')
         return self.engine.enable_unified_memory(**kwargs)
 
     def reset_session(self) -> None:
         self.session.reset()
         self._session_messages.clear()
+        self._session_thought_anchor = None
         warmup = getattr(self.engine, "probability_warmup", None)
         if warmup is not None:
             warmup.reset()
+        if getattr(self, "survivor_tracker", None) is not None:
+            self.survivor_tracker.reset()
         self._release_transient_state()
 
     def status_snapshot(self) -> dict[str, Any]:
@@ -2207,15 +3012,47 @@ class QuintessentiaUnifiedEngine:
         ec = self.expert_cache_stats()
         if ec is not None:
             snap["expert_cache"] = ec
+        snap["unified_primary_engine"] = True
+        snap["thought_anchor_enabled"] = bool(
+            self.thought_anchor_enabled or getattr(self, "_active_thought_anchor", None) is not None
+        )
         progressive = getattr(self.engine, "progressive", None)
         if progressive is not None:
             snap["progressive_execution"] = progressive.stats()
-            snap["mtp_status"] = ("native head on CPU; shared streamed verification" if self.mtp_enabled
-                                  else "prompt lookup" if self.speculator is not None else "disabled")
+            spec_src = self.speculator.stats().get("source") if self.speculator is not None else None
+            snap["mtp_status"] = (
+                "native head on CPU; shared streamed verification" if self.mtp_enabled
+                else "q1 self-speculation" if spec_src == "q1_skeleton"
+                else "prompt lookup" if self.speculator is not None else "disabled"
+            )
         if self.speculator is not None:
             snap["speculation"] = self.speculator.stats()
         if self._region_controller is not None:
             snap["route_exclusion"] = self._region_controller.stats()
+        if getattr(self, "survivor_tracker", None) is not None:
+            snap["survivor_probability_path"] = self.survivor_tracker.stats()
+        if getattr(self, "stanok_contour", None) is not None:
+            snap["stanok_contour"] = self.stanok_contour.stats()
+        if getattr(self, "probability_bus", None) is not None:
+            snap["probability_bus"] = self.probability_bus.stats()
+        if getattr(self, "cold_warmup_scale", None) is not None:
+            snap["cold_warmup_v4"] = self.cold_warmup_scale.stats()
+        q1_arena = getattr(self.engine, "q1_arena", None)
+        if q1_arena is not None:
+            snap["q1_role_arena"] = q1_arena.stats()
+        q1_lh = _q1_lm_head_telemetry(self.engine.model)
+        if q1_lh is not None:
+            snap["q1_lm_head"] = q1_lh
+        puz_ctrl = getattr(self.engine, "puzzle_controller", None)
+        if puz_ctrl is not None:
+            snap["q1_puzzle_overlay"] = puz_ctrl.stats()
+        q1_cubes_runner = getattr(self, "_q1_cubes_runner", None)
+        if q1_cubes_runner is not None:
+            snap["q1_cubes"] = q1_cubes_runner.stats()
+            snap["q1_planes"] = getattr(self, "q1_planes", 4)
+        if self.profile.get("weight_format") == "q1":
+            snap["q1_planes"] = getattr(self, "q1_planes", 4)
+            snap["q1_early_stop_enabled"] = getattr(self, "q1_early_stop", True)
         from src.quantized_projection import projection_stats
         snap["packed_projections"] = projection_stats(self.engine.model)
         projection_io = getattr(self.model_source, "projection_io_stats", None)
@@ -2314,18 +3151,10 @@ class QuintessentiaUnifiedEngine:
     # ------------------------------------------------------------------ generation core
 
     def _check_context_budget(self, prompt_tokens: int, max_new_tokens: int) -> None:
-        limit = self.plan.max_context_tokens
-        config = getattr(getattr(self, "engine", None), "config", None)
-        for name in ("max_position_embeddings", "n_positions"):
-            declared = getattr(config, name, None)
-            if isinstance(declared, int) and declared > 0:
-                limit = min(limit, declared)
-        if prompt_tokens + max_new_tokens > limit:
-            raise ContextBudgetExceeded(
-                f"Context budget exceeded: {prompt_tokens} prompt + {max_new_tokens} requested output "
-                f"tokens > {limit}. Shorten the conversation/output or plan a larger --max-context "
-                "within the model's position limit."
-            )
+        # Context and generation length are caller policy, not a server admission ceiling.
+        # Allocation and the model implementation determine actual executable capacity.
+        if prompt_tokens < 0 or max_new_tokens < 0:
+            raise ValueError("Token counts must be non-negative")
 
     @staticmethod
     def _make_cancel_checker(cancel_check: Callable[[], bool] | None) -> Callable[[str], None]:
@@ -2380,6 +3209,14 @@ class QuintessentiaUnifiedEngine:
             self.captured.pop("post_norm", None)
         return picked, past, last_h, mtp_draft
 
+    def _sample_next_token(self, logits_row: torch.Tensor, gen_history: list[int] | None = None) -> int:
+        return sample_next_token(
+            logits_row,
+            gen_history,
+            getattr(self, "_active_sampling", None),
+            rng=getattr(self, "_sampling_rng", None),
+        )
+
     def _stream_bf16(
         self,
         prompt_ids: list[int],
@@ -2403,6 +3240,7 @@ class QuintessentiaUnifiedEngine:
         n = len(prompt_ids)
         start = max(0, min(int(cached_prefix_len), n - 1))
         all_ids = list(prompt_ids)
+        gen_history: list[int] = []
         past = past_kv if start > 0 else None
         picked = -1
         phase_ref = ["prefill"]
@@ -2415,9 +3253,25 @@ class QuintessentiaUnifiedEngine:
                 self._reset_compute_peaks()
                 self._sync_compute()
                 t_pre0 = time.perf_counter()
-                for a in range(start, n, stride):
+                prog = getattr(self.engine, "progressive", None)
+                has_moe_loader = getattr(self.model_source, "_expert_loader", None) is not None
+                a = start
+                while a < n:
                     check("prefill")
-                    b = min(n, a + stride)
+                    step_stride = (
+                        min(stride, 2)
+                        if (
+                            prog is not None
+                            and prog.gpu_enabled
+                            and prog.error is None
+                            and not prog.complete
+                            and not prog.bundle_ready.is_set()
+                            and not self.prefill_wavefront
+                            and has_moe_loader
+                        )
+                        else stride
+                    )
+                    b = min(n, a + step_stride)
                     step = torch.tensor([prompt_ids[a:b]], dtype=torch.long)
                     cache_pos = torch.arange(a, b, dtype=torch.long)
                     if self.prefill_wavefront and b - a > chunk and self.engine.device.type == "cuda":
@@ -2435,9 +3289,11 @@ class QuintessentiaUnifiedEngine:
                         t_anchor = getattr(self, "_active_thought_anchor", None)
                         if t_anchor is not None:
                             logits = t_anchor.on_prefill_end(self, past, logits)
-                        picked = int(logits[0].argmax().item())
+                        picked = self._sample_next_token(logits[0], gen_history)
                     del logits
+                    a = b
                 all_ids.append(picked)
+                gen_history.append(picked)
                 self._sync_compute()
                 prefill_ms = (time.perf_counter() - t_pre0) * 1000.0
                 yield {"kind": "tokens", "new_ids": [picked]}
@@ -2464,9 +3320,10 @@ class QuintessentiaUnifiedEngine:
                     if t_anchor is not None:
                         logits = t_anchor.transform_logits(logits, past, generated)
                         t_anchor.on_step_committed(past, 1)
-                    picked = int(logits[0].argmax().item())
+                    picked = self._sample_next_token(logits[0], gen_history)
                     del logits
                     all_ids.append(picked)
+                    gen_history.append(picked)
                     generated += 1
                     passes += 1
                     yield {"kind": "tokens", "new_ids": [picked]}
@@ -2514,6 +3371,7 @@ class QuintessentiaUnifiedEngine:
         eos_id = self.tokenizer.eos_token_id
         check = self._make_cancel_checker(cancel_check)
         all_ids = list(prompt_ids)
+        gen_history_fq: list[int] = []
         tail_ids = prompt_ids[cached_prefix_len:]
         assert len(tail_ids) >= 1
         past = None
@@ -2527,6 +3385,7 @@ class QuintessentiaUnifiedEngine:
                     tail_ids, past_kv, use_mtp=False, check=check, prefetch_next=max_new_tokens > 1
                 )
                 all_ids.append(picked)
+                gen_history_fq.append(picked)
                 self._sync_compute()
                 prefill_ms = (time.perf_counter() - t_pre0) * 1000.0
                 yield {"kind": "tokens", "new_ids": [picked]}
@@ -2550,9 +3409,10 @@ class QuintessentiaUnifiedEngine:
                     if t_anchor is not None:
                         lg = t_anchor.transform_logits(lg, past, generated_count)
                         t_anchor.on_step_committed(past, 1)
-                    picked = int(lg[0, -1].argmax(dim=-1).item())
+                    picked = self._sample_next_token(lg[0, -1], gen_history_fq)
                     del lg
                     all_ids.append(picked)
+                    gen_history_fq.append(picked)
                     generated_count += 1
                     passes += 1
                     yield {"kind": "tokens", "new_ids": [picked]}
@@ -2719,18 +3579,26 @@ class QuintessentiaUnifiedEngine:
     def stream_chat(
         self,
         messages: list[dict[str, str]],
-        max_new_tokens: int = 1024,
+        max_new_tokens: int | None = 1024,
         enable_thinking: bool = True,
         use_session_cache: bool = False,
         stop_on_eos: bool = True,
         cancel_check: Callable[[], bool] | None = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        penalty_window: int = 256,
+        seed: int | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Streams UTF-8-safe `thinking` and `answer` deltas, followed by a `done` telemetry packet.
 
-        ``cancel_check`` is polled before every prefill chunk, every decode step, and every streamed
-        layer pre-hook; when it returns True the generation stops with ``GenerationCancelled``. On
-        cancellation, errors and early close (``generator.close()``) every per-request tensor and
-        ring slot is released in ``finally``.
+        Pass ``max_new_tokens=0`` (or ``None``) for unlimited generation up to natural EOS or the
+        model's context window. ``cancel_check`` is polled before every prefill chunk, every decode
+        step, and every streamed layer pre-hook; when it returns True the generation stops with
+        ``GenerationCancelled``. On cancellation, errors and early close (``generator.close()``)
+        every per-request tensor and ring slot is released in ``finally``.
         """
         eos_ids = _eos_token_set(self.tokenizer.eos_token_id)
         check = self._make_cancel_checker(cancel_check)
@@ -2738,14 +3606,53 @@ class QuintessentiaUnifiedEngine:
         completed = False
         inner = None
         final_info: dict[str, Any] = {}
+        auto_anchor_installed = False
+        active_anchor_ref = getattr(self, "_active_thought_anchor", None)
+        sampling_cfg = SamplingConfig(
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+            repetition_penalty=float(repetition_penalty),
+            presence_penalty=float(presence_penalty),
+            penalty_window=int(penalty_window),
+            seed=seed,
+        )
         try:
             check("queue")
-            if max_new_tokens < 1:
-                raise ValueError("max_new_tokens must be positive")
+            if max_new_tokens is not None and int(max_new_tokens) < 0:
+                raise ValueError("max_new_tokens must be >= 0 (0 = unlimited until EOS)")
+            unlimited_tokens = (max_new_tokens is None) or (int(max_new_tokens) == 0)
+            plan_reserve_tokens = 4096 if unlimited_tokens else int(max_new_tokens)
             prompt_ids, cached_len, past_kv, unpark_ms = self._prepare_prompt_and_cache(
                 messages, enable_thinking=enable_thinking, use_session_cache=use_session_cache,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=plan_reserve_tokens,
             )
+            if unlimited_tokens:
+                model_ctx = int(getattr(self.engine.config, "max_position_embeddings", 32768) or 32768)
+                eff_max_new = max(1, min(32768, max(2048, model_ctx - len(prompt_ids))))
+            else:
+                eff_max_new = int(max_new_tokens)
+
+            self._active_sampling = sampling_cfg
+            if sampling_cfg.seed is not None and sampling_cfg.temperature > 0.0:
+                rng_dev = self.engine.device if getattr(self.engine, "device", None) is not None else torch.device("cpu")
+                gen_rng = torch.Generator(device=rng_dev)
+                gen_rng.manual_seed(int(sampling_cfg.seed))
+                self._sampling_rng = gen_rng
+            else:
+                self._sampling_rng = None
+            if self.thought_anchor_enabled and active_anchor_ref is None:
+                from .thought_buffer import InitialProbabilityAnchor
+                if use_session_cache and cached_len > 0 and self._session_thought_anchor is not None:
+                    active_anchor_ref = self._session_thought_anchor
+                else:
+                    active_anchor_ref = InitialProbabilityAnchor(
+                        mirror_mode=(self.q1_graphify_feedback == "mirror_scales"),
+                    )
+                self._active_thought_anchor = active_anchor_ref
+                auto_anchor_installed = True
+            if self.probability_bus is not None and active_anchor_ref is not None:
+                self.probability_bus.bind(initial_anchor=active_anchor_ref)
 
             started_in_think = bool(getattr(self, "_last_prompt_opened_think", enable_thinking))
             splitter = _IncrementalThinkSplitter(start_in_thinking=started_in_think)
@@ -2757,7 +3664,7 @@ class QuintessentiaUnifiedEngine:
 
             inner = self._stream_token_ids(
                 prompt_ids,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=eff_max_new,
                 stop_on_eos=stop_on_eos,
                 cached_prefix_len=cached_len,
                 past_kv=past_kv,
@@ -2864,6 +3771,8 @@ class QuintessentiaUnifiedEngine:
                 "park_to_ram_ms": round(park_ms, 2),
                 "parked_session_ram_mib": round(self.session.parked_bytes / MiB, 2),
                 "spec_gate": final_info.get("spec_gate", {}),
+                "sampling": sampling_cfg.as_dict(),
+                "unlimited_tokens": unlimited_tokens,
             }
             progressive = getattr(self.engine, "progressive", None)
             if progressive is not None:
@@ -2873,8 +3782,28 @@ class QuintessentiaUnifiedEngine:
                 metrics["expert_cache"] = ec
             from src.quantized_projection import projection_stats
             metrics["packed_projections"] = projection_stats(self.engine.model)
+            if getattr(self, "survivor_tracker", None) is not None:
+                metrics["survivor_probability_path"] = self.survivor_tracker.stats()
+            if getattr(self, "stanok_contour", None) is not None:
+                metrics["stanok_contour"] = self.stanok_contour.stats()
+            if getattr(self, "probability_bus", None) is not None:
+                metrics["probability_bus"] = self.probability_bus.stats()
+            if getattr(self, "cold_warmup_scale", None) is not None:
+                metrics["cold_warmup_v4"] = self.cold_warmup_scale.stats()
+            if getattr(self.engine, "q1_arena", None) is not None:
+                metrics["q1_role_arena"] = self.engine.q1_arena.stats()
+            q1_lh = _q1_lm_head_telemetry(self.engine.model)
+            if q1_lh is not None:
+                metrics["q1_lm_head"] = q1_lh
+            puz_ctrl = getattr(self.engine, "puzzle_controller", None)
+            if puz_ctrl is not None:
+                metrics["q1_puzzle_overlay"] = puz_ctrl.stats()
+            if active_anchor_ref is not None:
+                metrics["thought_anchor"] = active_anchor_ref.telemetry.summary()
             if self.prefill_wavefront:
                 metrics["prefill_wavefront"] = {"enabled": True, "windows": list(self._wavefront_windows)}
+            if auto_anchor_installed and use_session_cache:
+                self._session_thought_anchor = active_anchor_ref
             self.last_metrics = metrics
             completed = True
             yield {
@@ -2891,6 +3820,12 @@ class QuintessentiaUnifiedEngine:
             traceback.clear_frames(exc.__traceback__)
             raise
         finally:
+            self._active_sampling = None
+            self._sampling_rng = None
+            if auto_anchor_installed:
+                self._active_thought_anchor = None
+                if self.probability_bus is not None:
+                    self.probability_bus.initial_anchor = None
             if inner is not None:
                 inner.close()
                 inner = None
@@ -2901,14 +3836,31 @@ class QuintessentiaUnifiedEngine:
     def close(self) -> None:
         # Optional ThoughtBuffer baselines belong to this engine's device lifetime.
         self._neutral_logprob_cache = None
+        self._session_thought_anchor = None
         if getattr(self, "session", None) is not None:
             self.reset_session()
+        if getattr(self, "survivor_tracker", None) is not None:
+            self.survivor_tracker.close()
+            self.survivor_tracker = None
+        if getattr(self, "stanok_contour", None) is not None:
+            try:
+                self.stanok_contour.close()
+            except Exception:
+                pass
+            self.stanok_contour = None
+        self.probability_bus = None
         if getattr(self, "speculator", None) is not None:
             self.speculator.close()
             self.speculator = None
         if getattr(self, "_region_controller", None) is not None:
             self._region_controller.close()
             self._region_controller = None
+        if getattr(self, "_q1_cubes_runner", None) is not None:
+            try:
+                self._q1_cubes_runner.close()
+            except Exception:
+                pass
+            self._q1_cubes_runner = None
         if self.pread_reader is not None:
             try:
                 self.pread_reader.close()

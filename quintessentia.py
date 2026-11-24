@@ -1,4 +1,4 @@
-"""Quintessentia: `python quintessentia.py <doctor|ask|chat|serve|discover> [options]`."""
+"""Quintessentia: `python quintessentia.py <doctor|ask|chat|serve|discover|models|download|prepare> [options]`."""
 import sys
 
 sys.dont_write_bytecode = True

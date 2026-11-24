@@ -54,8 +54,50 @@ def _load_driver_and_nvrtc():
         nvrtc = ctypes.WinDLL(str(candidates[0]))
     else:
         nvcuda = ctypes.CDLL("libcuda.so.1")
-        candidates = sorted(torch_lib.glob("libnvrtc.so*"))
-        nvrtc = ctypes.CDLL(str(candidates[0])) if candidates else ctypes.CDLL("libnvrtc.so")
+        site_packages = torch_lib.parents[1]
+        search_dirs = [
+            torch_lib,
+            site_packages / "nvidia" / "cuda_nvrtc" / "lib",
+        ]
+        nvidia_dir = site_packages / "nvidia"
+        if nvidia_dir.is_dir():
+            for lib_dir in sorted(nvidia_dir.glob("*/lib")):
+                if lib_dir not in search_dirs:
+                    search_dirs.append(lib_dir)
+
+        nvrtc_path = None
+        for d in search_dirs:
+            if not d.is_dir():
+                continue
+            found = sorted(
+                p for p in d.glob("libnvrtc.so*")
+                if p.is_file() and "builtins" not in p.name
+            )
+            if found:
+                # Preload matching libnvrtc-builtins so nvrtcCompileProgram resolves symbols
+                for b in sorted(d.glob("libnvrtc-builtins.so*")):
+                    if b.is_file():
+                        try:
+                            ctypes.CDLL(str(b), mode=ctypes.RTLD_GLOBAL)
+                            break
+                        except OSError:
+                            pass
+                nvrtc_path = found[0]
+                break
+
+        if nvrtc_path is not None:
+            nvrtc = ctypes.CDLL(str(nvrtc_path))
+        else:
+            nvrtc = None
+            last_err = None
+            for soname in ("libnvrtc.so.12", "libnvrtc.so.13", "libnvrtc.so"):
+                try:
+                    nvrtc = ctypes.CDLL(soname)
+                    break
+                except OSError as exc:
+                    last_err = exc
+            if nvrtc is None:
+                raise RuntimeError(f"NVRTC shared library not found on Linux: {last_err}") from last_err
 
     # Explicit 64-bit pointer signatures (critical on 64-bit Windows)
     nvrtc.nvrtcCreateProgram.argtypes = [

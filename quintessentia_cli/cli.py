@@ -2,9 +2,9 @@
 
 Commands:
   models    List local models; select by number, name or path
-  download  Download a Hugging Face URL/repository and verify preparation
-  prepare   Verify automatic runtime packing with a first forward
-  doctor    Check GPU, VRAM plan, model files, Q4 cache and LAN addresses
+  download  Download a Hugging Face URL/repository and verify adaptation
+  prepare   Verify automatic runtime adaptation (Q1 cubes V4 on CUDA) with a first forward
+  doctor    Check GPU, VRAM plan, model files, caches and LAN addresses
   ask       Stream a single prompt (`<think>...</think>` -> answer -> `<|im_end|>`)
   chat      Interactive multi-turn chat (KV-prefix reuse + pinned host-RAM parking)
   serve     Web chat + OpenAI-compatible API (TCP :8787) and UDP LAN beacon (:8788)
@@ -53,6 +53,244 @@ from quintessentia_cli.runtime_config import (
 )
 
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_MODEL = 0, 1, 2, 3
+WEIGHT_FORMAT_CHOICES = ("auto", "q1_cubes", "q1", "q2", "q4", "q6", "q8", "bf16")
+FEEDBACK_MODE_CHOICES = ("auto", "off", "spiral_sphere", "pure_mirror", "mirror_scales", "v4")
+PROFILE_MODE_CHOICES = ("default", "custom")
+
+
+def resolve_generation_profile(
+    mode: str = "default",
+    *,
+    thinking: bool = True,
+    max_tokens: int = 0,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    repetition_penalty: float | None = None,
+    presence_penalty: float | None = None,
+    seed: int | None = None,
+) -> dict:
+    """Resolve user-facing `default` vs `custom` generation & anti-loop sampling profile.
+
+    - `default`: out-of-the-box user mode — unlimited tokens (`0` -> natural EOS) and
+      anti-loop sampling tuned separately for `<think>` (stops greedy draft-rewriting loops)
+      and `--no-think` (crisp, direct answers). Any explicitly passed CLI flag overrides.
+    - `custom`: full manual control — zero hidden sampling overrides (deterministic greedy
+      unless the user passes `--temperature`, `--top-p`, `--top-k`, `--presence-penalty`, etc.).
+    """
+    prof = str(mode or "default").strip().lower()
+    if prof not in PROFILE_MODE_CHOICES:
+        raise ValueError(f"Unsupported mode {mode!r}; expected one of {PROFILE_MODE_CHOICES}")
+
+    if prof == "default":
+        if thinking:
+            base = dict(
+                temperature=0.6,
+                top_p=0.95,
+                top_k=20,
+                repetition_penalty=1.05,
+                presence_penalty=1.2,
+            )
+        else:
+            base = dict(
+                temperature=0.35,
+                top_p=0.9,
+                top_k=20,
+                repetition_penalty=1.03,
+                presence_penalty=0.5,
+            )
+    else:
+        base = dict(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+        )
+
+    return {
+        "mode": prof,
+        "max_new_tokens": int(max_tokens),
+        "temperature": float(base["temperature"] if temperature is None else temperature),
+        "top_p": float(base["top_p"] if top_p is None else top_p),
+        "top_k": int(base["top_k"] if top_k is None else top_k),
+        "repetition_penalty": float(base["repetition_penalty"] if repetition_penalty is None else repetition_penalty),
+        "presence_penalty": float(base["presence_penalty"] if presence_penalty is None else presence_penalty),
+        "seed": seed,
+    }
+
+
+def _model_weight_bytes(folder: Path) -> int:
+    from .model_source import runtime_model_dir
+
+    target = runtime_model_dir(folder)
+    return sum(
+        f.stat().st_size
+        for f in target.iterdir()
+        if f.suffix in (".gguf", ".safetensors", ".bin") and f.is_file()
+    )
+
+
+def resolve_auto_v4_plan(
+    *,
+    model_dir: Path | None,
+    weight_format: str = "auto",
+    feedback_mode: str = "auto",
+    q1_planes: int | None = None,
+    device: str = "auto",
+    cuda_available: bool | None = None,
+    free_vram_bytes: int | None = None,
+    profile: dict | None = None,
+    weight_bytes: int | None = None,
+) -> dict:
+    """Resolve runtime weight format and V4 isolated mirror-scales activation for CLI/doctor.
+
+    Rules:
+      - Explicit `--feedback-mode off`: never forces V4 or `q1_cubes` (keeps legacy `auto` -> `q4`/`q6`).
+      - Explicit `--feedback-mode v4|mirror_scales|pure_mirror|spiral_sphere`: promotes
+        `weight_format=auto` -> `q1_cubes`, enables `q1_imprint_puzzle` for MoE/unknown, and picks
+        `q1_planes=5`, `cube_root_bits=8` unless overridden.
+      - `--feedback-mode auto` + `--weight-format q1_cubes`: enables V4 (`mirror_scales`,
+        `M0-M8`) automatically.
+      - `--feedback-mode auto` + `--weight-format auto` on CUDA: promotes ALL CUDA models
+        (dense and MoE alike) to pure Q1 cubes V4 (`q1_cubes` + `mirror_scales` + `q1_planes=5`
+        + `cube_root_bits=8`; enables `q1_imprint_puzzle=True` when `num_experts >= 2` or model
+        metadata is not yet local). CPU execution (`--device cpu` or no CUDA) keeps standard `auto`.
+    """
+    from src.stanok_contour import normalize_feedback_mode
+
+    wf = str(weight_format or "auto").strip().lower()
+    fb_raw = str(feedback_mode or "auto").strip().lower()
+
+    if fb_raw == "off":
+        return {
+            "weight_format": wf,
+            "feedback_mode": "off",
+            "q1_imprint_puzzle": False,
+            "q1_planes": q1_planes,
+            "cube_root_bits": 16,
+            "auto_v4_selected": False,
+            "reason": "explicit_off",
+        }
+
+    if fb_raw != "auto":
+        fb_norm = normalize_feedback_mode(fb_raw)
+        if wf == "auto":
+            wf = "q1_cubes"
+        eff_planes = 5 if (q1_planes is None and wf == "q1_cubes") else q1_planes
+        eff_root = 16 if (eff_planes is not None and int(eff_planes) > 8) else 8
+        return {
+            "weight_format": wf,
+            "feedback_mode": fb_norm,
+            "q1_imprint_puzzle": (wf == "q1_cubes"),
+            "q1_planes": eff_planes,
+            "cube_root_bits": eff_root if wf == "q1_cubes" else 16,
+            "auto_v4_selected": (fb_norm == "mirror_scales"),
+            "reason": f"explicit_{fb_norm}",
+        }
+
+    # feedback_mode == "auto"
+    if wf == "q1_cubes":
+        eff_planes = 5 if q1_planes is None else int(q1_planes)
+        eff_root = 16 if eff_planes > 8 else 8
+        num_exp = int((profile or {}).get("num_experts") or 0)
+        if profile is None and model_dir is not None and model_dir.exists():
+            try:
+                from .model_source import runtime_profile
+                num_exp = int((runtime_profile(model_dir) or {}).get("num_experts") or 0)
+            except Exception:
+                num_exp = 0
+        return {
+            "weight_format": "q1_cubes",
+            "feedback_mode": "mirror_scales",
+            "q1_imprint_puzzle": (num_exp >= 2 or model_dir is None),
+            "q1_planes": eff_planes,
+            "cube_root_bits": eff_root,
+            "auto_v4_selected": True,
+            "reason": "auto_q1_cubes_v4",
+        }
+
+    if wf != "auto" or device == "cpu":
+        return {
+            "weight_format": wf,
+            "feedback_mode": "off",
+            "q1_imprint_puzzle": False,
+            "q1_planes": q1_planes,
+            "cube_root_bits": 16,
+            "auto_v4_selected": False,
+            "reason": "explicit_non_q1_or_cpu",
+        }
+
+    # Default CUDA auto: promote all CUDA checkpoints to pure Q1 cubes V4 (k=5, root_bits=8)
+    if cuda_available is None:
+        try:
+            import torch
+            cuda_available = bool(torch.cuda.is_available())
+        except Exception:
+            cuda_available = False
+    if not cuda_available:
+        return {
+            "weight_format": wf,
+            "feedback_mode": "off",
+            "q1_imprint_puzzle": False,
+            "q1_planes": q1_planes,
+            "cube_root_bits": 16,
+            "auto_v4_selected": False,
+            "reason": "no_cuda",
+        }
+
+    eff_planes = 5 if q1_planes is None else int(q1_planes)
+    eff_root = 16 if eff_planes > 8 else 8
+    has_local_model = model_dir is not None and Path(model_dir).exists()
+
+    prof = profile
+    if prof is None and has_local_model:
+        try:
+            from .model_source import runtime_profile
+            prof = runtime_profile(model_dir)
+        except Exception:
+            prof = {}
+    num_experts = int((prof or {}).get("num_experts") or 0)
+
+    if num_experts >= 8 and has_local_model:
+        wb = weight_bytes
+        if wb is None:
+            try:
+                wb = _model_weight_bytes(Path(model_dir))
+            except Exception:
+                wb = 0
+
+        free_b = free_vram_bytes
+        if free_b is None:
+            try:
+                from .gpu_memory import measure_gpu_memory
+                free_b = int(measure_gpu_memory(0).get("free_bytes") or 0)
+            except Exception:
+                free_b = 0
+
+        if free_b > 0 and wb > int(1.25 * free_b):
+            return {
+                "weight_format": "q1_cubes",
+                "feedback_mode": "mirror_scales",
+                "q1_imprint_puzzle": True,
+                "q1_planes": eff_planes,
+                "cube_root_bits": eff_root,
+                "auto_v4_selected": True,
+                "reason": "auto_large_moe_exceeds_vram",
+                "num_experts": num_experts,
+                "weight_gib": round(wb / 2**30, 2),
+                "free_vram_gib": round(free_b / 2**30, 2),
+            }
+
+    return {
+        "weight_format": "q1_cubes",
+        "feedback_mode": "mirror_scales",
+        "q1_imprint_puzzle": (num_experts >= 2 or not has_local_model),
+        "q1_planes": eff_planes,
+        "cube_root_bits": eff_root,
+        "auto_v4_selected": True,
+        "reason": "auto_q1_cubes_v4",
+    }
 
 
 def _add_engine_args(p: argparse.ArgumentParser) -> None:
@@ -65,7 +303,13 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         help=f"Catalog number/name, local HF/GGUF/Quintessentia folder, or Hugging Face URL/repository "
         f"such as {DEFAULT_MODEL_ID} (downloaded once). Default: a locally recognized folder",
     )
-    p.add_argument("--quintessentia-root", type=str, default=None, help="Path to the Quintessentia program folder")
+    p.add_argument(
+        "--quintessentia-root",
+        dest="quintessentia_root",
+        type=str,
+        default=None,
+        help="Path to the Quintessentia program folder",
+    )
     p.add_argument("--download-dir", type=str, default=None, help="Save a Hugging Face model directly into this directory")
     p.add_argument("--device", choices=("auto", "cpu"), default="auto",
                    help="auto: CPU execution with optional GPU adoption; cpu: disk/CPU execution only")
@@ -75,21 +319,52 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         default="normal",
         help="normal: almost all free VRAM with a safety reserve (default); turbo: all free VRAM",
     )
-    p.add_argument("--max-context", type=int, default=None, help="Context tokens to reserve VRAM for (default 8192, 4096 on <=5 GB cards)")
+    p.add_argument("--max-context", type=int, default=None, help="KV memory-planning reservation; does not cap requests. Model architecture and available memory determine actual capacity.")
     p.add_argument("--prefill-chunk", type=int, default=None, help="Prompt tokens per prefill chunk (default 512, 256 on <=5 GB cards)")
     p.add_argument("--prefill-wavefront", action="store_true",
                    help="Experimental Llama prefill: overlap prompt chunks across three CUDA stages")
     p.add_argument("--no-mtp", action="store_true", help="Disable the speculative MTP head")
-    p.add_argument("--speculation", choices=("auto", "off", "lookup", "native"), default="auto",
-                   help="Shared streamed verification: native trained head when available, otherwise prompt lookup")
+    p.add_argument("--speculation", choices=("auto", "off", "lookup", "native", "q1"), default="auto",
+                   help="Shared streamed verification: native MTP head, prompt lookup, or Q1 2-plane self-speculation")
     p.add_argument("--mtp-head", type=str, default=None, help="Separate trained MTP safetensors for the selected model")
     p.add_argument("--mtp-head-budget-mib", type=int, default=128)
     p.add_argument("--region-pruning", action=argparse.BooleanOptionalAction, default=True,
                    help="Exclude proven zero-weight routed experts and cancel obsolete current-scope preparation")
+    p.add_argument("--thought-anchor", action=argparse.BooleanOptionalAction, default=False,
+                   help="Retain initial probability field Phi_0 with bounded log-odds steering across generation")
+    p.add_argument("--max-slot-mib", type=float, default=None,
+                   help="Cap per-slot VRAM budget in MiB (enables Q1 sub-layer / sub-lm_head cube streaming when below a layer or lm_head)")
     p.add_argument("--progressive-start", "--cpu-first", action=argparse.BooleanOptionalAction, default=True,
                    help="Start CPU and GPU preparation together; devices take work when ready (default); --no-progressive-start selects the GPU-first reference")
-    p.add_argument("--weight-format", choices=("auto", "bf16", "q4", "q6"), default="auto",
-                   help="Runtime weights: auto keeps the native Qwen Q4 path, otherwise uses universal Q6")
+    p.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto",
+                   help="Runtime weights: auto selects pure Q1 cubes V4 (k=5) on CUDA or standard CPU path; explicit q1_cubes/q1/q2/q4/q6/q8/bf16")
+    p.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None,
+                   help="Explicit prefix depth; auto V4 / q1_cubes defaults to 5 planes (root_bits=8), legacy q1 to 4")
+    p.add_argument("--cube-blueprint", help="Method 1 JSON map selecting Method 2 cube prefixes per projection")
+    p.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable dynamic Plane-0 vocabulary early-stop on Ideal Q1 LM head (default: on)")
+    p.add_argument("--puzzle-overlay", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable dynamic 3D Q1PuzzleOverlay (Ideal Q1 P=1 skeleton + contact-assembled delta cubes)")
+    p.add_argument("--puzzle-slice-ratio", type=float, default=0.35,
+                   help="Fraction of delta-cubes selected per dynamic slice S_t when --puzzle-overlay is enabled (0.0..1.0, default: 0.35)")
+    p.add_argument(
+        "--mode",
+        choices=PROFILE_MODE_CHOICES,
+        default="default",
+        help="User profile: default (auto V4 + unlimited EOS + anti-loop sampling) or custom (manual control over all sampling & engine flags)",
+    )
+    p.add_argument(
+        "--feedback-mode",
+        choices=FEEDBACK_MODE_CHOICES,
+        default="auto",
+        help="Q1 mirror feedback mode: auto (pure Q1 cubes V4 M0-M8 on CUDA), off (opt out to legacy q4/q6), spiral_sphere (V2), pure_mirror (V3), or mirror_scales/v4 (V4 isolated pure-math mirror scales)",
+    )
+    p.add_argument(
+        "--rest-tol",
+        type=float,
+        default=None,
+        help="Custom MoE cold-expert mirror rest tolerance (requires q1_cubes / V4; default: 0.24)",
+    )
     p.add_argument("--max-drafts", type=int, default=2, help="Max speculative draft depth (1..3, default: 2)")
     p.add_argument(
         "--fast-vocab",
@@ -98,15 +373,71 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_generation_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=0,
+        help="Max new tokens (0 = unlimited until natural EOS, default: 0)",
+    )
+    p.add_argument("--no-think", action="store_true", help="Disable `<think>` reasoning block")
+    p.add_argument("--system", type=str, default=None, help="Optional system prompt")
+    p.add_argument("--temperature", type=float, default=None, help="Sampling temperature (overrides mode default; 0 = greedy)")
+    p.add_argument("--top-p", dest="top_p", type=float, default=None, help="Nucleus top-p sampling cutoff (0..1)")
+    p.add_argument("--top-k", dest="top_k", type=int, default=None, help="Top-k sampling cutoff (0 = disabled)")
+    p.add_argument("--repetition-penalty", dest="repetition_penalty", type=float, default=None, help="Repetition penalty on generated tokens (>=1.0)")
+    p.add_argument("--presence-penalty", dest="presence_penalty", type=float, default=None, help="Presence penalty on generated tokens (>=0.0)")
+    p.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible sampling")
+
+
 def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
     from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     model = args.model
+    root = find_quintessentia_root(args.quintessentia_root)
     if getattr(args, "download_dir", None):
         if not model:
             raise ModelNotFoundError("--download-dir requires a Hugging Face model reference")
         from .model_hub import download_model
-        model, _, _ = download_model(model, find_quintessentia_root(args.quintessentia_root), directory=args.download_dir)
+        model, _, _ = download_model(model, root, directory=args.download_dir)
     explicit_repo = bool(model) and not Path(model).exists()
+    wf_arg = str(getattr(args, "weight_format", "auto") or "auto").strip().lower()
+    fb_arg = str(getattr(args, "feedback_mode", "auto") or "auto").strip().lower()
+    dev_arg = str(getattr(args, "device", "auto") or "auto").strip().lower()
+    is_local_ref = (
+        (model is None)
+        or Path(model).exists()
+        or (isinstance(model, str) and ("/" not in model) and ("\\" not in model))
+    )
+    needs_local_probe = (
+        is_local_ref
+        and (dev_arg != "cpu")
+        and (fb_arg != "off")
+        and (wf_arg in ("auto", "q1_cubes"))
+    )
+    resolved_dir: Path | None = None
+    if needs_local_probe:
+        try:
+            resolved_dir = resolve_model_dir(model, root, allow_download=False)
+        except (ModelNotFoundError, UnsupportedModelError, OSError, ValueError):
+            resolved_dir = None
+
+    v4_plan = resolve_auto_v4_plan(
+        model_dir=resolved_dir,
+        weight_format=wf_arg,
+        feedback_mode=fb_arg,
+        q1_planes=getattr(args, "q1_planes", None),
+        device=dev_arg,
+    )
+    if v4_plan.get("auto_v4_selected") and v4_plan.get("reason") == "auto_large_moe_exceeds_vram":
+        print(
+            f"[Quintessentia Auto-V4] Large MoE ({v4_plan.get('num_experts')} experts, "
+            f"{v4_plan.get('weight_gib')} GiB > 1.25x {v4_plan.get('free_vram_gib')} GiB free VRAM) "
+            f"-> weight_format={v4_plan['weight_format']}, feedback_mode={v4_plan['feedback_mode']} (M0-M8), "
+            f"q1_planes={v4_plan['q1_planes']}, cube_root_bits={v4_plan['cube_root_bits']}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     return QuintessentiaUnifiedEngine(
         model_dir=model,
         quintessentia_root=args.quintessentia_root,
@@ -117,7 +448,7 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         max_context_tokens=args.max_context,
         prefill_chunk_tokens=args.prefill_chunk,
         allow_download=explicit_repo,
-        weight_format=args.weight_format,
+        weight_format=v4_plan["weight_format"],
         prefill_wavefront=getattr(args, "prefill_wavefront", False),
         progressive_start=getattr(args, "progressive_start", getattr(args, "cpu_first", True)),
         device=getattr(args, "device", "auto"),
@@ -125,6 +456,21 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         mtp_head_path=getattr(args, "mtp_head", None),
         mtp_head_budget_mib=getattr(args, "mtp_head_budget_mib", 128),
         prune_regions=getattr(args, "region_pruning", True),
+        thought_anchor=getattr(args, "thought_anchor", False),
+        max_slot_mib=getattr(args, "max_slot_mib", None),
+        q1_planes=v4_plan["q1_planes"],
+        cube_root_bits=v4_plan["cube_root_bits"],
+        cube_blueprint=getattr(args, "cube_blueprint", None),
+        q1_early_stop=getattr(args, "q1_early_stop", True),
+        puzzle_overlay=getattr(args, "puzzle_overlay", False),
+        puzzle_slice_ratio=getattr(args, "puzzle_slice_ratio", 0.35),
+        q1_expert_rest_tol=(
+            getattr(args, "rest_tol", None)
+            if v4_plan["weight_format"] == "q1_cubes"
+            else None
+        ),
+        q1_imprint_puzzle=bool(v4_plan["q1_imprint_puzzle"]),
+        q1_graphify_feedback=v4_plan["feedback_mode"],
     )
 
 
@@ -174,14 +520,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             report["startup_memory_probe"] = measure_gpu_memory(0)
             free_b, total_b = (report["startup_memory_probe"][k] for k in ("free_bytes", "total_bytes"))
             try:
+                max_slot_mib = getattr(args, "max_slot_mib", None)
+                extra_plan = {"max_slot_bytes": int(float(max_slot_mib) * 1024**2)} if max_slot_mib is not None else {}
+                v4_doc = resolve_auto_v4_plan(
+                    model_dir=model_dir,
+                    weight_format=getattr(args, "weight_format", "auto"),
+                    feedback_mode=getattr(args, "feedback_mode", "auto"),
+                    q1_planes=getattr(args, "q1_planes", None),
+                    device=getattr(args, "device", "auto"),
+                    cuda_available=cuda_ok and not cpu_execution,
+                    free_vram_bytes=free_b,
+                    profile=profile,
+                )
+                report["auto_v4_plan"] = v4_doc
+                wf_doc = v4_doc["weight_format"]
+                q1_p_doc = v4_doc["q1_planes"] or (16 if wf_doc == "q1_cubes" else 4)
+                if wf_doc in ("q1", "q1_cubes") or q1_p_doc != 4:
+                    extra_plan["q1_planes"] = q1_p_doc
                 profile, plan, _has_mtp = plan_for_checkpoint(
                     model_dir,
                     mode=args.vram_mode,
                     total_bytes=total_b,
                     free_bytes=free_b,
                     enable_mtp=not getattr(args, "no_mtp", False),
-                    weight_format=getattr(args, "weight_format", "auto"),
+                    weight_format=wf_doc,
                     prefill_wavefront=getattr(args, "prefill_wavefront", False),
+                    **extra_plan,
                 )
                 report["runtime_profile"] = profile
                 report["mtp_weights_present"] = bool(profile.get("mtp_weights"))
@@ -201,10 +565,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if model_error:
         print(f"                       {model_error}")
     profile = report.get("runtime_profile") or {}
+    v4_doc = report.get("auto_v4_plan")
     if profile:
-        why = "; ".join(profile.get("why_not_fast") or [])
-        fast_line = "on" if profile.get("fast_qwen") else f"off ({why})" if why else "off"
-        print(f"  Backend            : {profile.get('backend')} / {profile.get('weight_format')} / fast {fast_line}")
+        if profile.get("weight_format") == "q1_cubes":
+            q1_p = profile.get("q1_planes") or (v4_doc or {}).get("q1_planes") or 5
+            root_b = (v4_doc or {}).get("cube_root_bits") or (16 if int(q1_p) > 8 else 8)
+            print(f"  Backend            : {profile.get('backend')} / q1_cubes (k={q1_p}, root_bits={root_b})")
+        else:
+            why = "; ".join(profile.get("why_not_fast") or [])
+            fast_line = "on" if profile.get("fast_qwen") else f"off ({why})" if why else "off"
+            print(f"  Backend            : {profile.get('backend')} / {profile.get('weight_format')} / fast {fast_line}")
+    if v4_doc and v4_doc.get("auto_v4_selected"):
+        print(
+            f"  V4 Q1 Cubes        : ON ({v4_doc['feedback_mode']}, "
+            f"q1_planes={v4_doc['q1_planes']}, root_bits={v4_doc['cube_root_bits']}, "
+            f"reason={v4_doc['reason']})"
+        )
     if "mtp_weights_present" in report:
         mtp_on = bool(profile.get("mtp_enabled"))
         present = "present" if report["mtp_weights_present"] else "absent"
@@ -216,9 +592,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             f"{profile.get('num_hidden_layers')} layers, hidden {profile.get('hidden_size')}"
         )
     if plan is not None:
-        layout = "all layers resident" if plan.full_residency else (
-            f"{plan.resident_layers}/{plan.layers_total} resident + {plan.ring_slots}-slot ring"
-        )
+        if plan.full_residency:
+            layout = "all layers resident"
+        elif profile.get("weight_format") == "q1_cubes" and v4_doc and v4_doc.get("auto_v4_selected"):
+            layout = f"{plan.resident_layers}/{plan.layers_total} resident + V4 streamed tail"
+        else:
+            layout = f"{plan.resident_layers}/{plan.layers_total} resident + {plan.ring_slots}-slot ring"
         print(
             f"  VRAM plan ({plan.mode:6s}): total {plan.total_bytes / 2**30:.2f} GiB, free {plan.free_bytes / 2**30:.2f} GiB, "
             f"reserve {plan.reserve_bytes / 2**30:.2f} GiB -> {layout}, MTP {'on' if plan.enable_mtp else 'off'}"
@@ -259,17 +638,29 @@ def cmd_models(args):
         for row in rows:
             checked = f" | metadata {'OK' if row['metadata_supported'] else 'needs adapter'}" if "metadata_supported" in row else ""
             print(f"{row['index']:>3}  {row['name']}  [{row.get('format','?')}, {row.get('weight_bytes',0)/2**30:.2f} GiB]{checked}")
-        print('Select by number, folder name or full path: quintessentia ask --model 1 "Hi"')
+        print('Select by number, folder name or full path: quint ask --model 1 "Hi"')
         print('Available files and metadata checks do not certify runtime support; see MODEL_SUPPORT.md.')
     return EXIT_OK
 
 
-def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vram_mode="normal"):
+def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vram_mode="normal",
+                        feedback_mode="auto", q1_planes=None, q1_early_stop=True):
     import torch
     from .unified_runtime import QuintessentiaUnifiedEngine
-    with QuintessentiaUnifiedEngine(folder, quintessentia_root=root, device=device, weight_format=weight_format,
+    v4_plan = resolve_auto_v4_plan(
+        model_dir=Path(folder),
+        weight_format=weight_format,
+        feedback_mode=feedback_mode,
+        q1_planes=q1_planes,
+        device=device,
+    )
+    with QuintessentiaUnifiedEngine(
+        folder, quintessentia_root=root, device=device, weight_format=v4_plan["weight_format"],
         vram_mode=vram_mode, enable_mtp=False, speculation="off", verbose=False,
-        max_context_tokens=512, prefill_chunk_tokens=8) as engine:
+        max_context_tokens=512, prefill_chunk_tokens=8, q1_planes=v4_plan["q1_planes"],
+        cube_root_bits=v4_plan["cube_root_bits"], q1_imprint_puzzle=bool(v4_plan["q1_imprint_puzzle"]),
+        q1_graphify_feedback=v4_plan["feedback_mode"], q1_early_stop=q1_early_stop,
+    ) as engine:
         ids = engine.tokenizer("Hi", return_tensors="pt").input_ids
         with torch.inference_mode():
             logits, cache = engine.engine._forward_step(ids, prefill=True, prefill_end=True, prefetch_next=False)
@@ -287,7 +678,10 @@ def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vr
 def cmd_prepare(args):
     root = find_quintessentia_root(args.quintessentia_root)
     folder = resolve_model_dir(args.model, root, allow_download=bool(args.model) and not Path(args.model).exists())
-    report = _verify_preparation(folder, root=root, device=args.device, weight_format=args.weight_format, vram_mode=args.vram_mode)
+    report = _verify_preparation(folder, root=root, device=args.device, weight_format=args.weight_format,
+                                 vram_mode=args.vram_mode, feedback_mode=getattr(args, "feedback_mode", "auto"),
+                                 q1_planes=getattr(args, "q1_planes", None),
+                                 q1_early_stop=getattr(args, "q1_early_stop", True))
     from .model_hub import register_model, save_json
     register_model(root, folder)
     if args.json_out:
@@ -303,8 +697,11 @@ def cmd_download(args):
                                              filename=args.file, revision=args.revision)
     try:
         if not args.no_verify:
-            receipt["preparation"] = _verify_preparation(folder, root=root, device=args.device,
-                weight_format=args.weight_format, vram_mode=args.vram_mode)
+            receipt["preparation"] = _verify_preparation(
+                folder, root=root, device=args.device, weight_format=args.weight_format,
+                vram_mode=args.vram_mode, feedback_mode=getattr(args, "feedback_mode", "auto"),
+                q1_planes=getattr(args, "q1_planes", None),
+                q1_early_stop=getattr(args, "q1_early_stop", True))
             receipt["status"] = "ready"
         save_json(marker, receipt)
         if args.json_out:
@@ -320,17 +717,32 @@ def cmd_download(args):
     return EXIT_OK
 
 
-def _stream_to_console(engine: QuintessentiaUnifiedEngine, messages: list[dict[str, str]], max_tokens: int, thinking: bool, use_session: bool) -> dict:
+def _stream_to_console(
+    engine: QuintessentiaUnifiedEngine,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    thinking: bool,
+    use_session: bool,
+    *,
+    gen_profile: dict | None = None,
+) -> dict:
     in_think_printed = False
     in_ans_printed = False
     done_packet: dict = {}
+    gp = gen_profile or {}
 
     gen = engine.stream_chat(
         messages,
-        max_new_tokens=max_tokens,
+        max_new_tokens=int(gp.get("max_new_tokens", max_tokens)),
         enable_thinking=thinking,
         use_session_cache=use_session,
         stop_on_eos=True,
+        temperature=float(gp.get("temperature", 0.0)),
+        top_p=float(gp.get("top_p", 1.0)),
+        top_k=int(gp.get("top_k", 0)),
+        repetition_penalty=float(gp.get("repetition_penalty", 1.0)),
+        presence_penalty=float(gp.get("presence_penalty", 0.0)),
+        seed=gp.get("seed"),
     )
     try:
         for ev in gen:
@@ -384,8 +796,29 @@ def _stream_to_console(engine: QuintessentiaUnifiedEngine, messages: list[dict[s
 def cmd_ask(args: argparse.Namespace) -> int:
     prompt_text = " ".join(args.prompt).strip()
     if not prompt_text:
-        print("Error: please provide a prompt, e.g. `quintessentia ask \"Привет!\"`", file=sys.stderr)
+        print("Error: please provide a prompt, e.g. `quint ask \"Привет!\"`", file=sys.stderr)
         return EXIT_USAGE
+
+    thinking = not args.no_think
+    gen_profile = resolve_generation_profile(
+        getattr(args, "mode", "default"),
+        thinking=thinking,
+        max_tokens=args.max_tokens,
+        temperature=getattr(args, "temperature", None),
+        top_p=getattr(args, "top_p", None),
+        top_k=getattr(args, "top_k", None),
+        repetition_penalty=getattr(args, "repetition_penalty", None),
+        presence_penalty=getattr(args, "presence_penalty", None),
+        seed=getattr(args, "seed", None),
+    )
+    tok_label = "unlimited->EOS" if gen_profile["max_new_tokens"] == 0 else f"max={gen_profile['max_new_tokens']}"
+    print(
+        f"[Quintessentia Mode: {gen_profile['mode']} | {tok_label} | think={'ON' if thinking else 'OFF'} | "
+        f"temp={gen_profile['temperature']}, top_p={gen_profile['top_p']}, top_k={gen_profile['top_k']}, "
+        f"presence={gen_profile['presence_penalty']}, rep={gen_profile['repetition_penalty']}]",
+        file=sys.stderr,
+        flush=True,
+    )
 
     messages: list[dict[str, str]] = []
     if args.system:
@@ -397,8 +830,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
             eng,
             messages=messages,
             max_tokens=args.max_tokens,
-            thinking=not args.no_think,
+            thinking=thinking,
             use_session=False,
+            gen_profile=gen_profile,
         )
         if args.json_out and done_pkt:
             Path(args.json_out).write_text(json.dumps(done_pkt, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -407,13 +841,17 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 def cmd_chat(args: argparse.Namespace) -> int:
     thinking = not args.no_think
+    cur_mode = getattr(args, "mode", "default")
     messages: list[dict[str, str]] = []
     if args.system:
         messages.append({"role": "system", "content": args.system})
 
     with _engine_from_args(args) as eng:
+        b_lbl = eng.profile.get("backend", "auto")
+        wf_lbl = eng.profile.get("weight_format", "auto")
         print(
-            "\n[Quintessentia Interactive Chat] Commands: `/reset`, `/think on|off`, `/status`, `/exit`. "
+            f"\n[Quintessentia Interactive Chat | mode={cur_mode} | {b_lbl} ({wf_lbl})] "
+            "Commands: `/reset`, `/think on|off`, `/mode default|custom`, `/status`, `/exit`. "
             "Ctrl+C stops the current answer.\n",
             flush=True,
         )
@@ -437,10 +875,29 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 thinking = (parts[1].lower() == "on") if len(parts) > 1 else (not thinking)
                 print(f"[Режим <think>: {'ON' if thinking else 'OFF'}]", flush=True)
                 continue
+            if user_in.lower().startswith("/mode"):
+                parts = user_in.split()
+                if len(parts) > 1 and parts[1].lower() in PROFILE_MODE_CHOICES:
+                    cur_mode = parts[1].lower()
+                    print(f"[Режим профиля: {cur_mode}]", flush=True)
+                else:
+                    print(f"[Текущий режим: {cur_mode}. Использование: /mode default|custom]", flush=True)
+                continue
             if user_in.lower() == "/status":
                 print(json.dumps(eng.status_snapshot(), ensure_ascii=False, indent=2), flush=True)
                 continue
 
+            gen_profile = resolve_generation_profile(
+                cur_mode,
+                thinking=thinking,
+                max_tokens=args.max_tokens,
+                temperature=getattr(args, "temperature", None),
+                top_p=getattr(args, "top_p", None),
+                top_k=getattr(args, "top_k", None),
+                repetition_penalty=getattr(args, "repetition_penalty", None),
+                presence_penalty=getattr(args, "presence_penalty", None),
+                seed=getattr(args, "seed", None),
+            )
             messages.append({"role": "user", "content": user_in})
             done_pkt = _stream_to_console(
                 eng,
@@ -448,6 +905,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 max_tokens=args.max_tokens,
                 thinking=thinking,
                 use_session=True,
+                gen_profile=gen_profile,
             )
             if done_pkt:
                 messages.append({"role": "assistant", "content": done_pkt.get("answer_text", "")})
@@ -500,23 +958,26 @@ def build_parser() -> argparse.ArgumentParser:
     from . import __version__
     parser = argparse.ArgumentParser(
         prog="quintessentia",
-        description="Quintessentia: supported HF/GGUF language models, Q4/Q6 CUDA execution and a LAN OpenAI-compatible server",
+        description="Quintessentia: Q1-cubes V4 / Q4 / Q6 / BF16 CUDA & CPU streaming inference engine and LAN OpenAI-compatible server",
     )
     parser.add_argument("--version", action="version", version=f"Quintessentia {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_models = sub.add_parser("models", help="List local model files; select by number, folder name or path")
-    p_models.add_argument("--quintessentia-root", default=None)
+    p_models.add_argument("--quintessentia-root", dest="quintessentia_root", default=None)
     p_models.add_argument("--json", action="store_true")
     p_models.add_argument("--check", action="store_true", help="Check adaptation metadata; does not run generation")
     p_models.set_defaults(func=cmd_models)
 
     for command, callback in (("download",cmd_download),("prepare",cmd_prepare)):
         p_model = sub.add_parser(command, help=("Download a Hugging Face model into a directory and verify automatic adaptation"
-                                               if command == "download" else "Verify a model's first forward and automatic runtime packing"))
-        p_model.add_argument("--quintessentia-root", default=None)
+                                               if command == "download" else "Verify a model's first forward and automatic runtime adaptation"))
+        p_model.add_argument("--quintessentia-root", dest="quintessentia_root", default=None)
         p_model.add_argument("--device", choices=("auto","cpu"), default="auto")
-        p_model.add_argument("--weight-format", choices=("auto","bf16","q4","q6"), default="auto")
+        p_model.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto")
+        p_model.add_argument("--feedback-mode", choices=FEEDBACK_MODE_CHOICES, default="auto")
+        p_model.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None)
+        p_model.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True)
         p_model.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
         p_model.add_argument("--json-out", default=None)
         if command == "download":
@@ -531,28 +992,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doc = sub.add_parser("doctor", help="Check GPU, VRAM plan, model files, and LAN interfaces")
     p_doc.add_argument("--model", "--model-dir", dest="model", type=str, default=None)
-    p_doc.add_argument("--quintessentia-root", type=str, default=None)
+    p_doc.add_argument("--quintessentia-root", dest="quintessentia_root", type=str, default=None)
     p_doc.add_argument("--download-dir", default=None)
     p_doc.add_argument("--device", choices=("auto", "cpu"), default="auto")
     p_doc.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
-    p_doc.add_argument("--weight-format", choices=("auto", "bf16", "q4", "q6"), default="auto")
+    p_doc.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto")
+    p_doc.add_argument("--feedback-mode", choices=FEEDBACK_MODE_CHOICES, default="auto")
+    p_doc.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None)
+    p_doc.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True)
+    p_doc.add_argument("--max-slot-mib", type=float, default=None)
     p_doc.add_argument("--json-out", type=str, default=None)
     p_doc.set_defaults(func=cmd_doctor)
 
     p_ask = sub.add_parser("ask", help="Stream a single prompt (`<think>...</think>` -> `<|im_end|>`)")
     _add_engine_args(p_ask)
-    p_ask.add_argument("--max-tokens", type=int, default=1024, help="Max new tokens (default: 1024)")
-    p_ask.add_argument("--no-think", action="store_true", help="Disable `<think>` reasoning block")
-    p_ask.add_argument("--system", type=str, default=None, help="Optional system prompt")
+    _add_generation_args(p_ask)
     p_ask.add_argument("--json-out", type=str, default=None, help="Save full response + telemetry JSON")
     p_ask.add_argument("prompt", nargs="+", help="Prompt text")
     p_ask.set_defaults(func=cmd_ask)
 
     p_chat = sub.add_parser("chat", help="Interactive terminal chat with `kv_prefix` reuse & RAM parking")
     _add_engine_args(p_chat)
-    p_chat.add_argument("--max-tokens", type=int, default=1024)
-    p_chat.add_argument("--no-think", action="store_true")
-    p_chat.add_argument("--system", type=str, default=None)
+    _add_generation_args(p_chat)
     p_chat.set_defaults(func=cmd_chat)
 
     p_srv = sub.add_parser("serve", help="Start LAN HTTP/SSE server + UDP LAN self-broadcaster")

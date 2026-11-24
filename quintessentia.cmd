@@ -1,6 +1,6 @@
 @echo off
 setlocal
-rem Quintessentia: quintessentia.cmd <doctor|ask|chat|serve|discover> [options]
+rem Quintessentia: quintessentia.cmd <doctor|ask|chat|serve|discover|models|download|prepare> [options]
 set "PYTHONDONTWRITEBYTECODE=1"
 set "PY=python"
 if defined QUINTESSENTIA_PYTHON (

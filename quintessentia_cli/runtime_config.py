@@ -35,3 +35,14 @@ class GenerationCancelled(RuntimeError):
     def __init__(self, phase, reason="cancelled"):
         super().__init__(f"generation cancelled during {phase}: {reason}")
         self.phase, self.reason = phase, reason
+
+
+def model_context_limit(engine):
+    """Architectural limit only; the KV planning reservation is not a request ceiling."""
+    config = getattr(engine, "config", None)
+    for cfg in (getattr(config, "text_config", None), config):
+        for name in ("max_position_embeddings", "n_positions", "seq_length", "max_sequence_length", "max_seq_len"):
+            value = cfg.get(name) if isinstance(cfg, dict) else getattr(cfg, name, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    return None

@@ -26,6 +26,7 @@ from copy import deepcopy
 import ctypes
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path, PurePosixPath
 import queue
@@ -135,6 +136,7 @@ _GLOBAL_ALIASES = {
         "model.language_model.embed_tokens.weight",
         "language_model.model.embed_tokens.weight",
         "model.embed_tokens.weight",
+        "model.tok_embeddings.weight",
         "model.embeddings.weight",
         "model.decoder.embed_tokens.weight",
         "transformer.wte.weight",
@@ -154,6 +156,7 @@ _GLOBAL_ALIASES = {
         "language_model.model.norm.weight",
         "model.norm.weight",
         "model.norm_f.weight",
+        "model.final_norm.weight",
         "model.embedding_norm.weight",
         "model.final_layernorm.weight",
         "model.decoder.final_layer_norm.weight",
@@ -173,6 +176,7 @@ _GLOBAL_ALIASES = {
         "language_model.lm_head.weight",
         "embed_out.weight",
         "output_projection.weight",
+        "output.weight",
         "head.weight",
     ),
 }
@@ -860,6 +864,41 @@ def read_safetensors_header(path: str | Path) -> tuple[dict[str, Any], int]:
     return header, 8 + n
 
 
+_PREAD_FADVISE_MIN_BYTES = 262144  # 256 KiB — skip tiny header/metadata reads
+_PREAD_FADVISE_STATS: dict[str, int] = {"calls": 0, "bytes": 0}
+_DIRECT_IO_STATS: dict[str, int] = {"calls": 0, "bytes": 0, "fallbacks": 0}
+_LIBC_PREAD = None
+_LIBC_PREAD_INIT = False
+
+
+def pread_fadvise_stats() -> dict[str, int]:
+    """Return telemetry of POSIX_FADV_DONTNEED page-cache evictions after positioned reads."""
+    return dict(_PREAD_FADVISE_STATS)
+
+
+def direct_io_stats() -> dict[str, int]:
+    """Return telemetry of Linux O_DIRECT aligned positioned reads (0 page-cache footprint)."""
+    return dict(_DIRECT_IO_STATS)
+
+
+def _get_libc_pread():
+    global _LIBC_PREAD, _LIBC_PREAD_INIT
+    if _LIBC_PREAD_INIT:
+        return _LIBC_PREAD
+    _LIBC_PREAD_INIT = True
+    if os.name != "posix" or not hasattr(os, "O_DIRECT"):
+        return None
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        fn = libc.pread
+        fn.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_longlong]
+        fn.restype = ctypes.c_ssize_t
+        _LIBC_PREAD = fn
+    except Exception:
+        _LIBC_PREAD = None
+    return _LIBC_PREAD
+
+
 def _pread_or_seek_into(f: Any, abs_offset: int, view: memoryview, path: str) -> None:
     total = len(view)
     if total == 0:
@@ -873,6 +912,17 @@ def _pread_or_seek_into(f: Any, abs_offset: int, view: memoryview, path: str) ->
                 raise OSError(f"{path}: unexpected EOF at offset {abs_offset + done}")
             view[done : done + len(chunk)] = chunk
             done += len(chunk)
+        if (
+            total >= _PREAD_FADVISE_MIN_BYTES
+            and hasattr(os, "posix_fadvise")
+            and hasattr(os, "POSIX_FADV_DONTNEED")
+        ):
+            try:
+                os.posix_fadvise(fd, abs_offset, total, os.POSIX_FADV_DONTNEED)
+                _PREAD_FADVISE_STATS["calls"] += 1
+                _PREAD_FADVISE_STATS["bytes"] += total
+            except OSError:
+                pass
     else:
         f.seek(abs_offset)
         done = 0
@@ -1064,12 +1114,18 @@ class _ParallelSliceStagingPool:
         self._views = [memoryview(s.numpy()) for s in self._slots]
         self._events = [torch.cuda.Event() if self.use_cuda else None for _ in self._slots]
         self._in_flight = [False] * len(self._slots)
+        self._slot_locks = [threading.Lock() for _ in self._slots]
+        self._cursor_lock = threading.Lock()
         self._cursor = 0
 
         self._lock = threading.Lock()
         self._pool: ThreadPoolExecutor | None = None
         self._handle_queues: dict[str, queue.SimpleQueue] = {}
         self._all_handles: list[Any] = []
+        # Native Linux O_DIRECT aligned read pools (0 page cache, 0 fadvise lock contention)
+        self._direct_supported: dict[str, bool] = {}
+        self._direct_queues: dict[str, queue.SimpleQueue] = {}
+        self._all_direct_resources: list[tuple[int, mmap.mmap]] = []
 
     def _borrow_handle(self, path: str):
         with self._lock:
@@ -1085,11 +1141,102 @@ class _ParallelSliceStagingPool:
                 self._all_handles.append(f)
             return f, q
 
+    @staticmethod
+    def _alloc_page_aligned(size: int) -> tuple[bytearray, int, int]:
+        """Allocates a 4096-byte page-aligned buffer without calling `mmap.mmap`."""
+        cap = max(4096, (int(size) + 4095) & ~4095)
+        raw = bytearray(cap + 4096)
+        base_ptr = ctypes.addressof(ctypes.c_char.from_buffer(raw))
+        pad = (-base_ptr) & 4095
+        return raw, pad, base_ptr + pad
+
+    def _probe_direct_path(self, path: str) -> bool:
+        with self._lock:
+            cached = self._direct_supported.get(path)
+            if cached is not None:
+                return cached
+        pread_fn = _get_libc_pread()
+        ok = False
+        if pread_fn is not None and os.environ.get("QUINTESSENTIA_DISABLE_O_DIRECT", "0") != "1":
+            fd = -1
+            try:
+                if os.path.getsize(path) >= 4096:
+                    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+                    _raw, _pad, ptr = self._alloc_page_aligned(4096)
+                    n = pread_fn(fd, ptr, 4096, 0)
+                    ok = (n == 4096)
+            except OSError:
+                ok = False
+            finally:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        with self._lock:
+            self._direct_supported[path] = ok
+            if ok and path not in self._direct_queues:
+                self._direct_queues[path] = queue.SimpleQueue()
+        return ok
+
+    def _borrow_direct(self, path: str, min_aligned_bytes: int):
+        with self._lock:
+            q = self._direct_queues[path]
+        try:
+            fd, buf, pad, ptr, cap = q.get_nowait()
+        except queue.Empty:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            cap = max(1024 * 1024, (min_aligned_bytes + 4095) & ~4095)
+            buf, pad, ptr = self._alloc_page_aligned(cap)
+            with self._lock:
+                self._all_direct_resources.append((fd, None))
+        if min_aligned_bytes > cap:
+            new_cap = max((min_aligned_bytes + 4095) & ~4095, cap * 2)
+            buf, pad, ptr = self._alloc_page_aligned(new_cap)
+            cap = new_cap
+        return fd, buf, pad, ptr, cap, q
+
+    def _read_one_direct(self, path: str, abs_offset: int, dst_view: memoryview) -> bool:
+        length = len(dst_view)
+        if length == 0:
+            return True
+        pread_fn = _get_libc_pread()
+        if pread_fn is None:
+            return False
+        a_off = abs_offset & ~4095
+        head = abs_offset - a_off
+        a_len = ((head + length + 4095) & ~4095)
+        fd, buf, pad, ptr, cap, q = self._borrow_direct(path, a_len)
+        try:
+            done = 0
+            while done < a_len:
+                n = pread_fn(fd, ptr + done, a_len - done, a_off + done)
+                if n < 0:
+                    _DIRECT_IO_STATS["fallbacks"] += 1
+                    return False
+                if n == 0:
+                    break
+                done += int(n)
+            if done < head + length:
+                _DIRECT_IO_STATS["fallbacks"] += 1
+                return False
+            with memoryview(buf) as mv:
+                dst_view[:] = mv[pad + head : pad + head + length]
+            _DIRECT_IO_STATS["calls"] += 1
+            _DIRECT_IO_STATS["bytes"] += length
+            return True
+        finally:
+            q.put((fd, buf, pad, ptr, cap))
+
     def _read_one(self, task: tuple[str, int, int, int], view: memoryview) -> None:
         path, abs_offset, dst_offset, length = task
+        dst = view[dst_offset : dst_offset + length]
+        if length >= 4096 and self._probe_direct_path(path):
+            if self._read_one_direct(path, abs_offset, dst):
+                return
         f, q = self._borrow_handle(path)
         try:
-            _pread_or_seek_into(f, abs_offset, view[dst_offset : dst_offset + length], path)
+            _pread_or_seek_into(f, abs_offset, dst, path)
         finally:
             q.put(f)
 
@@ -1116,6 +1263,8 @@ class _ParallelSliceStagingPool:
     ) -> list[tuple[str, int, int, int]]:
         if len(tasks) <= 1:
             return tasks
+        # Elevator sort by (file, offset) turns scattered expert reads into sequential sweeps.
+        tasks = sorted(tasks, key=lambda t: (t[0], t[1]))
         merged: list[tuple[str, int, int, int]] = []
         cur_p, cur_off, cur_dst, cur_n = tasks[0]
         for p, off, dst, n in tasks[1:]:
@@ -1139,30 +1288,42 @@ class _ParallelSliceStagingPool:
         if total_bytes <= 0 or not tasks:
             return torch.empty(0, dtype=torch.uint8, device=self.device)
         tasks = self._coalesce_tasks(tasks)
-        self._ensure_capacity(total_bytes)
-        idx = self._cursor
-        self._cursor = (self._cursor + 1) % len(self._slots)
+        with self._cursor_lock:
+            if total_bytes > self.slot_bytes:
+                for sl in self._slot_locks:
+                    sl.acquire()
+                try:
+                    self._ensure_capacity(total_bytes)
+                finally:
+                    for sl in self._slot_locks:
+                        sl.release()
+            idx = self._cursor
+            self._cursor = (self._cursor + 1) % len(self._slots)
+            slot_lock = self._slot_locks[idx]
 
-        if self.use_cuda and self._in_flight[idx] and self._events[idx] is not None:
-            self._events[idx].synchronize()
-            self._in_flight[idx] = False
+        with slot_lock:
+            if self.use_cuda and self._in_flight[idx] and self._events[idx] is not None:
+                self._events[idx].synchronize()
+                self._in_flight[idx] = False
 
-        view = self._views[idx]
-        if len(tasks) == 1 or self.workers == 1:
-            for t in tasks:
-                self._read_one(t, view)
-        else:
-            if self._pool is None:
-                self._pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="quintessentia-moe-io")
-            list(self._pool.map(lambda t: self._read_one(t, view), tasks))
+            view = self._views[idx]
+            if len(tasks) == 1 or self.workers == 1:
+                for t in tasks:
+                    self._read_one(t, view)
+            else:
+                with self._lock:
+                    if self._pool is None:
+                        self._pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="quintessentia-moe-io")
+                    pool = self._pool
+                list(pool.map(lambda t: self._read_one(t, view), tasks))
 
-        src_u8 = self._slots[idx][:total_bytes]
-        if self.use_cuda:
-            dst_u8 = src_u8.to(device=self.device, non_blocking=True)
-            self._events[idx].record(torch.cuda.current_stream(self.device))
-            self._in_flight[idx] = True
-            return dst_u8
-        return src_u8.clone()
+            src_u8 = self._slots[idx][:total_bytes]
+            if self.use_cuda:
+                dst_u8 = src_u8.to(device=self.device, non_blocking=True)
+                self._events[idx].record(torch.cuda.current_stream(self.device))
+                self._in_flight[idx] = True
+                return dst_u8
+            return src_u8.clone()
 
     def close(self) -> None:
         if self.use_cuda:
@@ -1184,6 +1345,19 @@ class _ParallelSliceStagingPool:
                     pass
             self._all_handles.clear()
             self._handle_queues.clear()
+            for fd, buf in self._all_direct_resources:
+                try:
+                    buf.close()
+                except Exception:
+                    pass
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            self._all_direct_resources.clear()
+            self._direct_queues.clear()
+            self._direct_supported.clear()
         self._views.clear()
         self._slots.clear()
 
@@ -1585,6 +1759,10 @@ def _fast_moe_dispatch(
                 x_k = (sub_w.unsqueeze(-1) * x.unsqueeze(0)).to(dtype=comp_dtype)  # (K, D)
                 up_out = torch.bmm(up_w, x_k.unsqueeze(-1)).squeeze(-1)
                 gate_out = torch.bmm(gate_w, x_k.unsqueeze(-1)).squeeze(-1) if gate_w is not None else None
+            elif up_w.device.type == "cpu":
+                x_k = x.unsqueeze(0).expand(up_w.shape[0], -1).unsqueeze(-1)
+                up_out = torch.bmm(up_w, x_k).squeeze(-1)
+                gate_out = torch.bmm(gate_w, x_k).squeeze(-1) if gate_w is not None else None
             else:
                 up_out = torch.matmul(up_w, x)
                 gate_out = torch.matmul(gate_w, x) if gate_w is not None else None
@@ -1692,7 +1870,8 @@ _HF_EXPERT_LEAF_RE = re.compile(
 )
 _HF_PACKED_EXPERT_LEAF_RE = re.compile(
     r"^(mlp\.experts|feed_forward\.experts|block_sparse_moe\.experts|mixer\.experts)"
-    r"\.(gate_up_proj|up_proj|down_proj|gate_up_proj_bias|down_proj_bias)(?:\.weight)?$"
+    r"\.(gate_up_proj|up_proj|down_proj|gate_up_proj_bias|down_proj_bias"
+    r"|gate_up_proj_blocks|gate_up_proj_scales|down_proj_blocks|down_proj_scales)(?:\.weight)?$"
 )
 _HF_EXPERT_ROLE = {
     "gate_proj": "gate",
@@ -1760,6 +1939,54 @@ class _HFExpertCacheAndLoader:
                     max_expert_raw_bytes = max(max_expert_raw_bytes, un + dn)
 
         for l_idx, pmap in packed_experts.items():
+            if {"gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales"}.issubset(pmap):
+                # Native HuggingFace MXFP4 packed experts (e.g. GptOss-20B-MXFP4):
+                #   gate_up_proj_blocks [E, 2*I, H//32, 16] u8 + gate_up_proj_scales [E, 2*I, H//32] u8
+                #   down_proj_blocks    [E, H,   I//32, 16] u8 + down_proj_scales    [E, H,   I//32] u8
+                gub_p, gub_off, gub_n, _, gub_sh = reader.tensor_span(*pmap["gate_up_proj_blocks"])
+                gus_p, gus_off, gus_n, _, gus_sh = reader.tensor_span(*pmap["gate_up_proj_scales"])
+                dnb_p, dnb_off, dnb_n, _, dnb_sh = reader.tensor_span(*pmap["down_proj_blocks"])
+                dns_p, dns_off, dns_n, _, dns_sh = reader.tensor_span(*pmap["down_proj_scales"])
+                n_exp = int(dnb_sh[0])
+                self.num_experts_by_layer[l_idx] = n_exp
+                H_cur = int(dnb_sh[1])
+                I_cur = int(dnb_sh[2]) * int(dnb_sh[3]) * 2
+                if int(gub_sh[0]) != n_exp or int(gub_sh[1]) != 2 * I_cur or int(gub_sh[2]) * int(gub_sh[3]) * 2 != H_cur:
+                    raise UnsupportedModelError(
+                        f"Unrecognised MXFP4 MoE shapes gate_up_blocks={gub_sh}, down_blocks={dnb_sh}"
+                    )
+                if inter_dim == 0 and hidden_dim == 0:
+                    inter_dim, hidden_dim = I_cur, H_cur
+                if (I_cur, H_cur) != (inter_dim, hidden_dim):
+                    uniform_shapes = False
+                bgub, bgus, bdnb, bdns = gub_n // n_exp, gus_n // n_exp, dnb_n // n_exp, dns_n // n_exp
+                for eid in range(n_exp):
+                    self._spans[(l_idx, eid)] = (
+                        "mxfp4_inter",
+                        (
+                            (gub_p, gub_off + eid * bgub, bgub),
+                            (gus_p, gus_off + eid * bgus, bgus),
+                            (dnb_p, dnb_off + eid * bdnb, bdnb),
+                            (dns_p, dns_off + eid * bdns, bdns),
+                        ),
+                        torch.uint8,
+                    )
+                max_expert_raw_bytes = max(max_expert_raw_bytes, bgub + bgus + bdnb + bdns)
+                if "gate_up_proj_bias" in pmap or "down_proj_bias" in pmap:
+                    gub_t = (
+                        reader.read_tensor(*pmap["gate_up_proj_bias"]).to(device=self.device, dtype=dtype)
+                        if "gate_up_proj_bias" in pmap
+                        else None
+                    )
+                    db_t = (
+                        reader.read_tensor(*pmap["down_proj_bias"]).to(device=self.device, dtype=dtype)
+                        if "down_proj_bias" in pmap
+                        else None
+                    )
+                    gb_t = gub_t[:, 0::2].contiguous() if gub_t is not None else None
+                    ub_t = gub_t[:, 1::2].contiguous() if gub_t is not None else None
+                    self._biases[l_idx] = (gb_t, ub_t, db_t)
+                continue
             dp, doff, dn, ddt, dsh = reader.tensor_span(*pmap["down_proj"])
             raw_dt = getattr(torch, ddt)
             n_exp = int(dsh[0])
@@ -1895,6 +2122,38 @@ class _HFExpertCacheAndLoader:
                 tasks.append((path, off, cursor, nbytes))
                 cursor += nbytes
         u8 = self._staging.fetch_to_device(tasks, cursor)
+        if mode == "mxfp4_inter":
+            # Exact HuggingFace MXFP4 dequant matching `transformers.integrations.mxfp4._convert_moe_packed_tensors`
+            n_bh = D // 32
+            n_bi = I // 32
+            bgub = 2 * I * n_bh * 16
+            bgus = 2 * I * n_bh
+            bdnb = D * n_bi * 16
+            bdns = D * n_bi
+            stride = bgub + bgus + bdnb + bdns
+            rows_u8 = u8.reshape(k, stride)
+            lut = torch.tensor(_MXFP4_DOUBLED_LEVELS, device=u8.device, dtype=torch.float32) * 0.5
+
+            def _dec_mxfp4(blk_u8: Any, sc_u8: Any, out_r: int, n_blk: int) -> Any:
+                blk = blk_u8.reshape(k, out_r, n_blk, 16)
+                exp = sc_u8.reshape(k, out_r, n_blk, 1).to(torch.int32) - 127
+                lo = lut[(blk & 0x0F).to(torch.int64)]
+                hi = lut[(blk >> 4).to(torch.int64)]
+                w = torch.stack((lo, hi), dim=-1).reshape(k, out_r, n_blk, 32)
+                torch.ldexp(w, exp, out=w)
+                return w.reshape(k, out_r, n_blk * 32).to(dtype=dtype)
+
+            gu = _dec_mxfp4(rows_u8[:, :bgub], rows_u8[:, bgub : bgub + bgus], 2 * I, n_bh)
+            dn = _dec_mxfp4(
+                rows_u8[:, bgub + bgus : bgub + bgus + bdnb],
+                rows_u8[:, bgub + bgus + bdnb :],
+                D,
+                n_bi,
+            )
+            gate = gu[:, 0::2, :].unsqueeze(1)
+            up = gu[:, 1::2, :].unsqueeze(1)
+            dn_r = dn.reshape(k, 1, I, D)
+            return torch.cat([gate, up, dn_r], dim=1)
         vals = u8.view(raw_dt).to(dtype=dtype)
         if mode in ("std3", "std2"):
             return vals.reshape(k, self.n_proj, I, D)
@@ -2087,7 +2346,8 @@ class HFShardedSource:
         for idx, pmap in self._packed_experts.items():
             has_3 = {"gate_up_proj", "down_proj"}.issubset(pmap)
             has_2 = {"up_proj", "down_proj"}.issubset(pmap)
-            if not (has_3 or has_2):
+            has_mxfp4 = {"gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales"}.issubset(pmap)
+            if not (has_3 or has_2 or has_mxfp4):
                 raise UnsupportedModelError(
                     f"{self.model_dir}: layer {idx} packed experts miss projections ({sorted(pmap)})"
                 )
@@ -2215,8 +2475,12 @@ class HFShardedSource:
         for layer_idx in moe_layers:
             exp_path = self._routed_expert_container[layer_idx]
             experts_mod = layers[layer_idx].get_submodule(exp_path)
-            for pname in ("gate_up_proj", "up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias"):
+            for pname in (
+                "gate_up_proj", "up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias",
+                "gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales",
+            ):
                 experts_mod._parameters.pop(pname, None)
+                experts_mod._buffers.pop(pname, None)
             for child in experts_mod.modules():
                 if child is not experts_mod:
                     child._parameters.clear()
@@ -2232,19 +2496,24 @@ class HFShardedSource:
             def _hf_sliced_experts_forward(
                 self_exp,
                 hidden_states: torch.Tensor,
-                top_k_index: torch.Tensor,
-                top_k_weights: torch.Tensor,
+                top_k_index: torch.Tensor | None = None,
+                top_k_weights: torch.Tensor | None = None,
+                *,
+                router_indices: torch.Tensor | None = None,
+                routing_weights: torch.Tensor | None = None,
                 _layer_idx=layer_idx,
                 _num_exp=num_exp_layer,
                 _is_llama4=is_llama4,
                 _has_bias=has_bias,
             ) -> torch.Tensor:
+                idx_t = router_indices if top_k_index is None else top_k_index
+                w_t = routing_weights if top_k_weights is None else top_k_weights
                 n_e = int(getattr(self_exp, "num_experts", _num_exp))
                 return _fast_moe_dispatch(
                     self_exp,
                     hidden_states,
-                    top_k_index,
-                    top_k_weights,
+                    idx_t,
+                    w_t,
                     n_e,
                     lambda ids, dev, dt, evict: loader.load_batch(_layer_idx, ids, dev, dt, evict),
                     packed_loader=loader if quant_bits else None,
@@ -2414,7 +2683,7 @@ class _GGUFGlobalsMap(collections.abc.MutableMapping):
 def _apply_shape_ops(torch_shape: tuple[int, ...], operations: Iterable[Any]) -> tuple[int, ...]:
     """Computes the target PyTorch shape after 1-to-1 GGUF ``ConversionOps`` (without reading bytes)."""
     from transformers.integrations.gguf.gguf_conversion_mapping import Unsqueeze
-    from quintessentia_cli.gguf_arch_registry import Transpose2D
+    from quintessentia_cli.gguf_arch_registry import SqueezeLast, Transpose2D
 
     shape = tuple(torch_shape)
     for op in operations:
@@ -2425,6 +2694,8 @@ def _apply_shape_ops(torch_shape: tuple[int, ...], operations: Iterable[Any]) ->
             shape = shape[:pos] + (1,) + shape[pos:]
         elif isinstance(op, Transpose2D) and len(shape) == 2:
             shape = (shape[1], shape[0])
+        elif isinstance(op, SqueezeLast) and len(shape) > 1 and shape[-1] == 1:
+            shape = shape[:-1]
     return shape
 
 
@@ -2620,6 +2891,43 @@ class _GGUFExpertCacheAndLoader:
         u_raw = packed_u8[:, bg : bg + bu].contiguous().reshape(-1)
         d_raw = packed_u8[:, bg + bu : bg + bu + bd].contiguous().reshape(-1)
         return self._dequant_split(g_raw, u_raw, d_raw, k, meta, dtype)
+
+    def fetch_raw_u8(self, layer_idx: int, exp_ids: list[int]) -> tuple[dict[int, tuple[Any, Any, Any]], int]:
+        """Linear CPU->GPU raw-byte injection: streams quantized GGUF bytes directly to GPU (0 CPU compute / 0 dequant!)."""
+        if not exp_ids:
+            return {}, 0
+        meta = self._layer_meta[int(layer_idx)]
+        g2, u2, d2 = self._fetch_grouped_u8(meta, list(exp_ids))
+        raw_map = {int(eid): (g2[i], u2[i], d2[i]) for i, eid in enumerate(exp_ids)}
+        return raw_map, int(len(exp_ids) * meta["tot"])
+
+    def dequant_raw_u8(
+        self,
+        layer_idx: int,
+        raw_map: dict[int, tuple[Any, Any, Any]],
+        exp_ids: list[int],
+        dtype: Any,
+    ) -> dict[int, tuple[Any, Any]]:
+        """GPU-side selective dequantization: dequantizes ONLY router-selected experts from pre-injected VRAM raw bytes."""
+        import torch
+
+        if not exp_ids:
+            return {}
+        meta = self._layer_meta[int(layer_idx)]
+        k = len(exp_ids)
+        if k == 1:
+            e0 = int(exp_ids[0])
+            g_r, u_r, d_r = raw_map[e0]
+            g_w, u_w, d_w = self._dequant_split(g_r.reshape(-1), u_r.reshape(-1), d_r.reshape(-1), 1, meta, dtype)
+            return {e0: (torch.cat([g_w[0], u_w[0]], dim=0).contiguous(), d_w[0].contiguous())}
+        g_cat = torch.cat([raw_map[int(e)][0] for e in exp_ids], dim=0).reshape(-1)
+        u_cat = torch.cat([raw_map[int(e)][1] for e in exp_ids], dim=0).reshape(-1)
+        d_cat = torch.cat([raw_map[int(e)][2] for e in exp_ids], dim=0).reshape(-1)
+        g_w, u_w, d_w = self._dequant_split(g_cat, u_cat, d_cat, k, meta, dtype)
+        return {
+            int(eid): (torch.cat([g_w[j], u_w[j]], dim=0).contiguous(), d_w[j].contiguous())
+            for j, eid in enumerate(exp_ids)
+        }
 
     def load_batch(self, layer_idx: int, batch_ids: list[int], dev: Any, comp_dtype: Any, allow_evict: bool):
         import torch
@@ -2850,6 +3158,23 @@ class GGUFModelSource:
             self._post_shapes[gguf_name] = _apply_shape_ops(torch_shape, ops)
             self._stored[canonical] = (shard_str, gguf_name)
 
+        # Merge split gate/up shared MLP weights into fused input_linear (e.g. GraniteMoeHybrid)
+        for idx, entries in self._layers.items():
+            for sfx in ("weight", "bias"):
+                gk = f"model.layers.{idx}.shared_mlp._gate_proj.{sfx}"
+                uk = f"model.layers.{idx}.shared_mlp._up_proj.{sfx}"
+                ik = f"model.layers.{idx}.shared_mlp.input_linear.{sfx}"
+                if gk in entries and uk in entries:
+                    g_shard, g_name = entries.pop(gk)
+                    _, u_name = entries.pop(uk)
+                    g_sh = self._post_shapes[g_name]
+                    u_sh = self._post_shapes[u_name]
+                    virt = f"{g_name}#cat0:{u_name}"
+                    self._post_shapes[virt] = (g_sh[0] + u_sh[0], *g_sh[1:])
+                    entries[ik] = (g_shard, virt)
+                elif uk in entries:
+                    entries[ik] = entries.pop(uk)
+
         for idx, exp_parts in self._routed_experts.items():
             if set(exp_parts) != {"gate", "up", "down"}:
                 raise UnsupportedModelError(
@@ -2962,7 +3287,7 @@ class GGUFModelSource:
         tensors: dict[str, Any] = {}
         files: dict[str, Any] = {}
         for name, (shard_path, gguf_name) in sorted(self.layer_entries(layer_idx).items()):
-            base_name = gguf_name.split("#row_slice:", 1)[0]
+            base_name = gguf_name.split("#cat0:", 1)[0].split("#row_slice:", 1)[0]
             info = self._tensor_info[base_name]
             tensors[name] = {
                 "shape": list(self._post_shapes[gguf_name]),
@@ -3037,6 +3362,12 @@ class GGUFModelSource:
     def read_converted_tensor(self, gguf_name: str, dtype: Any = None, device: Any = None):
         import torch
         from transformers.integrations.gguf.gguf_conversion_mapping import LogNegate, SubtractOne
+
+        if "#cat0:" in gguf_name:
+            parts = gguf_name.split("#cat0:")
+            return torch.cat(
+                [self.read_converted_tensor(p, dtype=dtype, device=device) for p in parts], dim=0
+            ).contiguous()
 
         row_slice: tuple[int, int] | None = None
         if "#row_slice:" in gguf_name:
@@ -3216,8 +3547,12 @@ class GGUFModelSource:
                 ) from exc
 
             # Remove meta parameters so neither _load_resident_layer nor ring hooks expect them in slots.
-            for pname in ("gate_up_proj", "up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias"):
+            for pname in (
+                "gate_up_proj", "up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias",
+                "gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales",
+            ):
                 experts_mod._parameters.pop(pname, None)
+                experts_mod._buffers.pop(pname, None)
             for child in experts_mod.modules():
                 if child is not experts_mod:
                     child._parameters.clear()
@@ -3259,7 +3594,10 @@ def open_model_source(model_dir: str | Path):
     fmt = detect_format(model_dir)
     if fmt == "hf":
         quant = raw_text_config_dict(model_dir).get("quantization_config") or {}
-        if quant.get("quant_method") in {"fp8", "awq", "gptq"}:
+        if quant.get("quant_method") in {"fp8", "awq", "gptq"} or (
+            quant.get("quant_method") == "bitsandbytes"
+            and (quant.get("load_in_8bit") or quant.get("_load_in_8bit"))
+        ):
             from quintessentia_cli.hf_quantized_source import HFQuantizedSource
             return HFQuantizedSource(model_dir)
         return HFShardedSource(model_dir)

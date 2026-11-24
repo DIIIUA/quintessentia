@@ -1,3 +1,4 @@
 """Quintessentia command-line interface, runtime and LAN server."""
 
-__version__ = "1.2.0"
+PROJECT_NAME = "Quintessentia"
+__version__ = "2.0.0"

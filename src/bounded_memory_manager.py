@@ -738,15 +738,17 @@ class StableWeightManager:
         quantized_projections=None,
         staging_device=None,
         defer_staging=False,
+        q1_planes: int = 1,
     ):
         self.model_dir = model_dir
         self.model_source = model_source
         self.dtype = dtype
         self.cache_policy = cache_policy
-        if weight_format not in ("bf16", "q4", "q4_g16_asym", "q4_g32_asym", "q4_g64_asym", "packed_q4", "packed_q6"):
+        if weight_format not in ("bf16", "q4", "q4_g16_asym", "q4_g32_asym", "q4_g64_asym", "packed_q1", "packed_q2", "packed_q4", "packed_q6", "packed_q8"):
             raise ValueError("Unsupported weight format")
         self.quantized_projections = quantized_projections or {}
-        self.quant_bits = int(weight_format[-1]) if weight_format.startswith("packed_q") else 0
+        self.quant_bits = int(weight_format.removeprefix("packed_q")) if weight_format.startswith("packed_q") else 0
+        self.q1_planes = max(1, int(q1_planes))
         self.is_q4 = weight_format.startswith("q4")
         self.weight_format = weight_format if self.quant_bits else f"q4_g{q4_group_size}_asym" if self.is_q4 else "bf16"
         self.q4_group_size = q4_group_size
@@ -822,7 +824,7 @@ class StableWeightManager:
                 quant_spec = self.quantized_projections.get(l_idx, {}).get(short_k)
                 if quant_spec is not None:
                     from src.quantized_projection import packed_specs
-                    for sub_k, (sub_sh, sub_dt) in packed_specs(short_k, quant_spec["shape"], self.quant_bits, self.q4_group_size).items():
+                    for sub_k, (sub_sh, sub_dt) in packed_specs(short_k, quant_spec["shape"], self.quant_bits, self.q4_group_size, q1_planes=getattr(self, "q1_planes", 1)).items():
                         _record_spec(sub_k, sub_sh, sub_dt)
                 elif self.is_q4 and is_q4_quantizable(short_k, shape, group_size=self.q4_group_size):
                     for sub_k, (sub_sh, sub_dt) in q4_tensor_specs(
@@ -952,7 +954,7 @@ class StableWeightManager:
                     quant_spec["shape"],
                     lambda a, b: self.model_source.read_weight_rows(entry, a, b,
                                     transpose=quant_spec["transpose"], device=dst),
-                    self.quant_bits, self.q4_group_size, dst, row_alignment=alignment)
+                    self.quant_bits, self.q4_group_size, dst, row_alignment=alignment, q1_planes=getattr(self, "q1_planes", 1))
                 tensors.update({short_k.removesuffix("weight") + key: value for key, value in packed.items()})
                 del packed
                 continue
@@ -967,7 +969,7 @@ class StableWeightManager:
                 self.quantization_calls += 1
                 if quant_spec["transpose"]:
                     t = t.T
-                packed = pack_weight(t, self.quant_bits, self.q4_group_size, dst)
+                packed = pack_weight(t, self.quant_bits, self.q4_group_size, dst, q1_planes=getattr(self, "q1_planes", 1))
                 tensors.update({short_k.removesuffix("weight") + key: value for key, value in packed.items()})
             elif self.is_q4 and is_q4_quantizable(short_k, tuple(t.shape), group_size=self.q4_group_size):
                 self.quantization_calls += 1

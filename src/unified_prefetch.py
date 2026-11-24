@@ -1,6 +1,8 @@
 """Prefill-map producer publishing directly into the common weight arena."""
 from collections import OrderedDict
+from contextlib import nullcontext
 import threading
+import time
 
 import torch
 
@@ -30,12 +32,16 @@ area, and a demand miss uses the same directory as a prepared expert.
         self.epoch = memory.epoch
         self.serial = 0
         self.requests, self.settled = OrderedDict(), {}
-        self.active = self.closed = False
+        self.active = self.closed = self._draining = False
         self.fatal = None
-        self.stream = torch.cuda.Stream(device=self.device)
-        self.origin = torch.cuda.Event(enable_timing=True)
-        self.origin.record(torch.cuda.current_stream(self.device))
-        self.stream.wait_event(self.origin)
+        if self.device.type == 'cuda':
+            self.stream = torch.cuda.Stream(device=self.device)
+            self.origin = torch.cuda.Event(enable_timing=True)
+            self.origin.record(torch.cuda.current_stream(self.device))
+            self.stream.wait_event(self.origin)
+        else:
+            self.stream = None
+            self.origin = None
         self.trace, self.updates, self.step_done = [], [], {}
         self.counters = dict(submitted=0, superseded=0, published=0, stale=0,
             cpu_conversions=0, host_cache_hits=0, errors=0, retained_on_refinement=0,
@@ -56,16 +62,33 @@ area, and a demand miss uses the same directory as a prepared expert.
             if old and old['serial'] > self.settled.get(lane, 0):
                 self.counters['superseded'] += 1
             self.serial += 1
-            if getattr(self.memory, 'dynamic_regions', False):
-                # B holds just the next region; C owns no queued GPU payload.
-                self.requests.clear()
+            dynamic = bool(getattr(self.memory, 'dynamic_regions', False))
+            self.requests.pop(lane, None)
+            if dynamic:
+                # 2-layer lookahead window: retain active A lane while preparing B,
+                # dropping only entries older than two lanes so A isn't marked obsolete.
+                while len(self.requests) >= 2:
+                    evicted_lane, _ = self.requests.popitem(last=False)
+                    self.settled.pop(evicted_lane, None)
             self.requests[lane] = dict(layer=int(layer), ids=ids, region=region,
                 serial=self.serial, epoch=self.epoch, lane=lane, step=step, depth=depth)
-            wanted = {(r['layer'], eid) for r in self.requests.values() for eid in r['ids']}
-            self.counters['retained_on_refinement'] += len(wanted & self.memory.directory.keys())
-            self.memory.set_desired(wanted)
+            lane_wanted = {(int(layer), eid) for eid in ids}
+            if dynamic:
+                active_protected = {
+                    (r['layer'], eid)
+                    for ln, r in self.requests.items()
+                    if ln != lane
+                    for eid in r['ids']
+                }
+                wanted = lane_wanted | active_protected
+                self.counters['retained_on_refinement'] += len(wanted & self.memory.directory.keys())
+                self.memory.set_desired(lane_wanted, active_protected=active_protected)
+            else:
+                wanted = {(r['layer'], eid) for r in self.requests.values() for eid in r['ids']}
+                self.counters['retained_on_refinement'] += len(wanted & self.memory.directory.keys())
+                self.memory.set_desired(wanted)
             self.counters['submitted'] += 1
-            if wanted.issubset(self.memory.directory):
+            if lane_wanted.issubset(self.memory.directory):
                 self.settled[lane] = self.serial
             else:
                 self.work_ready.set()
@@ -77,7 +100,8 @@ area, and a demand miss uses the same directory as a prepared expert.
                 if req['serial'] > self.settled.get(lane, 0)]
 
     def _run(self):
-        with torch.cuda.device(self.device), torch.inference_mode():
+        cuda_ctx = torch.cuda.device(self.device) if self.device.type == 'cuda' else nullcontext()
+        with cuda_ctx, torch.inference_mode():
             while True:
                 self.work_ready.wait()
                 with self.cv:
@@ -99,6 +123,9 @@ area, and a demand miss uses the same directory as a prepared expert.
                     key = missing[0]
                     self.active = True
                 try:
+                    # Yield CPU/GIL/disk I/O briefly when the compute thread is doing cold demand reads.
+                    if getattr(self.memory, 'demand_inflight', 0) > 0 and not self._draining:
+                        time.sleep(0.0005)
                     packed = self._packed_cpu(*key)
                     with self.cv:
                         latest = self.requests.get(lane)
@@ -132,6 +159,23 @@ area, and a demand miss uses the same directory as a prepared expert.
                         self.active = False
                         self.cv.notify_all()
 
+    def finish_step(self, region):
+        if self.device.type != 'cuda':
+            return
+        super().finish_step(region)
+
+    def drain(self, timeout=30):
+        with self.cv:
+            self._draining = True
+            try:
+                if not self.cv.wait_for(lambda: not self.active and not self._pending(), timeout):
+                    raise TimeoutError("Warmup producer did not drain")
+                self._check()
+            finally:
+                self._draining = False
+        if self.stream is not None:
+            self.stream.synchronize()
+
     def reset(self):
         with self.cv:
             self.memory.reset_task()
@@ -145,8 +189,14 @@ area, and a demand miss uses the same directory as a prepared expert.
             timeline = []
             for row in self.trace:
                 finish = self.step_done.get(row['step'])
-                if finish is not None and all(e.query() for e in (row['start'], row['ready'], finish)):
-                    a, b, c = [self.origin.elapsed_time(e) for e in (row['start'], row['ready'], finish)]
+                start, ready = row['start'], row['ready']
+                if (self.origin is not None and finish is not None
+                        and start is not None and ready is not None
+                        and all(e.query() for e in (start, ready, finish))):
+                    try:
+                        a, b, c = [self.origin.elapsed_time(e) for e in (start, ready, finish)]
+                    except RuntimeError:
+                        continue
                     timeline.append({k:v for k,v in row.items() if k not in ('start','ready')} |
                         dict(transfer_start_ms=a, transfer_done_ms=b, step_done_ms=c,
                              transfer_began_before_step_end=a<c, ready_before_step_end=b<c))
@@ -171,7 +221,8 @@ area, and a demand miss uses the same directory as a prepared expert.
             self.memory.reset_task()
             self.cv.notify_all()
         self.thread.join()
-        self.stream.synchronize()
+        if self.stream is not None:
+            self.stream.synchronize()
         self.close_cpu()
         self.cpu_cache.clear()
         self.cpu_cache_size = 0

@@ -238,7 +238,9 @@ def format_connection_passport(passport: dict[str, Any]) -> str:
         "  QUINTESSENTIA LAN NODE — READY FOR CONNECTIONS\n"
         "================================================================================\n"
         f"  Node Hostname   : {passport['hostname']} ({passport['gpu_name']}, mode={passport['vram_mode']})\n"
-        f"  Model ID        : {model_id}\n"
+        f"  Model ID        : {model_id}"
+        + (f" [{passport['backend']} / {passport['weight_format']}]" if passport.get("weight_format") else "")
+        + "\n"
         f"  Local Browser   : {local_url}\n"
         f"  LAN Web Chat    : {lan_url}{extra_line}\n"
         f"  OpenAI Base URL : {oai_url}\n"
@@ -321,6 +323,7 @@ async function refreshInfo() {
     const tps = lm.decode_tok_per_s ? `${lm.decode_tok_per_s} tok/s` : 'ready';
     badges.innerHTML = `
       <span class="badge">Model: ${d.model_id}</span>
+      <span class="badge">Format: ${d.weight_format || 'auto'}</span>
       <span class="badge">GPU: ${d.gpu_name} (${d.vram_mode})</span>
       <span class="badge">VRAM: ${st.allocated_vram_mib || 0} MiB</span>
       <span class="badge">Speed: ${tps}</span>
@@ -663,6 +666,8 @@ class QuintessentiaLANServer:
             "lan_web_url": f"http://{self.lan_ip}:{self.http_port}",
             "openai_base_url": f"http://{self.lan_ip}:{self.http_port}/v1",
             "model_id": st["model_id"],
+            "backend": st.get("backend"),
+            "weight_format": st.get("weight_format"),
             "gpu_name": st["gpu_name"],
             "vram_mode": st["vram_mode"],
             "mtp_enabled": st["mtp_enabled"],

@@ -2,13 +2,31 @@
 
 ## Unreleased (2.0.0-dev) — 2026-11-24
 
-- **Project renamed to Quintessentia** with a new original geometric emblem (`assets/quintessentia-logo.png`), primary CLI entrypoints (`quintessentia.py` / `quintessentia.cmd`, retaining `quintessentia.py` / `quintessentia.cmd` as compatibility shims), updated LAN Web UI and CLI banners, and `--feedback-mode` CLI selector (`off`, `spiral_sphere`, `pure_mirror`, `mirror_scales` / `v4`).
-- **V4 isolated pure-math mirror scales (`mirror_scales` / `v4`)**:
-  - Removed runtime Graphify, `UnifiedProbabilityBus`, `StanokContainmentContour`, and the 3-slot conveyor ring in V4, enforcing zero cross-scale coupling.
-  - Added **M0** pure-math trunk mirror carving (`carve_trunk_mirror_q1`), CUDA Kernel #6 (`launch_pure_mirror_diff_q1_gemv`) across dense trunk projections, and `selection_policy="mirror"` in Method 1 `StreamingCubeSurvey`.
-  - Replaced the conveyor with two independent mirror-born mechanisms: **M1 `MirrorLoadDispatcher`** (live NVML VRAM + GPU/memory utilization + compute-vs-IO balancing) and **M2 `MirrorRegionBreathingPool`** (hardware CUDA-event direct admit / entry-cone `HOLD_WARM_REGION -> PIN_REUSE` / immediate exhale).
-  - Added **M3 `MirrorColdWarmupScale`**, **M4 `MirrorPostPrefillRegionWarmupScale`**, **M5/M5b** continuous algebraic cube depth `mirror_cube_depth_math` with reversible host bit-plane scars, and **M6 `MirrorProbabilityPath`** (depth-difference `S_prob`, late rising `SPLIT` protection, dynamic entropy floor).
-- **Linux / WSL 2 NVRTC compatibility**: updated `src/quintessentia_nvrtc.py` to discover PyTorch-bundled `nvidia/cuda_nvrtc/lib/libnvrtc.so*` and preload `libnvrtc-builtins.so*` cleanly on Linux while keeping Windows untouched (`61/61` tests passing natively on WSL 2 Linux + CUDA 12.6 with native `os.pread()`).
+### Pure Q1 Cubes V4 as default CUDA runtime
+- **Default `--weight-format auto` promoted to pure `Q1` cubes V4 (`q1_cubes`, `k=5`, `root_bits=8`) on CUDA:** covers dense models, hybrid SSM/Attention models, and small/large MoE checkpoints automatically. `--feedback-mode off`, explicit `--weight-format q1|q2|q4|q6|q8|bf16`, and `--device cpu` opt-outs remain fully intact.
+- **High-throughput self-contained NVRTC Q1 CUDA kernels:**
+  - Bank-conflict-free `POPC10` 2-row-per-warp GEMV (`Kernel #6-R2`, batched MoE `Kernel #6c`, and `ideal_q1_popc10_r2`) plus cached native C-launcher dispatch (`_fast_k6`).
+  - Single-pass CUDA Ballot Q1 carving (`Kernel #7`, >200× faster than Python-loop carving), GPU Sinkhorn scaling without large temporary FP32 buffers, and chunked pure-Q1 `lm_head` carving for large vocabularies (saving >1.1 GiB VRAM on 248k-vocab models).
+  - Adaptive V4 GPU/host/disk streaming breather (`M1` load dispatcher + `M2` CUDA-event region pool + prefix-pinned host cache + `ext4` disk L3 cache with Linux `O_DIRECT` / `POSIX_FADV_DONTNEED`) replacing the rigid 3-slot conveyor ring in V4.
+- **Complete V4 subsystem stack (M0–M8) & CLI ergonomics:**
+  - Isolated V4 runtime components covering trunk carving, load balancing, region pooling, cold/post-prefill warmup, adaptive depth, probability-path tracking, speculative verification, and thought-buffer retention.
+  - One-button launchers (`./quint` on Linux/WSL 2, `quint.cmd` / `quintessentia.cmd` on Windows), `--mode default|custom` generation profiles with GPU anti-loop sampling, and updated `doctor`, `chat`, `prepare`, `download`, and LAN server passport/UI reporting active backend/format and `--q1-planes 1..16`.
+
+### Universal architecture & format expansion (37 / 47 checkpoints verified)
+- **Hugging Face loaders (`quintessentia_cli/model_source.py`, `hf_quantized_source.py`, `src/binary_halving_q1.py`):**
+  - Native `Conv1D` Q1 support (`GPT-2`: 74.31 tok/s, +30% over BF16).
+  - Universal `resolve_decoder_layers` and module-level `_tied_weights_keys` sharing (`Mamba`, `Mamba2`, `Zamba2`).
+  - Native packed HF **MXFP4** MoE expert streaming (`gpt-oss-20b-MXFP4` running in 3.8 GiB VRAM).
+  - Direct HF **bitsandbytes 8-bit (`SCB`)** decoding without requiring `bitsandbytes` (`RecurrentGemma-2B-8bit`).
+- **GGUF hybrid & SSM support (`quintessentia_cli/gguf_arch_registry.py`, `model_source.py`):**
+  - Added SSM config mapping, trailing singleton squeeze for 2D `ssm_a`/`ssm_d`, `head_dim` resolution, and virtual `#cat0:` merging of split shared-MLP `gate`/`up` tensors (`Falcon-H1-0.5B`, `Granite-4.0-tiny-hybrid`).
+- **`transformers 5.x` recurrent cache contract (`src/quintessentia_integrated.py`):**
+  - Added native `cache` parameter handling and `_setup_cache` initialization for architectures whose forward does not return `past_key_values` (`RecurrentGemma`), plus `model.final_norm.weight` / `model.norm_f.weight` norm resolution.
+- **Linux / WSL 2 NVRTC compatibility:** automatic discovery of PyTorch-bundled `libnvrtc.so*` and `libnvrtc-builtins.so*` on Linux alongside Windows CUDA support.
+
+### Verified hardware & test results (RTX 3060 Ti 8 GB, WSL 2 ext4)
+- **37 / 47** checkpoints passing end-to-end 2-turn chat on pure Q1 cubes V4 across **26 `model_type` families**: `Qwythos-9B-BF16` **19.91 tok/s** (32/32 resident, 6.0 GiB VRAM), `Command-R-7B` **15.68 tok/s**, `Llama-3.2-1B` **39.79 tok/s**, `GPT-2` **74.31 tok/s**, `Zamba2-1.2B` **14.22 tok/s**, `RecurrentGemma-2B-8bit` **15.89 tok/s**, `Qwen3.6-35B-A3B` **1.91 tok/s** (5.5 GiB VRAM), `gpt-oss-20b-MXFP4` **0.85 tok/s** (3.8 GiB VRAM). See [MODEL_SUPPORT.md](MODEL_SUPPORT.md).
+- **99 / 99** `pytest` passing across core V4, Q1, CLI, download/preparation, quantized-source, and VRAM-plan suites in WSL 2.
 
 ## 1.2.0 — 2026-11-18
 

@@ -2,8 +2,8 @@
 
 Commands:
   models    List local models; select by number, name or path
-  download  Download a Hugging Face URL/repository and verify preparation
-  prepare   Verify automatic runtime packing with a first forward
+  download  Download a Hugging Face URL/repository and verify adaptation
+  prepare   Verify automatic runtime adaptation (Q1 cubes V4 on CUDA) with a first forward
   doctor    Check GPU, VRAM plan, model files, caches and LAN addresses
   ask       Stream a single prompt (`<think>...</think>` -> answer -> `<|im_end|>`)
   chat      Interactive multi-turn chat (KV-prefix reuse + pinned host-RAM parking)
@@ -565,14 +565,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if model_error:
         print(f"                       {model_error}")
     profile = report.get("runtime_profile") or {}
-    if profile:
-        why = "; ".join(profile.get("why_not_fast") or [])
-        fast_line = "on" if profile.get("fast_qwen") else f"off ({why})" if why else "off"
-        print(f"  Backend            : {profile.get('backend')} / {profile.get('weight_format')} / fast {fast_line}")
     v4_doc = report.get("auto_v4_plan")
+    if profile:
+        if profile.get("weight_format") == "q1_cubes":
+            q1_p = profile.get("q1_planes") or (v4_doc or {}).get("q1_planes") or 5
+            root_b = (v4_doc or {}).get("cube_root_bits") or (16 if int(q1_p) > 8 else 8)
+            print(f"  Backend            : {profile.get('backend')} / q1_cubes (k={q1_p}, root_bits={root_b})")
+        else:
+            why = "; ".join(profile.get("why_not_fast") or [])
+            fast_line = "on" if profile.get("fast_qwen") else f"off ({why})" if why else "off"
+            print(f"  Backend            : {profile.get('backend')} / {profile.get('weight_format')} / fast {fast_line}")
     if v4_doc and v4_doc.get("auto_v4_selected"):
         print(
-            f"  Mirror Scales V4   : ON ({v4_doc['feedback_mode']} M0-M8, "
+            f"  V4 Q1 Cubes        : ON ({v4_doc['feedback_mode']}, "
             f"q1_planes={v4_doc['q1_planes']}, root_bits={v4_doc['cube_root_bits']}, "
             f"reason={v4_doc['reason']})"
         )
@@ -587,9 +592,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             f"{profile.get('num_hidden_layers')} layers, hidden {profile.get('hidden_size')}"
         )
     if plan is not None:
-        layout = "all layers resident" if plan.full_residency else (
-            f"{plan.resident_layers}/{plan.layers_total} resident + {plan.ring_slots}-slot ring"
-        )
+        if plan.full_residency:
+            layout = "all layers resident"
+        elif profile.get("weight_format") == "q1_cubes" and v4_doc and v4_doc.get("auto_v4_selected"):
+            layout = f"{plan.resident_layers}/{plan.layers_total} resident + V4 streamed tail"
+        else:
+            layout = f"{plan.resident_layers}/{plan.layers_total} resident + {plan.ring_slots}-slot ring"
         print(
             f"  VRAM plan ({plan.mode:6s}): total {plan.total_bytes / 2**30:.2f} GiB, free {plan.free_bytes / 2**30:.2f} GiB, "
             f"reserve {plan.reserve_bytes / 2**30:.2f} GiB -> {layout}, MTP {'on' if plan.enable_mtp else 'off'}"
@@ -636,13 +644,13 @@ def cmd_models(args):
 
 
 def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vram_mode="normal",
-                        q1_planes=None, q1_early_stop=True):
+                        feedback_mode="auto", q1_planes=None, q1_early_stop=True):
     import torch
     from .unified_runtime import QuintessentiaUnifiedEngine
     v4_plan = resolve_auto_v4_plan(
         model_dir=Path(folder),
         weight_format=weight_format,
-        feedback_mode="auto",
+        feedback_mode=feedback_mode,
         q1_planes=q1_planes,
         device=device,
     )
@@ -671,7 +679,8 @@ def cmd_prepare(args):
     root = find_quintessentia_root(args.quintessentia_root)
     folder = resolve_model_dir(args.model, root, allow_download=bool(args.model) and not Path(args.model).exists())
     report = _verify_preparation(folder, root=root, device=args.device, weight_format=args.weight_format,
-                                 vram_mode=args.vram_mode, q1_planes=getattr(args, "q1_planes", None),
+                                 vram_mode=args.vram_mode, feedback_mode=getattr(args, "feedback_mode", "auto"),
+                                 q1_planes=getattr(args, "q1_planes", None),
                                  q1_early_stop=getattr(args, "q1_early_stop", True))
     from .model_hub import register_model, save_json
     register_model(root, folder)
@@ -690,7 +699,8 @@ def cmd_download(args):
         if not args.no_verify:
             receipt["preparation"] = _verify_preparation(
                 folder, root=root, device=args.device, weight_format=args.weight_format,
-                vram_mode=args.vram_mode, q1_planes=getattr(args, "q1_planes", None),
+                vram_mode=args.vram_mode, feedback_mode=getattr(args, "feedback_mode", "auto"),
+                q1_planes=getattr(args, "q1_planes", None),
                 q1_early_stop=getattr(args, "q1_early_stop", True))
             receipt["status"] = "ready"
         save_json(marker, receipt)
@@ -837,8 +847,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
         messages.append({"role": "system", "content": args.system})
 
     with _engine_from_args(args) as eng:
+        b_lbl = eng.profile.get("backend", "auto")
+        wf_lbl = eng.profile.get("weight_format", "auto")
         print(
-            f"\n[Quintessentia Interactive Chat | mode={cur_mode}] "
+            f"\n[Quintessentia Interactive Chat | mode={cur_mode} | {b_lbl} ({wf_lbl})] "
             "Commands: `/reset`, `/think on|off`, `/mode default|custom`, `/status`, `/exit`. "
             "Ctrl+C stops the current answer.\n",
             flush=True,
@@ -946,7 +958,7 @@ def build_parser() -> argparse.ArgumentParser:
     from . import __version__
     parser = argparse.ArgumentParser(
         prog="quintessentia",
-        description="Quintessentia: mirror-equality Q1/Q4/Q6 CUDA & CPU streaming inference engine and LAN OpenAI-compatible server",
+        description="Quintessentia: Q1-cubes V4 / Q4 / Q6 / BF16 CUDA & CPU streaming inference engine and LAN OpenAI-compatible server",
     )
     parser.add_argument("--version", action="version", version=f"Quintessentia {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -959,11 +971,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     for command, callback in (("download",cmd_download),("prepare",cmd_prepare)):
         p_model = sub.add_parser(command, help=("Download a Hugging Face model into a directory and verify automatic adaptation"
-                                               if command == "download" else "Verify a model's first forward and automatic runtime packing"))
+                                               if command == "download" else "Verify a model's first forward and automatic runtime adaptation"))
         p_model.add_argument("--quintessentia-root", dest="quintessentia_root", default=None)
         p_model.add_argument("--device", choices=("auto","cpu"), default="auto")
         p_model.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto")
-        p_model.add_argument("--q1-planes", type=int, choices=tuple(range(1, 9)), default=4)
+        p_model.add_argument("--feedback-mode", choices=FEEDBACK_MODE_CHOICES, default="auto")
+        p_model.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None)
         p_model.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True)
         p_model.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
         p_model.add_argument("--json-out", default=None)

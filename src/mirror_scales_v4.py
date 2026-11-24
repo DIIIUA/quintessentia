@@ -1376,6 +1376,10 @@ class MirrorIsolatedMoEOverlayV4:
         self.diff_q1_calls: int = 0
         self.diff_q1_anchored_calls: int = 0
         self.line_cuda_launches: int = 0
+        self.decode_norm_syncs_performed: int = 0
+        self.decode_norm_syncs_avoided: int = 0
+        self.decode_d2h_coalesced: int = 0
+        self._decode_tok_zero = torch.zeros((1,), dtype=torch.long, device=self.device)
         self.depth_sheds: int = 0
         self.shed_scars_saved: int = 0
         self.shed_scars_restored: int = 0
@@ -1830,8 +1834,19 @@ class MirrorIsolatedMoEOverlayV4:
         if m_tok == 0:
             return torch.zeros_like(hidden_states)
 
-        idx_cpu = top_k_index.detach().cpu().tolist()
-        w_cpu = top_k_weights.detach().float().cpu().tolist()
+        # Coalesce top_k_index + top_k_weights into a SINGLE D2H transfer per layer (halves router syncs)
+        if top_k_index.device.type == "cuda" and top_k_weights.device == top_k_index.device:
+            k_width = int(top_k_index.shape[-1])
+            packed_cpu = torch.cat(
+                [top_k_index.detach().to(torch.float32), top_k_weights.detach().to(torch.float32)],
+                dim=-1,
+            ).cpu().tolist()
+            idx_cpu = [[int(v) for v in row[:k_width]] for row in packed_cpu]
+            w_cpu = [row[k_width:] for row in packed_cpu]
+            self.decode_d2h_coalesced += 1
+        else:
+            idx_cpu = top_k_index.detach().cpu().tolist()
+            w_cpu = top_k_weights.detach().float().cpu().tolist()
         num_exp = self.cache.num_experts
 
         per_tok_full: List[List[Tuple[int, int, float]]] = []
@@ -2109,13 +2124,15 @@ class MirrorIsolatedMoEOverlayV4:
                 cold_queue.append((e_int, k_pos, rw))
 
         line_spine = torch.zeros((1, h_dim), dtype=torch.float32, device=dev)
-        tok_t = torch.zeros((1,), dtype=torch.long, device=dev)
+        tok_t = self._decode_tok_zero if self._decode_tok_zero.device == dev else torch.zeros((1,), dtype=torch.long, device=dev)
         done_count = 0
         w_done = 0.0
-        prev_delta_norm = 0.0
-        last_delta_norm = 0.0
+        prev_y_ref: Optional[torch.Tensor] = None
+        prev_y_rw: float = 0.0
+        last_y_ref: Optional[torch.Tensor] = None
+        last_y_rw: float = 0.0
 
-        # 3. Execute resident hot experts via Kernel #6 Differential-Reversible Q1 GEMV
+        # 3. Execute resident hot experts via Kernel #6 Differential-Reversible Q1 GEMV (ZERO per-expert .item() syncs!)
         max_rw = max((rw for _, _, rw in valid), default=1.0) or 1.0
         for e_int, k_pos, rw in hot_items:
             pair = self._get_hot_or_host(li, e_int, all_eids_in_layer)
@@ -2156,8 +2173,10 @@ class MirrorIsolatedMoEOverlayV4:
             if used_cuda:
                 self.line_cuda_launches += 1
 
-            prev_delta_norm = last_delta_norm
-            last_delta_norm = float(y_e.float().norm().item()) * rw
+            # Defer norm evaluation: keep only last two GPU tensor refs; avoid per-expert CPU-GPU sync!
+            prev_y_ref, prev_y_rw = last_y_ref, last_y_rw
+            last_y_ref, last_y_rw = y_e, rw
+            self.decode_norm_syncs_avoided += 1
             done_count += 1
             w_done += rw
             c.routed_slots_executed += 1
@@ -2169,7 +2188,40 @@ class MirrorIsolatedMoEOverlayV4:
         # 4. Local M5 Mirror Equality on line_spine for remaining cold experts (strict `and` -> crisp spelling!)
         cold_to_run: List[Tuple[int, int, float, bool]] = []
         in_entry_cone = li < self.entry_cone_layers
-        line_norm = float(line_spine.norm().item())
+        line_norm = 0.0
+        last_delta_norm = 0.0
+        prev_delta_norm = 0.0
+
+        # Compute & sync [line_norm, last_norm, prev_norm] ONCE per layer ONLY if a cold candidate will enter mirror rest check
+        needs_mirror_norms = False
+        if cold_queue and not in_entry_cone:
+            sim_done = done_count
+            sim_w = w_done
+            for _e_int, _k_pos, rw in cold_queue:
+                if sim_done < eff_min or sim_w < max(0.0, tok_total_w - sim_w):
+                    sim_done += 1
+                    sim_w += rw
+                else:
+                    needs_mirror_norms = True
+                    break
+
+        if needs_mirror_norms:
+            norm_tensors = [line_spine.norm()]
+            if last_y_ref is not None:
+                norm_tensors.append(last_y_ref.float().norm())
+            if prev_y_ref is not None:
+                norm_tensors.append(prev_y_ref.float().norm())
+            norm_vals = torch.stack(norm_tensors).tolist()
+            self.decode_norm_syncs_performed += 1
+            line_norm = float(norm_vals[0])
+            if last_y_ref is not None:
+                last_delta_norm = float(norm_vals[1]) * last_y_rw
+            if prev_y_ref is not None:
+                prev_delta_norm = float(norm_vals[2 if last_y_ref is not None else 1]) * prev_y_rw
+        else:
+            self.decode_norm_syncs_avoided += 1
+        prev_y_ref = None
+        last_y_ref = None
 
         for e_int, k_pos, rw in cold_queue:
             rem_w = max(0.0, tok_total_w - w_done)
@@ -2369,6 +2421,9 @@ class MirrorIsolatedMoEOverlayV4:
                 "diff_q1_anchored_calls": self.diff_q1_anchored_calls,
                 "anchors_resident": len(c._mirror_anchors),
                 "line_cuda_launches": self.line_cuda_launches,
+                "decode_norm_syncs_performed": self.decode_norm_syncs_performed,
+                "decode_norm_syncs_avoided": self.decode_norm_syncs_avoided,
+                "decode_d2h_coalesced": self.decode_d2h_coalesced,
                 "post_prefill_bg_adoptions": self.post_prefill_bg_adoptions,
             },
             "last_trace": dict(self.last_trace),

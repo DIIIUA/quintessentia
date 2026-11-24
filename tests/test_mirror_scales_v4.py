@@ -501,3 +501,88 @@ def test_m6_mirror_probability_path_split_protection_and_entropy_floor():
     assert tracker.last_entropy_floor is not None
     assert tracker.split_protected_count >= 1, "Late rising SPLIT token must trigger mirror split protection!"
     tracker.close()
+
+
+def test_approach1_zero_sync_hot_decode_and_m0_m5_tails():
+    """Verify Approach 1: zero-sync hot decode, coalesced D2H, M0 plateau stop, and M5 mirror cubes_for_weight."""
+    from src.binary_halving_q1 import LazyMoEBinaryHalvingCache, carve_trunk_mirror_q1
+
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    weights = _make_synthetic_experts(2, 8, 128, 128, seed=77)
+
+    def _read_single(li, eid):
+        g, d = weights[(li, eid)]
+        return g.to(device=dev), d.to(device=dev)
+
+    def _read_batch(li, eids):
+        return {eid: _read_single(li, eid) for eid in eids}
+
+    cache = LazyMoEBinaryHalvingCache(
+        _read_single,
+        num_layers=2,
+        num_experts=8,
+        device=dev,
+        store_cubes=6,
+        root_bits=8,
+        group_size=64,
+        use_fwht=True,
+        max_cache_bytes=128 * 1024**2,
+        host_cache_bytes=64 * 1024**2,
+        cache_on_gpu=(dev.type == "cuda"),
+        expert_batch_reader=_read_batch,
+        imprint_puzzle=True,
+        imprint_depths=(6, 5, 4, 3),
+        imprint_auto_vram=False,
+        graphify_feedback="v4",
+    )
+    try:
+        # 1. M5 cubes_for_weight uses continuous mirror algebra in V4 (NOT constant store_cubes)
+        k_weak = cache.cubes_for_weight(0.05, max_router_weight=0.70, total_router_weight=1.0)
+        k_strong = cache.cubes_for_weight(0.70, max_router_weight=0.70, total_router_weight=1.0)
+        assert 3 <= k_weak < k_strong <= 6
+
+        # 2. Prefill crystallizes experts 0, 1, 2, 3 so decode on those experts is 100% zero-disk
+        gen = torch.Generator(device="cpu").manual_seed(123)
+        x_pre = (torch.randn((6, 128), generator=gen, dtype=torch.float32) * 0.4).to(device=dev, dtype=torch.bfloat16)
+        idx_pre = torch.tensor([[0, 1, 2, 3]] * 6, dtype=torch.long, device=dev)
+        w_pre = torch.tensor([[0.45, 0.30, 0.15, 0.10]] * 6, dtype=torch.float32, device=dev)
+        cache.forward_layer_moe(0, x_pre, idx_pre, w_pre, F.silu)
+
+        ov = cache._imprint_overlay
+        # Pick only experts actually crystallized into L1/L2 by prefill for the 100% zero-disk hot test
+        hot_eids = sorted(e for (li, e) in cache._lru.keys() if li == 0)
+        assert len(hot_eids) >= 2
+        syncs_before = ov.decode_norm_syncs_performed
+        avoided_before = ov.decode_norm_syncs_avoided
+        x_dec = x_pre[-1:]
+        idx_hot = torch.tensor([hot_eids], dtype=torch.long, device=dev)
+        w_vals = [1.0 / len(hot_eids)] * len(hot_eids)
+        w_hot = torch.tensor([w_vals], dtype=torch.float32, device=dev)
+        y_hot = cache.forward_layer_moe(0, x_dec, idx_hot, w_hot, F.silu)
+        assert torch.isfinite(y_hot).all()
+        # Zero-disk decode must perform ZERO norm syncs and avoid per-expert + spine syncs!
+        assert ov.decode_norm_syncs_performed == syncs_before
+        assert ov.decode_norm_syncs_avoided >= avoided_before + len(hot_eids) + 1
+        if dev.type == "cuda":
+            assert ov.decode_d2h_coalesced >= 2
+
+        # Cold-tail candidate layer performs AT MOST 1 batched norm sync for the entire layer
+        cold_eids = [e for e in range(8) if e not in hot_eids][:2]
+        idx_mix = torch.tensor([hot_eids[:2] + cold_eids], dtype=torch.long, device=dev)
+        w_mix = torch.tensor([[0.55, 0.35, 0.06, 0.04]], dtype=torch.float32, device=dev)
+        syncs_mid = ov.decode_norm_syncs_performed
+        y_mix = cache.forward_layer_moe(0, x_dec, idx_mix, w_mix, F.silu)
+        assert torch.isfinite(y_mix).all()
+        assert (ov.decode_norm_syncs_performed - syncs_mid) <= 1
+
+        # 3. M0 carve_trunk_mirror_q1 stops early cleanly on low-rank/structured weight plateau
+        u = torch.randn((128, 4), generator=gen, dtype=torch.float32) * 0.25
+        v = torch.randn((4, 128), generator=gen, dtype=torch.float32) * 0.25
+        w_struct = (u @ v).to(device=dev, dtype=torch.bfloat16)
+        _t, _m, k_opt, rem_rel = carve_trunk_mirror_q1(
+            w_struct, 7, min_cubes=3, mirror_tol=0.05, root_bits=8, group_size=64, use_fwht=True, sinkhorn_iters=2
+        )
+        assert 3 <= k_opt < 7
+        assert rem_rel <= 0.125
+    finally:
+        cache.close()

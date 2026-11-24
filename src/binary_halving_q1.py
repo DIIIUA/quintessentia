@@ -1233,6 +1233,7 @@ class IncrementalCubeCarver:
             else float(self._rem.pow(2).sum().sqrt().item())
         ) + 1e-8
         rem_rel = 1.0
+        prev_rem_rel: Optional[float] = None
 
         while len(self._carved_lo) < target_max:
             p = len(self._carved_lo)
@@ -1254,7 +1255,19 @@ class IncrementalCubeCarver:
                 ).tolist()
                 rem_rel = n_rem / ref_n
                 step_rel = n_step / ref_n
-                if mirror_tol > 0.0 and rem_rel <= mirror_tol and step_rel <= mirror_tol:
+                rel_gain = (
+                    max(0.0, prev_rem_rel - rem_rel) / (prev_rem_rel + 1e-12)
+                    if prev_rem_rel is not None
+                    else 1.0
+                )
+                exact_converged = (rem_rel <= mirror_tol and step_rel <= mirror_tol)
+                plateau_converged = (
+                    prev_rem_rel is not None
+                    and rem_rel <= (2.5 * mirror_tol)
+                    and rel_gain <= 0.12
+                )
+                prev_rem_rel = rem_rel
+                if mirror_tol > 0.0 and (exact_converged or plateau_converged):
                     break
 
         k_opt = len(self._carved_lo)
@@ -1520,13 +1533,25 @@ class LazyMoEBinaryHalvingCache:
         self.cold_experts_rested = 0
         self.cold_disk_reads_avoided = 0
 
-    def cubes_for_weight(self, router_weight: float) -> int:
-        if self.router_depth_schedule is None:
-            return self.store_cubes
-        for thresh, cubes in self.router_depth_schedule:
-            if router_weight >= thresh:
-                return max(1, min(self.store_cubes, int(cubes)))
-        return 1
+    def cubes_for_weight(
+        self,
+        router_weight: float,
+        max_router_weight: float = 1.0,
+        total_router_weight: float = 1.0,
+    ) -> int:
+        if self.router_depth_schedule is not None:
+            for thresh, cubes in self.router_depth_schedule:
+                if router_weight >= thresh:
+                    return max(1, min(self.store_cubes, int(cubes)))
+            return 1
+        if self.feedback_mode == "mirror_scales":
+            from src.mirror_scales_v4 import mirror_cube_depth_math
+            rw = max(0.0, float(router_weight))
+            p_body = rw / max(float(max_router_weight), rw, 1e-12)
+            p_tail = rw / max(float(total_router_weight), rw, 1e-12)
+            min_k = min(3, self.store_cubes)
+            return mirror_cube_depth_math(p_body, p_tail, min_k=min_k, max_k=self.store_cubes)
+        return self.store_cubes
 
     def _put_host(
         self,

@@ -25,10 +25,10 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     import torch
     import psutil
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     torch.set_num_threads(6)
-    paths = ["src/progressive_execution.py", "src/aircolibri_integrated.py",
-             "aircolibri_cli/unified_runtime.py", "aircolibri_cli/cli.py", __file__]
+    paths = ["src/progressive_execution.py", "src/quintessentia_integrated.py",
+             "quintessentia_cli/unified_runtime.py", "quintessentia_cli/cli.py", __file__]
     report = {"protocol": "Two short requests per checkpoint/format; OS caches not flushed. Technical execution only; no answer-quality or causal speedup certification.",
               "device_choice": args.device, "cuda_available": torch.cuda.is_available(), "cpu_threads": 6,
               "source_sha256": {str(p): hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in paths},
@@ -44,7 +44,7 @@ def main():
             engine = None
             started = time.perf_counter()
             try:
-                engine = AirColibriUnifiedEngine(folder, device=args.device, weight_format=fmt,
+                engine = QuintessentiaUnifiedEngine(folder, device=args.device, weight_format=fmt,
                     enable_mtp=False, max_context_tokens=256, prefill_chunk_tokens=8, verbose=False)
                 result["constructor_s"] = time.perf_counter() - started
                 messages = []

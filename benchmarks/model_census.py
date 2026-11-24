@@ -49,7 +49,7 @@ def worker(args):
     started = time.perf_counter()
     engine = None
     fingerprint = hashlib.sha256()
-    for directory in ('src', 'aircolibri_cli'):
+    for directory in ('src', 'quintessentia_cli'):
         for path in sorted((args.engine_root / directory).rglob('*')):
             if path.suffix in ('.py', '.cu', '.h', '.c'):
                 fingerprint.update(path.relative_to(args.engine_root).as_posix().encode())
@@ -61,11 +61,11 @@ def worker(args):
     write(destination, report)
     try:
         import torch
-        from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, forward_step_all_logits
+        from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, forward_step_all_logits
         torch.set_num_threads(6)
         report.update(stage='load', weight_format=args.weight_format)
         write(destination, report)
-        engine = AirColibriUnifiedEngine(model_dir=folder, aircolibri_root=args.engine_root,
+        engine = QuintessentiaUnifiedEngine(model_dir=folder, quintessentia_root=args.engine_root,
             weight_format=args.weight_format, enable_mtp=False, allow_download=False,
             max_context_tokens=512, prefill_chunk_tokens=args.prefill_chunk, verbose=False)
         report.update(stage='raw_forward', loaded=True, plan=engine.plan.as_dict())

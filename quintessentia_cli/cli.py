@@ -1,4 +1,4 @@
-"""AirColibri command-line interface.
+"""Quintessentia command-line interface.
 
 Commands:
   models    List local models; select by number, name or path
@@ -8,7 +8,7 @@ Commands:
   ask       Stream a single prompt (`<think>...</think>` -> answer -> `<|im_end|>`)
   chat      Interactive multi-turn chat (KV-prefix reuse + pinned host-RAM parking)
   serve     Web chat + OpenAI-compatible API (TCP :8787) and UDP LAN beacon (:8788)
-  discover  Find AirColibri nodes on the local network
+  discover  Find Quintessentia nodes on the local network
 
 Exit codes: 0 OK, 1 runtime error, 2 usage error, 3 model not found / unsupported.
 """
@@ -28,28 +28,28 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-from aircolibri_cli.lan_server import (
+from quintessentia_cli.lan_server import (
     DEFAULT_BEACON_PORT,
     DEFAULT_HTTP_PORT,
     DEFAULT_LOG_FILE,
     DEFAULT_MAX_REQUEST_BYTES,
-    AirColibriLANServer,
+    QuintessentiaLANServer,
     detect_lan_ips,
     discover_lan_servers,
     format_connection_passport,
 )
-from aircolibri_cli.model_source import (
+from quintessentia_cli.model_source import (
     DEFAULT_MODEL_ID,
     ModelNotFoundError,
     UnsupportedModelError,
     detect_format,
     resolve_model_dir,
 )
-from aircolibri_cli.runtime_config import (
+from quintessentia_cli.runtime_config import (
     VRAM_MODES,
     GenerationCancelled,
     checkpoint_manifest_path,
-    find_aircolibri_root,
+    find_quintessentia_root,
 )
 
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_MODEL = 0, 1, 2, 3
@@ -62,10 +62,10 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         dest="model",
         type=str,
         default=None,
-        help=f"Catalog number/name, local HF/GGUF/Colibri folder, or Hugging Face URL/repository "
+        help=f"Catalog number/name, local HF/GGUF/Quintessentia folder, or Hugging Face URL/repository "
         f"such as {DEFAULT_MODEL_ID} (downloaded once). Default: a locally recognized folder",
     )
-    p.add_argument("--aircolibri-root", type=str, default=None, help="Path to the AirColibri program folder")
+    p.add_argument("--quintessentia-root", type=str, default=None, help="Path to the Quintessentia program folder")
     p.add_argument("--download-dir", type=str, default=None, help="Save a Hugging Face model directly into this directory")
     p.add_argument("--device", choices=("auto", "cpu"), default="auto",
                    help="auto: CPU execution with optional GPU adoption; cpu: disk/CPU execution only")
@@ -98,18 +98,18 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _engine_from_args(args: argparse.Namespace) -> AirColibriUnifiedEngine:
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     model = args.model
     if getattr(args, "download_dir", None):
         if not model:
             raise ModelNotFoundError("--download-dir requires a Hugging Face model reference")
         from .model_hub import download_model
-        model, _, _ = download_model(model, find_aircolibri_root(args.aircolibri_root), directory=args.download_dir)
+        model, _, _ = download_model(model, find_quintessentia_root(args.quintessentia_root), directory=args.download_dir)
     explicit_repo = bool(model) and not Path(model).exists()
-    return AirColibriUnifiedEngine(
+    return QuintessentiaUnifiedEngine(
         model_dir=model,
-        aircolibri_root=args.aircolibri_root,
+        quintessentia_root=args.quintessentia_root,
         vram_mode=args.vram_mode,
         enable_mtp=not args.no_mtp,
         enable_vocab_pruner=args.fast_vocab,
@@ -131,10 +131,10 @@ def _engine_from_args(args: argparse.Namespace) -> AirColibriUnifiedEngine:
 def cmd_doctor(args: argparse.Namespace) -> int:
     import torch
 
-    from aircolibri_cli.model_source import runtime_profile
-    from aircolibri_cli.unified_runtime import plan_for_checkpoint
+    from quintessentia_cli.model_source import runtime_profile
+    from quintessentia_cli.unified_runtime import plan_for_checkpoint
 
-    root = find_aircolibri_root(args.aircolibri_root)
+    root = find_quintessentia_root(args.quintessentia_root)
     lan_ip, all_ips = detect_lan_ips()
     cuda_ok = torch.cuda.is_available()
     cpu_execution = getattr(args, "device", "auto") == "cpu" or not cuda_ok
@@ -143,7 +143,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "cuda_available": cuda_ok,
         "gpu_name": gpu_name,
         "execution_device": "cpu" if cpu_execution else "auto",
-        "aircolibri_root": str(root),
+        "quintessentia_root": str(root),
         "primary_lan_ip": lan_ip,
         "all_lan_ips": all_ips,
     }
@@ -167,7 +167,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         report["model_format"] = fmt
         profile = runtime_profile(model_dir)
         report["runtime_profile"] = profile
-        if fmt == "colibri" and profile.get("fast_qwen"):
+        if fmt == "quintessentia" and profile.get("fast_qwen"):
             report["q4_cache_ready"] = (root / "data" / "q4-g64-cache").exists() and checkpoint_manifest_path(root).exists()
         if cuda_ok and not cpu_execution:
             from .gpu_memory import measure_gpu_memory
@@ -192,7 +192,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 report["execution_device"] = "cpu"
 
     print("=" * 76)
-    print("  AIRCOLIBRI DOCTOR — ENVIRONMENT & LAN READINESS")
+    print("  QUINTESSENTIA DOCTOR — ENVIRONMENT & LAN READINESS")
     print("=" * 76)
     print(f"  CUDA / GPU         : {'OK' if cuda_ok else 'MISSING'} — {gpu_name}")
     print(f"  Execution          : {report['execution_device']}")
@@ -236,7 +236,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_models(args):
     from .model_source import local_model_candidates, runtime_model_dir, is_supported
-    root = find_aircolibri_root(args.aircolibri_root)
+    root = find_quintessentia_root(args.quintessentia_root)
     rows = []
     for i, folder in enumerate(local_model_candidates(root), 1):
         row = dict(index=i, name=folder.name, path=str(folder.resolve()))
@@ -259,15 +259,15 @@ def cmd_models(args):
         for row in rows:
             checked = f" | metadata {'OK' if row['metadata_supported'] else 'needs adapter'}" if "metadata_supported" in row else ""
             print(f"{row['index']:>3}  {row['name']}  [{row.get('format','?')}, {row.get('weight_bytes',0)/2**30:.2f} GiB]{checked}")
-        print('Select by number, folder name or full path: aircolibri ask --model 1 "Hi"')
+        print('Select by number, folder name or full path: quintessentia ask --model 1 "Hi"')
         print('Available files and metadata checks do not certify runtime support; see MODEL_SUPPORT.md.')
     return EXIT_OK
 
 
 def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vram_mode="normal"):
     import torch
-    from .unified_runtime import AirColibriUnifiedEngine
-    with AirColibriUnifiedEngine(folder, aircolibri_root=root, device=device, weight_format=weight_format,
+    from .unified_runtime import QuintessentiaUnifiedEngine
+    with QuintessentiaUnifiedEngine(folder, quintessentia_root=root, device=device, weight_format=weight_format,
         vram_mode=vram_mode, enable_mtp=False, speculation="off", verbose=False,
         max_context_tokens=512, prefill_chunk_tokens=8) as engine:
         ids = engine.tokenizer("Hi", return_tensors="pt").input_ids
@@ -285,7 +285,7 @@ def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vr
 
 
 def cmd_prepare(args):
-    root = find_aircolibri_root(args.aircolibri_root)
+    root = find_quintessentia_root(args.quintessentia_root)
     folder = resolve_model_dir(args.model, root, allow_download=bool(args.model) and not Path(args.model).exists())
     report = _verify_preparation(folder, root=root, device=args.device, weight_format=args.weight_format, vram_mode=args.vram_mode)
     from .model_hub import register_model, save_json
@@ -298,7 +298,7 @@ def cmd_prepare(args):
 
 def cmd_download(args):
     from .model_hub import download_model, save_json
-    root = find_aircolibri_root(args.aircolibri_root)
+    root = find_quintessentia_root(args.quintessentia_root)
     folder, marker, receipt = download_model(args.reference, root, directory=args.directory,
                                              filename=args.file, revision=args.revision)
     try:
@@ -316,11 +316,11 @@ def cmd_download(args):
             save_json(args.json_out, receipt)
         raise
     print(f"{'Ready' if receipt['status']=='ready' else 'Downloaded (verification skipped)'}: {folder}")
-    print(f'Next: aircolibri ask --model "{folder}" "Hi"')
+    print(f'Next: quintessentia ask --model "{folder}" "Hi"')
     return EXIT_OK
 
 
-def _stream_to_console(engine: AirColibriUnifiedEngine, messages: list[dict[str, str]], max_tokens: int, thinking: bool, use_session: bool) -> dict:
+def _stream_to_console(engine: QuintessentiaUnifiedEngine, messages: list[dict[str, str]], max_tokens: int, thinking: bool, use_session: bool) -> dict:
     in_think_printed = False
     in_ans_printed = False
     done_packet: dict = {}
@@ -384,7 +384,7 @@ def _stream_to_console(engine: AirColibriUnifiedEngine, messages: list[dict[str,
 def cmd_ask(args: argparse.Namespace) -> int:
     prompt_text = " ".join(args.prompt).strip()
     if not prompt_text:
-        print("Error: please provide a prompt, e.g. `aircolibri ask \"Привет!\"`", file=sys.stderr)
+        print("Error: please provide a prompt, e.g. `quintessentia ask \"Привет!\"`", file=sys.stderr)
         return EXIT_USAGE
 
     messages: list[dict[str, str]] = []
@@ -413,7 +413,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
     with _engine_from_args(args) as eng:
         print(
-            "\n[AirColibri Interactive Chat] Commands: `/reset`, `/think on|off`, `/status`, `/exit`. "
+            "\n[Quintessentia Interactive Chat] Commands: `/reset`, `/think on|off`, `/status`, `/exit`. "
             "Ctrl+C stops the current answer.\n",
             flush=True,
         )
@@ -459,12 +459,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     api_key = args.api_key
     if not api_key:
-        api_key = f"colibri-{secrets.token_hex(8)}" if args.require_auth else "colibri-local"
-    root = find_aircolibri_root(args.aircolibri_root)
+        api_key = f"quintessentia-{secrets.token_hex(8)}" if args.require_auth else "quintessentia-local"
+    root = find_quintessentia_root(args.quintessentia_root)
     log_file = None if args.no_log_file else (args.log_file or str(root / DEFAULT_LOG_FILE))
 
     with _engine_from_args(args) as eng:
-        srv = AirColibriLANServer(
+        srv = QuintessentiaLANServer(
             engine=eng,
             host=args.host,
             http_port=args.port,
@@ -481,16 +481,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
-    print(f"[AirColibri] Scanning LAN via UDP port {args.beacon_port} ({args.timeout:.1f}s)...", flush=True)
+    print(f"[Quintessentia] Scanning LAN via UDP port {args.beacon_port} ({args.timeout:.1f}s)...", flush=True)
     nodes = discover_lan_servers(timeout_s=args.timeout, beacon_port=args.beacon_port)
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(nodes, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if not nodes:
-        print("No active AirColibri LAN servers responded on this subnet.", flush=True)
+        print("No active Quintessentia LAN servers responded on this subnet.", flush=True)
         return EXIT_RUNTIME
 
-    print(f"Found {len(nodes)} active AirColibri node(s) on the LAN:")
+    print(f"Found {len(nodes)} active Quintessentia node(s) on the LAN:")
     for n in nodes:
         print(format_connection_passport(n))
     return EXIT_OK
@@ -499,14 +499,14 @@ def cmd_discover(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     from . import __version__
     parser = argparse.ArgumentParser(
-        prog="aircolibri",
-        description="AirColibri: supported HF/GGUF language models, Q4/Q6 CUDA execution and a LAN OpenAI-compatible server",
+        prog="quintessentia",
+        description="Quintessentia: supported HF/GGUF language models, Q4/Q6 CUDA execution and a LAN OpenAI-compatible server",
     )
-    parser.add_argument("--version", action="version", version=f"AirColibri {__version__}")
+    parser.add_argument("--version", action="version", version=f"Quintessentia {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_models = sub.add_parser("models", help="List local model files; select by number, folder name or path")
-    p_models.add_argument("--aircolibri-root", default=None)
+    p_models.add_argument("--quintessentia-root", default=None)
     p_models.add_argument("--json", action="store_true")
     p_models.add_argument("--check", action="store_true", help="Check adaptation metadata; does not run generation")
     p_models.set_defaults(func=cmd_models)
@@ -514,7 +514,7 @@ def build_parser() -> argparse.ArgumentParser:
     for command, callback in (("download",cmd_download),("prepare",cmd_prepare)):
         p_model = sub.add_parser(command, help=("Download a Hugging Face model into a directory and verify automatic adaptation"
                                                if command == "download" else "Verify a model's first forward and automatic runtime packing"))
-        p_model.add_argument("--aircolibri-root", default=None)
+        p_model.add_argument("--quintessentia-root", default=None)
         p_model.add_argument("--device", choices=("auto","cpu"), default="auto")
         p_model.add_argument("--weight-format", choices=("auto","bf16","q4","q6"), default="auto")
         p_model.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
@@ -531,7 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doc = sub.add_parser("doctor", help="Check GPU, VRAM plan, model files, and LAN interfaces")
     p_doc.add_argument("--model", "--model-dir", dest="model", type=str, default=None)
-    p_doc.add_argument("--aircolibri-root", type=str, default=None)
+    p_doc.add_argument("--quintessentia-root", type=str, default=None)
     p_doc.add_argument("--download-dir", default=None)
     p_doc.add_argument("--device", choices=("auto", "cpu"), default="auto")
     p_doc.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
@@ -577,7 +577,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_srv.set_defaults(func=cmd_serve)
 
-    p_disc = sub.add_parser("discover", help="Discover AirColibri servers broadcasting on the LAN")
+    p_disc = sub.add_parser("discover", help="Discover Quintessentia servers broadcasting on the LAN")
     p_disc.add_argument("--beacon-port", type=int, default=DEFAULT_BEACON_PORT)
     p_disc.add_argument("--timeout", type=float, default=2.0, help="Scan duration in seconds (default: 2.0)")
     p_disc.add_argument("--json-out", type=str, default=None)

@@ -33,7 +33,7 @@ def download_model(reference, root, *, directory=None, filename=None, revision=N
     if requested_revision != "main":
         name += "--"+hashlib.sha256(requested_revision.encode()).hexdigest()[:8]
     target = Path(directory).expanduser().resolve() if directory else Path(root)/"models"/name
-    marker = target/"aircolibri-source.json"
+    marker = target/"quintessentia-source.json"
     identity = dict(repo_id=ref.repo_id, filename=ref.filename)
     if marker.is_file():
         old = json.loads(marker.read_text("utf-8"))

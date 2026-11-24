@@ -1,15 +1,15 @@
-"""AirColibri runtime: W4A16 + NVRTC kernels + native MTP speculative decoding + budgeted VRAM.
+"""Quintessentia runtime: W4A16 + NVRTC kernels + native MTP speculative decoding + budgeted VRAM.
 
-`AirColibriUnifiedEngine` combines:
+`QuintessentiaUnifiedEngine` combines:
 - NVRTC CUDA kernels, including single-weight-read multi-row kernels (`M in {1,2,3,4}`)
-- Native MTP head (`ColibriNativeMTPHead`, ~130 MiB Q4)
-- `ColibriDraftVocab`, `ColibriSpecGate`, `colibri_spec_lookup`, `HybridSpecSnapshotManager`
+- Native MTP head (`QuintessentiaNativeMTPHead`, ~130 MiB Q4)
+- `QuintessentiaDraftVocab`, `QuintessentiaSpecGate`, `quintessentia_spec_lookup`, `HybridSpecSnapshotManager`
 - VRAM modes `normal` (almost all free VRAM, with a safety reserve) and `turbo` (all of it):
   all layers resident when they fit, otherwise resident layers + an equal-slot streaming ring
 - Chunked prefill that projects only the last position onto the vocabulary
 - Cooperative cancellation and guaranteed VRAM cleanup (`try/finally`) for every generation
-- `ColibriKVPrefixSession`: universal multi-turn KV / GatedDeltaNet prefix reuse with host-RAM parking
-- Colibri containers, standard Hugging Face shards, and sliced GGUF checkpoints (see `model_source`)
+- `QuintessentiaKVPrefixSession`: universal multi-turn KV / GatedDeltaNet prefix reuse with host-RAM parking
+- Quintessentia containers, standard Hugging Face shards, and sliced GGUF checkpoints (see `model_source`)
 - Optional `ZeroProbSubspaceVocabHead` (`--fast-vocab`, off by default)
 """
 from __future__ import annotations
@@ -31,11 +31,11 @@ import torch
 
 
 from .runtime_config import (PROJECT_ROOT, VRAM_MODES, ContextBudgetExceeded, GenerationCancelled,
-                             find_aircolibri_root, checkpoint_manifest_path)
+                             find_quintessentia_root, checkpoint_manifest_path)
 
 
 DEFAULT_DRAFT_SEED_CORPUS = (
-    "AirColibri combines 4-bit group-64 quantization, NVRTC CUDA kernel fusion, "
+    "Quintessentia combines 4-bit group-64 quantization, NVRTC CUDA kernel fusion, "
     "Multi-Token Prediction (MTP), GatedDeltaNet recurrent state snapshots, and "
     "PCIe triple-ring asynchronous DMA prefetching.\n"
     "В физике шин памяти видеокарты главная задержка при генерации по одному токену "
@@ -46,7 +46,7 @@ DEFAULT_DRAFT_SEED_CORPUS = (
 )
 
 
-class ColibriDraftVocab:
+class QuintessentiaDraftVocab:
     """Port of `upstream_colibri/c/draft_vocab.h` scored via `indexed_vocab_gemv_q4_f32`."""
 
     NEAR_NUM = 3
@@ -126,7 +126,7 @@ class ColibriDraftVocab:
             self.stats["appended"] += 1
 
 
-def colibri_spec_lookup(history: list[int], max_drafts: int = 2, max_n: int = 5, min_n: int = 2) -> list[int]:
+def quintessentia_spec_lookup(history: list[int], max_drafts: int = 2, max_n: int = 5, min_n: int = 2) -> list[int]:
     """Port of `spec_lookup` from `upstream_colibri/c/spec_draft.h`."""
     H = len(history)
     if H < min_n + 1 or max_drafts <= 0:
@@ -144,7 +144,7 @@ def colibri_spec_lookup(history: list[int], max_drafts: int = 2, max_n: int = 5,
     return []
 
 
-class ColibriSpecGate:
+class QuintessentiaSpecGate:
     """Port of confidence-scheduled `SpecGate` from `upstream_colibri/c/spec_draft.h`."""
 
     SRC_MTP = 0
@@ -524,7 +524,7 @@ def forward_step_all_logits(
     return outputs.logits, next_cache
 
 
-def install_colibri_multirow_unifications(
+def install_quintessentia_multirow_unifications(
     engine: Any,
     gk: Any,
     snap_mgr: HybridSpecSnapshotManager | None = None,
@@ -536,14 +536,14 @@ def install_colibri_multirow_unifications(
         apply_rotary_pos_emb,
         eager_attention_forward,
     )
-    from src.quantization_q4 import ColibriQ4Linear
+    from src.quantization_q4 import QuintessentiaQ4Linear
     from .kernels import ZeroProbSubspaceVocabHead, get_mr_kernels
 
     mrk = get_mr_kernels(gk.device)
     if captured is None:
         captured = {}
 
-    if not getattr(engine, "_colibri_mr_installed", False):
+    if not getattr(engine, "_quintessentia_mr_installed", False):
         for mod in engine.model.modules():
             if type(mod).__name__ == "Qwen3_5RMSNorm":
                 eps_val = float(mod.eps)
@@ -560,7 +560,7 @@ def install_colibri_multirow_unifications(
                 mod.forward = types.MethodType(make_rn_fwd(eps_val), mod)
 
         for submod in engine.model.model.layers.modules():
-            if isinstance(submod, ColibriQ4Linear):
+            if isinstance(submod, QuintessentiaQ4Linear):
                 orig_qf = submod.forward
 
                 def _mr_qfwd(x, _m=submod, _of=orig_qf):
@@ -684,7 +684,7 @@ def install_colibri_multirow_unifications(
 
                 s_attn.forward = types.MethodType(make_sa_fwd(orig_sa_fwd), s_attn)
 
-        engine._colibri_mr_installed = True
+        engine._quintessentia_mr_installed = True
 
     raw_q4_head = engine.model.lm_head.q4_head if hasattr(engine.model.lm_head, "q4_head") else engine.model.lm_head
     if hasattr(raw_q4_head, "qweight") and raw_q4_head.qweight.is_cuda:
@@ -721,16 +721,16 @@ def install_colibri_multirow_unifications(
     return captured
 
 
-class ColibriNativeMTPHead:
-    """Loads `model-mtp.safetensors` as Q4 (130.5 MiB VRAM) and scores over `ColibriDraftVocab`."""
+class QuintessentiaNativeMTPHead:
+    """Loads `model-mtp.safetensors` as Q4 (130.5 MiB VRAM) and scores over `QuintessentiaDraftVocab`."""
 
-    def __init__(self, engine: Any, gk: Any, draft_vocab: ColibriDraftVocab):
+    def __init__(self, engine: Any, gk: Any, draft_vocab: QuintessentiaDraftVocab):
         from safetensors import safe_open
         from transformers.cache_utils import DynamicCache
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
-        from src.aircolibri_integrated import set_module_tensor_to_device
-        from src.colibri_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4
-        from src.quantization_q4 import ColibriQ4Linear, quantize_tensor_q4
+        from src.quintessentia_integrated import set_module_tensor_to_device
+        from src.quintessentia_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4
+        from src.quantization_q4 import QuintessentiaQ4Linear, quantize_tensor_q4
         from .kernels import get_mr_kernels
 
         self._DynamicCache = DynamicCache
@@ -765,7 +765,7 @@ class ColibriNativeMTPHead:
                     setattr(
                         parent,
                         ch_name,
-                        ColibriQ4Linear(
+                        QuintessentiaQ4Linear(
                             out_features=ch.out_features,
                             in_features=ch.in_features,
                             has_bias=(ch.bias is not None),
@@ -774,7 +774,7 @@ class ColibriNativeMTPHead:
                             scratch_provider=engine._get_q4_scratch,
                         ),
                     )
-        self.fc_q4 = ColibriQ4Linear(
+        self.fc_q4 = QuintessentiaQ4Linear(
             out_features=cfg.hidden_size,
             in_features=cfg.hidden_size * 2,
             has_bias=False,
@@ -792,7 +792,7 @@ class ColibriNativeMTPHead:
         self.fc_q4.bind_q4_tensors(p_fc, s_fc, z_fc)
 
         for mod_name, submod in layer.named_modules():
-            if isinstance(submod, ColibriQ4Linear):
+            if isinstance(submod, QuintessentiaQ4Linear):
                 w_cpu = mtp_raw.pop(f"mtp.layers.0.{mod_name}.weight")
                 pq, sq, zq = quantize_tensor_q4(
                     w_cpu,
@@ -833,7 +833,7 @@ class ColibriNativeMTPHead:
                     return _rf
 
                 mod.forward = types.MethodType(make_rn(eps_v), mod)
-            elif isinstance(mod, ColibriQ4Linear):
+            elif isinstance(mod, QuintessentiaQ4Linear):
                 orig_f = mod.forward
 
                 def _qfwd(x, _m=mod, _of=orig_f):
@@ -863,7 +863,7 @@ class ColibriNativeMTPHead:
             return orig_mtp_mlp(x)
 
         self.layer.mlp.forward = types.MethodType(_mtp_mlp_fwd, self.layer.mlp)
-        self._ColibriQ4Linear = ColibriQ4Linear
+        self._QuintessentiaQ4Linear = QuintessentiaQ4Linear
         self.kv_cache = DynamicCache(config=self.mtp_cfg)
         self.committed_len = 0
         self.mtp_step_times_ms: list[float] = []
@@ -876,7 +876,7 @@ class ColibriNativeMTPHead:
     def q4_vram_bytes(self) -> int:
         total = 0
         for m in [self.fc_q4, *self.layer.modules(), self.enorm, self.hnorm, self.head_norm]:
-            if isinstance(m, self._ColibriQ4Linear):
+            if isinstance(m, self._QuintessentiaQ4Linear):
                 total += m.qweight.nbytes + m.scales.nbytes + m.zeros.nbytes
         for p in [*self.layer.parameters(), *self.enorm.parameters(), *self.hnorm.parameters(), *self.head_norm.parameters()]:
             total += p.numel() * p.element_size()
@@ -953,9 +953,9 @@ class ColibriNativeMTPHead:
         return d2, p2, last_normed
 
 
-def install_colibri_anchor_ring_schedule(engine: Any, resident_set: set[int]) -> dict[str, Any]:
+def install_quintessentia_anchor_ring_schedule(engine: Any, resident_set: set[int]) -> dict[str, Any]:
     """Installs `.coli_analysis.json` / `PriorityRanker` non-contiguous Anchor Residency + 3-slot queue."""
-    from src.aircolibri_integrated import set_module_tensor_to_device
+    from src.quintessentia_integrated import set_module_tensor_to_device
 
     for h in engine._hook_handles:
         h.remove()
@@ -1078,7 +1078,7 @@ def _detach_park_cpu(tensor: torch.Tensor, allow_pin: bool) -> torch.Tensor:
     return cpu_t
 
 
-class ColibriKVPrefixSession:
+class QuintessentiaKVPrefixSession:
     """Multi-turn KV + GatedDeltaNet + MTP session ledger with Host-RAM parking (`0 MiB` idle VRAM)."""
 
     def __init__(self):
@@ -1112,7 +1112,7 @@ class ColibriKVPrefixSession:
         past_key_values: Any,
         last_fed_h_post: torch.Tensor | None,
         engine: Any,
-        mtp_head: ColibriNativeMTPHead | None,
+        mtp_head: QuintessentiaNativeMTPHead | None,
         captured: dict[str, torch.Tensor],
         chatml_think_format: bool = False,
         consumed_tokens: int | None = None,
@@ -1229,7 +1229,7 @@ class ColibriKVPrefixSession:
     def unpark_to_gpu(
         self,
         device: torch.device,
-        mtp_head: ColibriNativeMTPHead | None,
+        mtp_head: QuintessentiaNativeMTPHead | None,
         first_new_token: int,
     ) -> tuple[Any, float]:
         from transformers.cache_utils import DynamicCache
@@ -1737,13 +1737,13 @@ def _eos_token_set(eos_token_id: Any) -> set[int]:
     return set()
 
 
-class AirColibriUnifiedEngine:
+class QuintessentiaUnifiedEngine:
     """High-level self-contained unified engine for CLI `ask`, `chat`, and LAN `serve`."""
 
     def __init__(
         self,
         model_dir: str | Path | None = None,
-        aircolibri_root: str | Path | None = None,
+        quintessentia_root: str | Path | None = None,
         vram_mode: str = "normal",
         enable_mtp: bool = True,
         enable_vocab_pruner: bool = False,
@@ -1771,7 +1771,7 @@ class AirColibriUnifiedEngine:
         if speculation == "off":
             enable_mtp = False
         self.speculator = self._region_controller = None
-        self.root = find_aircolibri_root(aircolibri_root)
+        self.root = find_quintessentia_root(quintessentia_root)
         # Historical spelling remains accepted by local experiments; it no
         # longer means that GPU startup waits for CPU work.
         if cpu_first is not None:
@@ -1783,8 +1783,8 @@ class AirColibriUnifiedEngine:
                                  prefill_wavefront, allow_gpu=device != "cpu")
             self._configure_general_stream(speculation, mtp_head_path, mtp_head_budget_mib, prune_regions)
             return
-        from src.aircolibri_engine import PriorityRanker
-        from src.aircolibri_integrated import AirColibriModel
+        from src.quintessentia_engine import PriorityRanker
+        from src.quintessentia_integrated import QuintessentiaModel
         from src.catalog_bridge import ExistingCrossLayerCatalog
         from src.existing_hooks import ExistingForwardHookAdapter
         from src.lease_ack_bridge import ExistingRingAcknowledgementAdapter
@@ -1800,7 +1800,7 @@ class AirColibriUnifiedEngine:
                 f"vram_mode must be one of {VRAM_MODES} (got {vram_mode!r}); fixed `4gb`/`8gb` profiles were removed"
             )
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA GPU is required to run AirColibriUnifiedEngine.")
+            raise RuntimeError("CUDA GPU is required to run QuintessentiaUnifiedEngine.")
 
         self.engine = None
         self.pread_reader = None
@@ -1810,7 +1810,7 @@ class AirColibriUnifiedEngine:
         self.model_dir = resolve_model_dir(model_dir, self.root, allow_download=allow_download)
         self.model_id = self.model_dir.name
         self.model_source = open_model_source(self.model_dir)
-        self.model_format = getattr(self.model_source, "kind", "hf") if self.model_source is not None else "colibri"
+        self.model_format = getattr(self.model_source, "kind", "hf") if self.model_source is not None else "quintessentia"
 
         from .gpu_memory import measure_gpu_memory
         self.memory_probe = measure_gpu_memory(self.device)
@@ -1848,7 +1848,7 @@ class AirColibriUnifiedEngine:
                 else f"{p.resident_layers}/{p.layers_total} resident + {p.ring_slots}-slot ring ({p.slot_bytes / MiB:.0f} MiB each)"
             )
             print(
-                f"[AirColibri] GPU: {self.gpu_name} ({self.total_vram_gib} GiB, free {free_b / GiB:.2f} GiB) | "
+                f"[Quintessentia] GPU: {self.gpu_name} ({self.total_vram_gib} GiB, free {free_b / GiB:.2f} GiB) | "
                 f"Mode: {vram_mode} | Backend: {self.profile['backend']} | "
                 f"Budget: {p.budget_bytes / GiB:.2f} GiB, reserve {p.reserve_bytes / GiB:.2f} GiB | "
                 f"{layout} | Model: {self.model_id} ({self.model_format})",
@@ -1868,7 +1868,7 @@ class AirColibriUnifiedEngine:
         if self.fast_qwen:
             from .kernels import GrandUnifiedKernels
 
-            q4_cache = Path(os.environ.get("AIRCOLIBRI_CACHE_DIR") or (self.root / "data" / "q4-g64-cache"))
+            q4_cache = Path(os.environ.get("QUINTESSENTIA_CACHE_DIR") or (self.root / "data" / "q4-g64-cache"))
             if self.model_source is not None:
                 use_cache_dir, use_manifest = str(q4_cache), None
             else:
@@ -1888,7 +1888,7 @@ class AirColibriUnifiedEngine:
                 weight_reader=self.pread_reader,
             )
             if self.plan.full_residency:
-                self.engine = AirColibriModel(str(self.model_dir), vram_resident_layers=num_layers, **common)
+                self.engine = QuintessentiaModel(str(self.model_dir), vram_resident_layers=num_layers, **common)
                 self.anchor_schedule = {"resident_layers": list(range(num_layers)), "streamed_layers": []}
             else:
                 prio = None
@@ -1906,7 +1906,7 @@ class AirColibriUnifiedEngine:
                         )
                     except Exception:
                         self.native_policy = None
-                self.engine = AirColibriModel(
+                self.engine = QuintessentiaModel(
                     str(self.model_dir),
                     vram_resident_layers=0,
                     max_ram_layers=max_ram_layers,
@@ -1918,14 +1918,14 @@ class AirColibriUnifiedEngine:
                     **common,
                 )
                 self.engine.tail_to_head_prefetch = True
-                self.anchor_schedule = install_colibri_anchor_ring_schedule(self.engine, resident_set)
+                self.anchor_schedule = install_quintessentia_anchor_ring_schedule(self.engine, resident_set)
                 if self.model_source is None:
                     catalog = ExistingCrossLayerCatalog(str(self.model_dir))
                     self.engine.trace_adapter = ExistingForwardHookAdapter(self.engine, catalog).install()
                     self.engine.ack_adapter = ExistingRingAcknowledgementAdapter(self.engine.pipeline).install()
 
             self.snap_mgr = HybridSpecSnapshotManager(self.engine.config, self.device, max_drafts=max(2, self.max_drafts))
-            self.captured = install_colibri_multirow_unifications(
+            self.captured = install_quintessentia_multirow_unifications(
                 self.engine,
                 self.gk,
                 snap_mgr=self.snap_mgr,
@@ -1934,15 +1934,15 @@ class AirColibriUnifiedEngine:
             self.enable_vocab_pruner = enable_vocab_pruner
             self.mtp_enabled = bool(enable_mtp and has_mtp and self.plan.enable_mtp and self.max_drafts >= 1)
             if self.mtp_enabled:
-                self.draft_vocab = ColibriDraftVocab(self.engine.config.vocab_size, top_k=16000, device=self.device)
+                self.draft_vocab = QuintessentiaDraftVocab(self.engine.config.vocab_size, top_k=16000, device=self.device)
                 seed_ids = self.engine.tokenizer(DEFAULT_DRAFT_SEED_CORPUS, add_special_tokens=False).input_ids
                 self.draft_vocab.seed_from_corpus_tokens(seed_ids)
-                self.mtp_head = ColibriNativeMTPHead(self.engine, self.gk, self.draft_vocab)
+                self.mtp_head = QuintessentiaNativeMTPHead(self.engine, self.gk, self.draft_vocab)
                 self.mtp_vram_mib = round(self.mtp_head.q4_vram_bytes() / MiB, 2)
         else:
             resident = num_layers if self.plan.full_residency else int(self.plan.resident_layers)
             expert_cache_bytes = max(0, int(self.plan.budget_bytes - self.plan.weights_bytes - 256 * MiB))
-            self.engine = AirColibriModel(
+            self.engine = QuintessentiaModel(
                 str(self.model_dir),
                 pipeline_mode="triple_ring_prefetch",
                 vram_resident_layers=resident,
@@ -1965,7 +1965,7 @@ class AirColibriUnifiedEngine:
             self.mtp_enabled = False
             self.enable_vocab_pruner = False
 
-        self.session = ColibriKVPrefixSession()
+        self.session = QuintessentiaKVPrefixSession()
         self._session_messages: list[dict[str, str]] = []
         self.last_metrics: dict[str, Any] = {}
         self.generations_started = 0
@@ -1987,7 +1987,7 @@ class AirColibriUnifiedEngine:
                 else ""
             )
             print(
-                f"[AirColibri] Ready in {self.boot_seconds}s | Resident VRAM: {self.resident_vram_mib} MiB "
+                f"[Quintessentia] Ready in {self.boot_seconds}s | Resident VRAM: {self.resident_vram_mib} MiB "
                 f"(backend {self.profile['backend']}, MTP: {'on' if self.mtp_enabled else 'off'}, "
                 f"FastVocab: {self.enable_vocab_pruner}{ec_str})",
                 flush=True,
@@ -2015,7 +2015,7 @@ class AirColibriUnifiedEngine:
                         allow_download, weight_format, prefill_wavefront, allow_gpu=True):
         from .model_source import (PreadSafetensorsReader, open_model_source,
                                    resolve_model_dir, runtime_profile, load_runtime_config)
-        from src.aircolibri_integrated import AirColibriModel
+        from src.quintessentia_integrated import QuintessentiaModel
         if mode not in VRAM_MODES:
             raise ValueError(f"vram_mode must be one of {VRAM_MODES}")
         if weight_format not in ("auto", "bf16", "q4", "q6"):
@@ -2027,7 +2027,7 @@ class AirColibriUnifiedEngine:
         self.model_dir = resolve_model_dir(model_dir, self.root, allow_download=allow_download)
         self.model_id = self.model_dir.name
         self.model_source = open_model_source(self.model_dir)
-        self.model_format = getattr(self.model_source, "kind", "colibri")
+        self.model_format = getattr(self.model_source, "kind", "quintessentia")
         self.profile = runtime_profile(self.model_dir)
         fmt = ("q4" if self.profile["fast_qwen"] else "q6") if weight_format == "auto" else weight_format
         self.profile = dict(self.profile, fast_qwen=False, backend="progressive-hf", weight_format=fmt)
@@ -2054,7 +2054,7 @@ class AirColibriUnifiedEngine:
         self.has_native_dll = False
         self.anchor_schedule = {"resident_layers": [], "streamed_layers": list(range(layers))}
         self.pread_reader = PreadSafetensorsReader(max_handles=8)
-        self.session = ColibriKVPrefixSession()
+        self.session = QuintessentiaKVPrefixSession()
         self._session_messages = []
         self.last_metrics = {}
         self.generations_started = self.generations_cancelled = 0
@@ -2081,7 +2081,7 @@ class AirColibriUnifiedEngine:
 
         boot = time.perf_counter()
         try:
-            self.engine = AirColibriModel(
+            self.engine = QuintessentiaModel(
                 str(self.model_dir), device=torch.device("cpu"),
                 vram_resident_layers=0, max_ram_layers=2,
                 max_ram_bytes=_streaming_ram_budget_bytes(), cache_policy="lru", num_slots=3,
@@ -2097,7 +2097,7 @@ class AirColibriUnifiedEngine:
         self.resident_vram_mib = round(torch.cuda.memory_allocated(metric_device)/MiB, 2) if metric_device is not None else 0.0
         if verbose:
             policy = "Common CPU/GPU start" if self.engine.progressive.gpu_enabled else "CPU streaming"
-            print(f"[AirColibri] {policy} | {self.model_id} ({fmt}); work follows device readiness", flush=True)
+            print(f"[Quintessentia] {policy} | {self.model_id} ({fmt}); work follows device readiness", flush=True)
 
     @property
     def tokenizer(self):
@@ -2573,7 +2573,7 @@ class AirColibriUnifiedEngine:
             }
             return
 
-        gate = ColibriSpecGate(max_drafts=self.max_drafts, force_off=False)
+        gate = QuintessentiaSpecGate(max_drafts=self.max_drafts, force_off=False)
         self.draft_vocab.begin_request(prompt_ids, cached_prompt_tokens=cached_prefix_len)
         if cached_prefix_len == 0:
             self.mtp_head.reset_cache()
@@ -2603,13 +2603,13 @@ class AirColibriUnifiedEngine:
                 check("decode")
                 rem = max_new_tokens - generated_count
 
-                lkp = colibri_spec_lookup(all_ids, max_drafts=min(self.max_drafts, rem))
+                lkp = quintessentia_spec_lookup(all_ids, max_drafts=min(self.max_drafts, rem))
                 if len(lkp) >= 2 or (len(lkp) == 1 and p1 < 0.45):
-                    src = ColibriSpecGate.SRC_LOOKUP
+                    src = QuintessentiaSpecGate.SRC_LOOKUP
                     cand_drafts = lkp[: min(self.max_drafts, rem)]
                     cand_probs = [0.75] * len(cand_drafts)
                 else:
-                    src = ColibriSpecGate.SRC_MTP
+                    src = QuintessentiaSpecGate.SRC_MTP
                     cand_drafts = [d1]
                     cand_probs = [p1]
                     if rem >= 2 and gate.should_draft_second_mtp(p1):
@@ -2931,7 +2931,7 @@ class AirColibriUnifiedEngine:
         if torch.cuda.is_initialized():
             torch.cuda.empty_cache()
 
-    def __enter__(self) -> "AirColibriUnifiedEngine":
+    def __enter__(self) -> "QuintessentiaUnifiedEngine":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

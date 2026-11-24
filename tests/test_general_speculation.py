@@ -4,7 +4,7 @@ import copy
 import pytest
 import torch
 
-from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, ColibriSpecGate
+from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, QuintessentiaSpecGate
 
 
 def collect(engine, prompt, count=9):
@@ -21,7 +21,7 @@ def fixed_proposals(speculator, expected, prompt_len, rejection):
             tokens[0] = (tokens[0]+1) % 64
         elif len(tokens) > 1 and rejection == "second":
             tokens[1] = (tokens[1]+1) % 64
-        return tokens, [.95]*len(tokens), ColibriSpecGate.SRC_LOOKUP
+        return tokens, [.95]*len(tokens), QuintessentiaSpecGate.SRC_LOOKUP
     speculator.propose = propose
 
 
@@ -30,15 +30,15 @@ def fixed_proposals(speculator, expected, prompt_len, rejection):
 @torch.no_grad()
 def test_streamed_dense_accept_and_reject_preserve_tokens_and_cache(tmp_path, monkeypatch, fmt, rejection):
     from test_cpu_independence import tiny_checkpoint
-    import aircolibri_cli.unified_runtime as runtime
+    import quintessentia_cli.unified_runtime as runtime
     tiny_checkpoint(tmp_path)
     monkeypatch.setattr(runtime, "_streaming_ram_budget_bytes", lambda: 48*1024)
-    monkeypatch.setattr(ColibriSpecGate, "pick_depth", lambda self, source, probs: len(probs))
+    monkeypatch.setattr(QuintessentiaSpecGate, "pick_depth", lambda self, source, probs: len(probs))
     prompt = [3, 7, 4, 9]
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", weight_format=fmt, speculation="off", verbose=False) as base:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", weight_format=fmt, speculation="off", verbose=False) as base:
         expected, state = collect(base, prompt)
         reference = copy.deepcopy(state["past"])
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", weight_format=fmt, speculation="lookup", verbose=False) as u:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", weight_format=fmt, speculation="lookup", verbose=False) as u:
         fixed_proposals(u.speculator, expected, len(prompt), rejection)
         actual, result = collect(u, prompt)
         assert actual == expected
@@ -64,12 +64,12 @@ def test_rejected_rows_restore_recurrent_and_sliding_state(tmp_path, monkeypatch
     config = tiny_config(family)
     AutoModelForCausalLM.from_config(config, dtype=torch.bfloat16).save_pretrained(tmp_path)
     _write_tiny_hf_tokenizer(tmp_path, vocab_size=64)
-    monkeypatch.setattr(ColibriSpecGate, "pick_depth", lambda self, source, probs: len(probs))
+    monkeypatch.setattr(QuintessentiaSpecGate, "pick_depth", lambda self, source, probs: len(probs))
     prompt = [3, 7, 4]
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", weight_format="bf16", speculation="off", verbose=False) as base:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", weight_format="bf16", speculation="off", verbose=False) as base:
         expected, state = collect(base, prompt)
         before = copy.deepcopy(state["past"])
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", weight_format="bf16", speculation="lookup", verbose=False) as u:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", weight_format="bf16", speculation="lookup", verbose=False) as u:
         fixed_proposals(u.speculator, expected, len(prompt), "second")
         actual, result = collect(u, prompt)
         assert actual == expected
@@ -85,7 +85,7 @@ def test_native_head_budget_is_checked_before_tensor_reads(tmp_path, monkeypatch
     from types import SimpleNamespace
     from transformers import Qwen3_5TextConfig
     from safetensors.torch import save_file
-    from aircolibri_cli.model_source import PreadSafetensorsReader
+    from quintessentia_cli.model_source import PreadSafetensorsReader
     save_file({"mtp.fc.weight": torch.zeros(128, 256, dtype=torch.bfloat16)}, str(tmp_path/"head.safetensors"))
     cfg = Qwen3_5TextConfig(hidden_size=128)
     engine = SimpleNamespace(config=cfg, dtype=torch.bfloat16, model_source=None)
@@ -101,7 +101,7 @@ def test_native_adapter_cpu_cache_continuation_matches_plain(tmp_path, monkeypat
     from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
     from safetensors.torch import save_file
     from test_model_source import _write_tiny_hf_tokenizer
-    import aircolibri_cli.unified_runtime as runtime
+    import quintessentia_cli.unified_runtime as runtime
     torch.set_num_threads(6)
     torch.manual_seed(843)
     cfg = Qwen3_5TextConfig(vocab_size=259, hidden_size=128, intermediate_size=256,
@@ -120,10 +120,10 @@ def test_native_adapter_cpu_cache_continuation_matches_plain(tmp_path, monkeypat
     save_file(weights, str(head))
     del model, weights
     monkeypatch.setattr(runtime, "_streaming_ram_budget_bytes", lambda: 48*1024)
-    monkeypatch.setattr(ColibriSpecGate, "pick_depth", lambda self, source, probs: len(probs))
+    monkeypatch.setattr(QuintessentiaSpecGate, "pick_depth", lambda self, source, probs: len(probs))
     reference = None
     for mode in ("off", "native"):
-        with AirColibriUnifiedEngine(tmp_path, device="cpu", weight_format="q6", speculation=mode,
+        with QuintessentiaUnifiedEngine(tmp_path, device="cpu", weight_format="q6", speculation=mode,
                                       mtp_head_path=head if mode == "native" else None, verbose=False) as u:
             first, state = collect(u, [3, 7, 4])
             events = list(u._stream_token_ids(state["all_ids"]+[11], 4, False,
@@ -150,7 +150,7 @@ def test_unvalidated_decoder_uses_plain_stream_without_excluding_model(tmp_path)
     _write_tiny_hf_tokenizer(tmp_path, vocab_size=259)
     reference = None
     for mode in ("off", "lookup"):
-        with AirColibriUnifiedEngine(tmp_path, device="cpu", speculation=mode, verbose=False) as u:
+        with QuintessentiaUnifiedEngine(tmp_path, device="cpu", speculation=mode, verbose=False) as u:
             actual, state = collect(u, [3,7,3,7,3,7])
             if reference is None:
                 reference = actual

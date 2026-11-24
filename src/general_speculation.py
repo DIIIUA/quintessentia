@@ -9,12 +9,12 @@ import time
 
 import torch
 
-from aircolibri_cli.thought_buffer import _auxiliary_forwards, capture_cache_snapshot, restore_cache_snapshot
+from quintessentia_cli.thought_buffer import _auxiliary_forwards, capture_cache_snapshot, restore_cache_snapshot
 
 
 class GeneralSpeculation:
     def __init__(self, runtime, mode="auto", head_path=None, head_budget_bytes=128*2**20):
-        from src.aircolibri_integrated import _NORM_WEIGHT_CANDIDATES
+        from src.quintessentia_integrated import _NORM_WEIGHT_CANDIDATES
         self.runtime, self.mode = runtime, mode
         self.native = None
         self.native_error = None
@@ -66,12 +66,12 @@ class GeneralSpeculation:
             self.capturing = False
 
     def propose(self, history, count, native_ready):
-        from aircolibri_cli.unified_runtime import ColibriSpecGate, colibri_spec_lookup
+        from quintessentia_cli.unified_runtime import QuintessentiaSpecGate, quintessentia_spec_lookup
         if native_ready:
             tokens, probs = self.native.draft(count)
-            return tokens, probs, ColibriSpecGate.SRC_MTP
-        tokens = colibri_spec_lookup(history, max_drafts=count)
-        return tokens, [0.75]*len(tokens), ColibriSpecGate.SRC_LOOKUP
+            return tokens, probs, QuintessentiaSpecGate.SRC_MTP
+        tokens = quintessentia_spec_lookup(history, max_drafts=count)
+        return tokens, [0.75]*len(tokens), QuintessentiaSpecGate.SRC_LOOKUP
 
     def _boundary(self, past):
         progressive = getattr(self.runtime.engine, "progressive", None)
@@ -130,12 +130,12 @@ class GeneralSpeculation:
 
     def stream(self, prompt_ids, max_new_tokens, stop_on_eos, cached_prefix_len=0,
                past_kv=None, cancel_check=None):
-        from aircolibri_cli.unified_runtime import ColibriSpecGate, _eos_token_set
+        from quintessentia_cli.unified_runtime import QuintessentiaSpecGate, _eos_token_set
         u, eng = self.runtime, self.runtime.engine
         check = u._make_cancel_checker(cancel_check)
         eos = _eos_token_set(u.tokenizer.eos_token_id)
         anchor = getattr(u, "_active_thought_anchor", None)
-        gate = ColibriSpecGate(max_drafts=u.max_drafts)
+        gate = QuintessentiaSpecGate(max_drafts=u.max_drafts)
         before = self.counters.copy()
         all_ids = list(prompt_ids)
         past = past_kv if cached_prefix_len else None

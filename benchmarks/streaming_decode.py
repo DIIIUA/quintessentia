@@ -78,13 +78,13 @@ def main():
     os.environ.update(HF_HUB_OFFLINE="1", TOKENIZERS_PARALLELISM="false")
     import psutil
     import torch
-    from aircolibri_cli import unified_runtime as runtime
+    from quintessentia_cli import unified_runtime as runtime
     torch.set_num_threads(6)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     original_plan = runtime.plan_for_checkpoint
     original_budget = runtime._streaming_ram_budget_bytes
     source = hashlib.sha256()
-    for directory in ("src", "aircolibri_cli"):
+    for directory in ("src", "quintessentia_cli"):
         for f in sorted((ROOT/directory).rglob("*")):
             if f.suffix in (".py", ".cu", ".h", ".c"):
                 source.update(f.relative_to(ROOT).as_posix().encode())
@@ -149,7 +149,7 @@ def main():
                             case["hardware_before"] = hardware([os.getpid()]+([pressure_info["pid"]] if holder else []))
                             case["available_ram_before_bytes"] = psutil.virtual_memory().available
                             started = time.perf_counter()
-                            engine = runtime.AirColibriUnifiedEngine(model_dir=model, progressive_start=False,
+                            engine = runtime.QuintessentiaUnifiedEngine(model_dir=model, progressive_start=False,
                                 weight_format="q6", speculation="off", prune_regions=False, enable_mtp=False,
                                 max_context_tokens=2048, prefill_chunk_tokens=64, verbose=False)
                             case["constructor_s"] = time.perf_counter()-started

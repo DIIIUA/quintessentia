@@ -11,11 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
-from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
 
 
 def run(folder, cpu_first, bits, tokens):
-    from src.colibri_deltanet_nvrtc import KERNEL_CALL_STATS
+    from src.quintessentia_deltanet_nvrtc import KERNEL_CALL_STATS
     kernel_before = dict(KERNEL_CALL_STATS)
     before = {str(p): (p.stat().st_size, p.stat().st_mtime_ns)
               for p in folder.rglob("*") if p.suffix in {".gguf", ".safetensors"}}
@@ -24,7 +24,7 @@ def run(folder, cpu_first, bits, tokens):
               "mode": "simultaneous_readiness" if cpu_first else "gpu_first_control", "format": f"q{bits}"}
     engine = None
     try:
-        engine = AirColibriUnifiedEngine(folder, cpu_first=cpu_first, weight_format=f"q{bits}",
+        engine = QuintessentiaUnifiedEngine(folder, cpu_first=cpu_first, weight_format=f"q{bits}",
                                          enable_mtp=False, max_context_tokens=512,
                                          prefill_chunk_tokens=8, verbose=False)
         result["constructor_s"] = time.perf_counter()-start
@@ -80,10 +80,10 @@ def main():
     report = {"protocol": "one request per fresh engine, OS caches not flushed; not a cold-disk or causal speedup proof",
               "threads": 6, "results": [],
               "source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                                for p in [ROOT/'src/progressive_execution.py', ROOT/'aircolibri_cli/unified_runtime.py',
-                                          ROOT/'src/quantized_experts.py', ROOT/'src/aircolibri_integrated.py',
-                                          ROOT/'src/colibri_deltanet_nvrtc.py', ROOT/'src/colibri_nvrtc.py',
-                                          ROOT/'src/native/colibri_fused_quant.cu', ROOT/'aircolibri_cli/model_source.py']}}
+                                for p in [ROOT/'src/progressive_execution.py', ROOT/'quintessentia_cli/unified_runtime.py',
+                                          ROOT/'src/quantized_experts.py', ROOT/'src/quintessentia_integrated.py',
+                                          ROOT/'src/quintessentia_deltanet_nvrtc.py', ROOT/'src/quintessentia_nvrtc.py',
+                                          ROOT/'src/native/quintessentia_fused_quant.cu', ROOT/'quintessentia_cli/model_source.py']}}
     for model in args.models:
         for cpu_first in ((True,) if args.progressive_only else (True, False)):
             print(f"RUN {model} progressive_start={cpu_first}", flush=True)

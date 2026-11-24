@@ -41,7 +41,7 @@ area, and a demand miss uses the same directory as a prepared expert.
             cpu_conversions=0, host_cache_hits=0, errors=0, retained_on_refinement=0,
             obsolete_after_pack=0, trace_dropped=0, updates_dropped=0)
         self.thread = threading.Thread(target=self._run,
-            name='aircolibri-unified-warmup', daemon=True)
+            name='quintessentia-unified-warmup', daemon=True)
         self.thread.start()
 
     def submit(self, layer, ids, *, region=None, depth=None, lane=None, step=None):

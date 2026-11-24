@@ -1,4 +1,4 @@
-"""Bounded Memory Manager for AirColibri (Stage 5 / Refactored):
+"""Bounded Memory Manager for Quintessentia (Stage 5 / Refactored):
 1. Строгий лимит RAM-кэша с поддержкой политик:
    - "static_pinned" (удержание фиксированных слоев в RAM, защита от LRU-патологии на последовательных проходах)
    - "lru" (классическое LRU-вытеснение)

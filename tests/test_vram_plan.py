@@ -1,7 +1,7 @@
 """CPU checks for the VRAM planner (`normal` / `turbo`, no fixed 4gb/8gb profiles)."""
 import pytest
 
-from aircolibri_cli.unified_runtime import GiB, MiB, plan_vram, q4_bytes_for_shape
+from quintessentia_cli.unified_runtime import GiB, MiB, plan_vram, q4_bytes_for_shape
 
 # Qwen3.5-9B-like numbers: 32 layers of ~122 MiB in Q4, LM head 572 MiB, MTP ~130 MiB.
 LAYERS = [122 * MiB] * 32

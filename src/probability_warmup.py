@@ -111,7 +111,7 @@ class ProbabilityWarmup:
                  gpu_budget_bytes=64*1024**2, host_cache_bytes=64*1024**2,
                  drift_patience=3, drift_miss_fraction=0.5, recent_window=8,
                  unified_memory=False, dynamic_regions=False):
-        from aircolibri_cli.model_source import HFShardedSource, PreadSafetensorsReader, _HFExpertCacheAndLoader
+        from quintessentia_cli.model_source import HFShardedSource, PreadSafetensorsReader, _HFExpertCacheAndLoader
         from src.quantized_experts import QuantizedExpertCache
         source = engine.model_source
         cache = getattr(source, "_expert_loader", None)

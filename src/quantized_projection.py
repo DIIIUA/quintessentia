@@ -1,4 +1,4 @@
-"""Bounded Colibri affine Q4/Q6 storage shared by streaming and compute.
+"""Bounded Quintessentia affine Q4/Q6 storage shared by streaming and compute.
 
 This is a runtime representation, not a GGUF block format. Source quantization
 is decoded by the source adapter before conversion. Routers and parameters
@@ -47,7 +47,7 @@ def pack_weight_rows(shape, read_rows, bits, group_size=64, device="cpu", tile_e
     resident/streaming slot budget.
     """
     if bits not in (4, 6) or group_size not in (16, 32, 64):
-        raise ValueError("Colibri supports Q4/Q6 with groups of 16, 32 or 64")
+        raise ValueError("Quintessentia supports Q4/Q6 with groups of 16, 32 or 64")
     n, k = shape
     if n < 0 or k <= 0 or k % group_size:
         raise ValueError("Input width must be divisible by group size")
@@ -112,7 +112,7 @@ class PackedLinear(nn.Module):
         return {name: getattr(self, name) for name in PACKED_FIELDS if hasattr(self, name)}
 
     def forward(self, x):
-        from src.colibri_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4, fused_dense_linear_q6
+        from src.quintessentia_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4, fused_dense_linear_q6
         if x.dtype == torch.bfloat16 and can_use_fused_dense_q4(x, self.packed_lo, self.qscale, self.qzero, self.group_size):
             self.fused_calls += 1
             if self.bits == 6:
@@ -132,7 +132,7 @@ class PackedLinear(nn.Module):
 
 def projection_map(model, layer_shapes, bits, group_size=64, replace=False):
     """Select actual module calls, never infer execution semantics from shapes alone."""
-    from aircolibri_cli.model_source import resolve_decoder_layers
+    from quintessentia_cli.model_source import resolve_decoder_layers
     from transformers.pytorch_utils import Conv1D
     result = {}
     for idx, layer in enumerate(resolve_decoder_layers(model)):

@@ -216,7 +216,7 @@ class QuantizedExpertCache:
         return None
 
     def _fused_shared(self, layer, hidden, valid, weights):
-        from src.colibri_nvrtc import fused_routed_moe_q4, fused_routed_moe_q6, reduce_routed_parts
+        from src.quintessentia_nvrtc import fused_routed_moe_q4, fused_routed_moe_q6, reduce_routed_parts
         memory = self.shared_memory
         with memory.lease(layer, [eid for _, eid in valid], self._load_packed,
                           auxiliary=bool(self.auxiliary_depth)) as entries:
@@ -281,7 +281,7 @@ class QuantizedExpertCache:
         slots = [self._get(layer, eid, True, protected)[2] for _, eid in valid]
         slot_idx = torch.tensor(slots, device=self.device, dtype=torch.int64)
         route_weights = weights[0, [pos for pos, _ in valid]].contiguous()
-        from src.colibri_nvrtc import fused_routed_moe_q4, fused_routed_moe_q6
+        from src.quintessentia_nvrtc import fused_routed_moe_q4, fused_routed_moe_q6
         self.fused_calls += 1
         gu, dn = self.gu, self.dn
         if self.bits == 4:
@@ -290,7 +290,7 @@ class QuantizedExpertCache:
 
     def stats(self):
         size = sum(v.numel()*v.element_size() for bank in (self.gu, self.dn) if bank for v in bank.values())
-        return {"format": f"colibri_q{self.bits}", "slots": self.num_slots, "arena_mib": round(size/1024**2, 2),
+        return {"format": f"quintessentia_q{self.bits}", "slots": self.num_slots, "arena_mib": round(size/1024**2, 2),
                 "enabled_layers": sorted(self.enabled_layers), "hits": self.hits, "misses": self.misses,
                 "hit_rate": self.hits/max(1, self.hits+self.misses), "conversions": self.conversions,
                 "fused_calls": self.fused_calls, "prefill_batches": self.prefill_batches,

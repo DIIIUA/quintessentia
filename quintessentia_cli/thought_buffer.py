@@ -498,7 +498,7 @@ class InitialProbabilityAnchor:
         return float(torch.topk(vals, k=k).values.mean().item())
 
 
-class ColibriThoughtBuffer:
+class QuintessentiaThoughtBuffer:
     """Retained initial evidence with optional draft notes and bounded steering.
 
     Both public paths retain the original distribution. Draft notes are explicitly

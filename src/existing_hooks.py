@@ -31,7 +31,7 @@ class ExistingForwardHookAdapter:
     preempt loading, reorder the layers, schedule transfers or mutate buffers.
     """
     def __init__(self, engine, catalog: ExistingCrossLayerCatalog,
-                 backend_name="aircolibri_hf", trace_limit=32768):
+                 backend_name="quintessentia_hf", trace_limit=32768):
         self.engine = engine
         self.catalog = catalog
         self.backend_name = backend_name
@@ -60,7 +60,7 @@ class ExistingForwardHookAdapter:
             root_name = self.engine.layer_names_dict["layer_prefix"].rsplit(".", 1)[0]
             root = self.engine.model.get_submodule(root_name)
             return root, layers
-        if self.backend_name == "aircolibri_hf":
+        if self.backend_name == "quintessentia_hf":
             root = self.engine.model.model
             return root, list(root.layers)
         raise ValueError("Unsupported backend for execution hooks")
@@ -102,7 +102,7 @@ class ExistingForwardHookAdapter:
                     if group not in self.catalog.entries[layer_id]:
                         continue
                     eligible = (isinstance(submodule, nn.Linear)
-                                or type(submodule).__name__ == "ColibriQ4Linear")
+                                or type(submodule).__name__ == "QuintessentiaQ4Linear")
                     is_norm = (group == "norm"
                                and ("Norm" in type(submodule).__name__
                                     or "norm" in type(submodule).__name__))
@@ -117,7 +117,7 @@ class ExistingForwardHookAdapter:
 
             if self.backend_name == "airllm_hf":
                 self._install_airllm_expert_observers()
-            if self.backend_name == "aircolibri_hf":
+            if self.backend_name == "quintessentia_hf":
                 self._wrap_existing_manager_calls()
         except BaseException:
             self.close()

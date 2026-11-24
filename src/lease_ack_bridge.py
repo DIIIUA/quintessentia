@@ -1,4 +1,4 @@
-"""Lease / completion acknowledgement for the EXISTING AirColibri GPURingPipeline.
+"""Lease / completion acknowledgement for the EXISTING Quintessentia GPURingPipeline.
 
 Intercepts its public methods in place without replacing their implementations.
 Acknowledges GPU readiness only after CUDA Event.query() confirms the event.
@@ -323,4 +323,4 @@ class ExistingRingAcknowledgementAdapter:
                     "violations_rejected": self.violations,
                     "uses_original_GPU_pipeline": True,
                     "new_loader_or_CUDA_kernel": False,
-                    "native_Colibri_C_lease_not_implemented": True}
+                    "native_Quintessentia_C_lease_not_implemented": True}

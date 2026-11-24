@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aircolibri_cli.thought_buffer import InitialProbabilityAnchor, AnchorStepTelemetry, ColibriThoughtBuffer
+from quintessentia_cli.thought_buffer import InitialProbabilityAnchor, AnchorStepTelemetry, QuintessentiaThoughtBuffer
 from test_probability_warmup import make_model
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
@@ -15,8 +15,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA requ
 @pytest.mark.parametrize('unified',[False,True,'dynamic'])
 @torch.no_grad()
 def test_anchor_probes_continuation_and_three_banks_match_anchor_only(tmp_path,kind,bits,unified):
-    from src.aircolibri_integrated import AirColibriModel
-    from aircolibri_cli.model_source import open_model_source
+    from src.quintessentia_integrated import QuintessentiaModel
+    from quintessentia_cli.model_source import open_model_source
     make_model(tmp_path,kind)
     expert_bytes=int(3*128*128*(bits/8+4/64))
     budget=8*6*128*128+32*1024**2+8*expert_bytes
@@ -24,7 +24,7 @@ def test_anchor_probes_continuation_and_three_banks_match_anchor_only(tmp_path,k
                 vram_resident_layers=1,num_slots=3,expert_cache_bytes=budget)
     refs=[]
     for joint in (False,True):
-        with AirColibriModel(str(tmp_path),model_source=open_model_source(tmp_path),**kwargs) as engine:
+        with QuintessentiaModel(str(tmp_path),model_source=open_model_source(tmp_path),**kwargs) as engine:
             warm=engine.enable_probability_warmup(region_experts=4,gpu_budget_bytes=2**20,
                                                   unified_memory=bool(unified),dynamic_regions=unified=='dynamic') if joint else None
             u=SimpleNamespace(engine=engine,tokenizer=engine.tokenizer,fast_qwen=False,
@@ -116,7 +116,7 @@ def test_anchor_probes_continuation_and_three_banks_match_anchor_only(tmp_path,k
 @pytest.mark.parametrize('unified',[False,True,'dynamic'])
 def test_public_thought_buffer_entrypoints_with_warmup(tmp_path,monkeypatch,bits,unified):
     from dataclasses import replace
-    from aircolibri_cli import unified_runtime as runtime
+    from quintessentia_cli import unified_runtime as runtime
     make_model(tmp_path,'granitemoe')
     original=runtime.plan_for_checkpoint
     def ring(*args,**kwargs):
@@ -136,11 +136,11 @@ def test_public_thought_buffer_entrypoints_with_warmup(tmp_path,monkeypatch,bits
         checked.append(anchor)
         return out
     monkeypatch.setattr(InitialProbabilityAnchor,'on_prefill_end',observe)
-    with runtime.AirColibriUnifiedEngine(cpu_first=False, model_dir=tmp_path,weight_format=f'q{bits}',enable_mtp=False,
+    with runtime.QuintessentiaUnifiedEngine(cpu_first=False, model_dir=tmp_path,weight_format=f'q{bits}',enable_mtp=False,
                                         verbose=False,max_context_tokens=2048,prefill_chunk_tokens=32) as u:
         warm=u.engine.enable_probability_warmup(region_experts=4,gpu_budget_bytes=2**20,
             unified_memory=bool(unified),dynamic_regions=unified=='dynamic')
-        buffer=ColibriThoughtBuffer(u)
+        buffer=QuintessentiaThoughtBuffer(u)
         result=buffer.ask_anchored([{'role':'user','content':'Remember number 7.'}],max_new_tokens=8)
         assert result['anchor_telemetry']['initial_rows_active']>0
         assert result['metrics']['generated_tokens']>0
@@ -163,14 +163,14 @@ def test_public_thought_buffer_entrypoints_with_warmup(tmp_path,monkeypatch,bits
 @pytest.mark.parametrize('bits',[4,6])
 @torch.no_grad()
 def test_unified_cancel_mid_forward_and_restart(tmp_path,bits):
-    from aircolibri_cli.model_source import open_model_source
-    from aircolibri_cli.unified_runtime import GenerationCancelled
-    from src.aircolibri_integrated import AirColibriModel
+    from quintessentia_cli.model_source import open_model_source
+    from quintessentia_cli.unified_runtime import GenerationCancelled
+    from src.quintessentia_integrated import QuintessentiaModel
     from src.gpu_ring_pipeline import SlotState
     make_model(tmp_path,'granitemoe')
     expert_bytes=int(3*128*128*(bits/8+4/64))
     budget=8*6*128*128+32*2**20+44*expert_bytes
-    with AirColibriModel(str(tmp_path),model_source=open_model_source(tmp_path),
+    with QuintessentiaModel(str(tmp_path),model_source=open_model_source(tmp_path),
             weight_format=f'q{bits}',universal_quantization=True,vram_resident_layers=1,
             num_slots=3,expert_cache_bytes=budget) as engine:
         warm=engine.enable_unified_memory(region_experts=4)

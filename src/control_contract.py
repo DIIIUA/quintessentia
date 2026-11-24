@@ -1,4 +1,4 @@
-"""Non-invasive AirColibri control-plane contract.
+"""Non-invasive Quintessentia control-plane contract.
 
 The backend retains ownership of the real forward, tensors, memory slots,
 CUDA events, expert routing, I/O and state. This module only records events,
@@ -168,12 +168,12 @@ def declared_backend_capabilities() -> dict[str, BackendCapabilities]:
             "airllm_hf", supports_layer_hooks=True, supports_expert_hooks=True,
             supports_live_prefetch_cancel=False, supports_residency_lease=False,
             proof="AirLLMBaseModel._install_streaming_hooks and _setup_expert_streaming"),
-        "aircolibri_hf": BackendCapabilities(
-            "aircolibri_hf", supports_layer_hooks=True, supports_expert_hooks=False,
+        "quintessentia_hf": BackendCapabilities(
+            "quintessentia_hf", supports_layer_hooks=True, supports_expert_hooks=False,
             supports_live_cache_stats=True,
-            proof="AirColibriModel._install_pipeline_hooks + StableWeightManager"),
-        "colibri_native": BackendCapabilities(
-            "colibri_native", supports_layer_hooks=False,
+            proof="QuintessentiaModel._install_pipeline_hooks + StableWeightManager"),
+        "quintessentia_native": BackendCapabilities(
+            "quintessentia_native", supports_layer_hooks=False,
             supports_expert_hooks=False, supports_residency_lease=False,
             supports_native_cuda=True,
             proof="c/tier.h and expert_store.h are C-native, not a Python ABI"),

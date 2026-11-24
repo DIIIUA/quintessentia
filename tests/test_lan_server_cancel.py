@@ -11,8 +11,8 @@ import time
 
 import pytest
 
-from aircolibri_cli.lan_server import AirColibriLANServer
-from aircolibri_cli.unified_runtime import GenerationCancelled
+from quintessentia_cli.lan_server import QuintessentiaLANServer
+from quintessentia_cli.unified_runtime import GenerationCancelled
 
 
 class FakeEngine:
@@ -70,7 +70,7 @@ def server(tmp_path):
 
     def make(engine=None, **kw):
         eng = engine or FakeEngine()
-        srv = AirColibriLANServer(eng, host="127.0.0.1", http_port=0, enable_beacon=False,
+        srv = QuintessentiaLANServer(eng, host="127.0.0.1", http_port=0, enable_beacon=False,
                                   log_file=str(tmp_path / "logs" / "server.log"), **kw)
         srv.start_background()
         servers.append(srv)
@@ -130,7 +130,7 @@ def test_bad_requests_get_clear_errors(server):
 
 
 def test_context_budget_error_is_a_client_error_and_server_recovers(server):
-    from aircolibri_cli.unified_runtime import ContextBudgetExceeded
+    from quintessentia_cli.unified_runtime import ContextBudgetExceeded
     srv, engine = server(engine=FakeEngine(decode_steps=2))
     original = engine.stream_chat
     def oversized(*args, **kwargs):
@@ -177,7 +177,7 @@ def test_stop_endpoint_cancels_running_generation(server):
             break
         data += chunk
     sock.close()
-    assert b"aircolibri_cancelled" in data
+    assert b"quintessentia_cancelled" in data
 
 
 def test_new_request_preempts_old_one_and_never_overlaps(server):

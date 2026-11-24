@@ -5,20 +5,20 @@ from dataclasses import replace
 import pytest
 import torch
 
-from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, ColibriSpecGate
+from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, QuintessentiaSpecGate
 from test_general_speculation import collect, fixed_proposals
 
 
 @pytest.mark.parametrize("case", ["budget", "eos", "cancel"])
 def test_verification_boundaries(tmp_path, monkeypatch, case):
     from test_cpu_independence import tiny_checkpoint
-    from aircolibri_cli.unified_runtime import GenerationCancelled
+    from quintessentia_cli.unified_runtime import GenerationCancelled
     tiny_checkpoint(tmp_path)
-    monkeypatch.setattr(ColibriSpecGate, "pick_depth", lambda self, source, probs: len(probs))
+    monkeypatch.setattr(QuintessentiaSpecGate, "pick_depth", lambda self, source, probs: len(probs))
     prompt = [3, 7, 4, 9]
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", speculation="off", verbose=False) as base:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", speculation="off", verbose=False) as base:
         expected, _ = collect(base, prompt)
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", speculation="lookup", verbose=False) as u:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", speculation="lookup", verbose=False) as u:
         fixed_proposals(u.speculator, expected, len(prompt), "none")
         if case == "budget":
             u.speculator.state_budget_bytes = 1
@@ -54,19 +54,19 @@ def test_verification_boundaries(tmp_path, monkeypatch, case):
 @torch.no_grad()
 def test_verified_routes_anchor_dynamic_three_regions_match_plain(tmp_path, monkeypatch, kind, bits):
     from test_probability_warmup import make_model
-    from aircolibri_cli import unified_runtime as runtime
-    from aircolibri_cli.thought_buffer import InitialProbabilityAnchor
+    from quintessentia_cli import unified_runtime as runtime
+    from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
     make_model(tmp_path, kind)
     original = runtime.plan_for_checkpoint
     def ring(*args, **kwargs):
         profile, plan, mtp = original(*args, **kwargs)
         return profile, replace(plan, full_residency=False, resident_layers=1, ring_slots=3), mtp
     monkeypatch.setattr(runtime, "plan_for_checkpoint", ring)
-    monkeypatch.setattr(ColibriSpecGate, "pick_depth", lambda self, source, probs: len(probs))
+    monkeypatch.setattr(QuintessentiaSpecGate, "pick_depth", lambda self, source, probs: len(probs))
     prompt = [1, 4, 6, 8]
     reference = None
     for mode in ("off", "lookup"):
-        with AirColibriUnifiedEngine(tmp_path, progressive_start=False, weight_format=f"q{bits}",
+        with QuintessentiaUnifiedEngine(tmp_path, progressive_start=False, weight_format=f"q{bits}",
                                       speculation=mode, verbose=False) as u:
             warm = u.engine.enable_probability_warmup(region_experts=4, gpu_budget_bytes=2**20,
                 host_cache_bytes=2**20, unified_memory=True, dynamic_regions=True)
@@ -104,8 +104,8 @@ def test_verified_routes_anchor_dynamic_three_regions_match_plain(tmp_path, monk
 def test_speculative_cpu_work_continues_into_gpu_ring_without_prefix_replay(tmp_path, monkeypatch):
     import threading
     from test_probability_warmup import make_model
-    from aircolibri_cli import unified_runtime as runtime
-    from aircolibri_cli.thought_buffer import InitialProbabilityAnchor
+    from quintessentia_cli import unified_runtime as runtime
+    from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
     make_model(tmp_path, "granitemoe")
     release = threading.Event()
     original = runtime.plan_for_checkpoint
@@ -114,8 +114,8 @@ def test_speculative_cpu_work_continues_into_gpu_ring_without_prefix_replay(tmp_
         profile, plan, mtp = original(*args, **kwargs)
         return profile, replace(plan, resident_layers=2, full_residency=False, ring_slots=3), mtp
     monkeypatch.setattr(runtime, "plan_for_checkpoint", delayed_plan)
-    monkeypatch.setattr(ColibriSpecGate, "pick_depth", lambda self, source, probs: len(probs))
-    u = runtime.AirColibriUnifiedEngine(tmp_path, weight_format="q6", speculation="lookup", verbose=False)
+    monkeypatch.setattr(QuintessentiaSpecGate, "pick_depth", lambda self, source, probs: len(probs))
+    u = runtime.QuintessentiaUnifiedEngine(tmp_path, weight_format="q6", speculation="lookup", verbose=False)
     try:
         pending = u.enable_unified_memory(region_experts=2, host_cache_bytes=2**20)
         anchor = InitialProbabilityAnchor()
@@ -126,7 +126,7 @@ def test_speculative_cpu_work_continues_into_gpu_ring_without_prefix_replay(tmp_
             if calls[0] == 3:
                 release.set()
                 assert u.engine.progressive.backend_ready.wait(30), u.engine.progressive.stats()
-            return [5, 7][:count], [.95]*min(count, 2), ColibriSpecGate.SRC_LOOKUP
+            return [5, 7][:count], [.95]*min(count, 2), QuintessentiaSpecGate.SRC_LOOKUP
         u.speculator.propose = propose
         actual, state = collect(u, [3, 7, 4], count=32)
         assert len(actual) == 32

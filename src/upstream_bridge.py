@@ -1,4 +1,4 @@
-"""Thin bindings to the original AirLLM reader and Colibri C admission policy.
+"""Thin bindings to the original AirLLM reader and Quintessentia C admission policy.
 
 No tensor loader or admission algorithm is reimplemented here. The native
 component controls RAM admission; native model execution is a separate backend.
@@ -174,9 +174,9 @@ class NativeTierPolicy:
 
 
 class PerLayerNativeTierPolicy:
-    """Per-layer Colibri C LFRU policy (c/tier.h) with prefill route warmup and T2 epoch decay.
+    """Per-layer Quintessentia C LFRU policy (c/tier.h) with prefill route warmup and T2 epoch decay.
 
-    Matches upstream Colibri's per-layer repin_pick organization: each decoder
+    Matches upstream Quintessentia's per-layer repin_pick organization: each decoder
     layer owns an independent 64-expert heat/recency table and per-layer slot
     quota so early layers never starve later layers, prefill token frequencies
     populate the hottest experts per layer in a single pass, and tier_decay

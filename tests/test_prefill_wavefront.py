@@ -31,10 +31,10 @@ def llama_folder(tmp_path):
 @pytest.mark.parametrize("fmt,resident", [("bf16", 0), ("q4", 2), ("q6", 0), ("q6", 7)])
 @torch.no_grad()
 def test_wave_matches_chunked_reference_cache_and_decode(llama_folder, fmt, resident):
-    from src.aircolibri_integrated import AirColibriModel
-    from aircolibri_cli.model_source import open_model_source
+    from src.quintessentia_integrated import QuintessentiaModel
+    from quintessentia_cli.model_source import open_model_source
     from src.gpu_ring_pipeline import SlotState
-    with AirColibriModel(str(llama_folder), weight_format=fmt, universal_quantization=True,
+    with QuintessentiaModel(str(llama_folder), weight_format=fmt, universal_quantization=True,
                          vram_resident_layers=resident, num_slots=3, max_ram_layers=7,
                          model_source=open_model_source(llama_folder)) as engine:
         tokens = torch.arange(1, 30).unsqueeze(0)
@@ -61,10 +61,10 @@ def test_wave_matches_chunked_reference_cache_and_decode(llama_folder, fmt, resi
 
 @torch.no_grad()
 def test_cancel_mid_wave_recovers_without_busy_slots(llama_folder):
-    from src.aircolibri_integrated import AirColibriModel
-    from aircolibri_cli.model_source import open_model_source
-    from aircolibri_cli.unified_runtime import GenerationCancelled
-    with AirColibriModel(str(llama_folder), vram_resident_layers=0, num_slots=3,
+    from src.quintessentia_integrated import QuintessentiaModel
+    from quintessentia_cli.model_source import open_model_source
+    from quintessentia_cli.unified_runtime import GenerationCancelled
+    with QuintessentiaModel(str(llama_folder), vram_resident_layers=0, num_slots=3,
                          model_source=open_model_source(llama_folder)) as engine:
         calls = [0]
         def cancel():
@@ -85,14 +85,14 @@ def test_cancel_mid_wave_recovers_without_busy_slots(llama_folder):
 @torch.no_grad()
 def test_unified_wave_session_cancel_and_thought_anchor(llama_folder, monkeypatch):
     from dataclasses import replace
-    from aircolibri_cli import unified_runtime as runtime
-    from aircolibri_cli.thought_buffer import ColibriThoughtBuffer
+    from quintessentia_cli import unified_runtime as runtime
+    from quintessentia_cli.thought_buffer import QuintessentiaThoughtBuffer
     original_plan = runtime.plan_for_checkpoint
     def force_ring(*args, **kwargs):
         profile, plan, mtp = original_plan(*args, **kwargs)
         return profile, replace(plan, full_residency=False, resident_layers=1, ring_slots=3), mtp
     monkeypatch.setattr(runtime, "plan_for_checkpoint", force_ring)
-    with runtime.AirColibriUnifiedEngine(llama_folder, cpu_first=False, weight_format="q6", verbose=False,
+    with runtime.QuintessentiaUnifiedEngine(llama_folder, cpu_first=False, weight_format="q6", verbose=False,
                                         prefill_chunk_tokens=8, prefill_wavefront=True,
                                         enable_mtp=False, max_context_tokens=512) as engine:
         messages = [{"role": "user", "content": "The next operation uses the result of the previous operation. " * 4}]
@@ -109,6 +109,6 @@ def test_unified_wave_session_cancel_and_thought_anchor(llama_folder, monkeypatc
             return count[0] > 12
         with pytest.raises(runtime.GenerationCancelled):
             list(engine.stream_chat(messages, max_new_tokens=3, cancel_check=cancel, use_session_cache=False))
-        anchored = ColibriThoughtBuffer(engine).ask_anchored(messages[:1], max_new_tokens=3)
+        anchored = QuintessentiaThoughtBuffer(engine).ask_anchored(messages[:1], max_new_tokens=3)
         assert anchored["anchor_telemetry"]["total_rows_scored"] > 0
         assert not engine.engine._wavefront_active

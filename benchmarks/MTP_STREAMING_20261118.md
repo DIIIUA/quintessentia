@@ -63,7 +63,7 @@ bitmap модели. Неактуальная необязательная по�
 
 ## Реальный Qwen-прогон
 
-`D:\Air-Colibri Storage\development_20261118\native_qwen_live_1.json`:
+`D:\Quintessentia Storage\development_20261118\native_qwen_live_1.json`:
 GGUF Q4_K_M, внутреннее исполнение Q6, RTX 3060 Ti, шесть CPU-потоков. Для обеих
 сторон принудительно заданы ноль resident layers, три GPU-слота и RAM-кэш весов
 128 МиБ; пик кэша 114.62 МиБ, были реальные вытеснения. Глобальные веса, активные

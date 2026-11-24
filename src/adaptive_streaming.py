@@ -1,5 +1,5 @@
 """Adaptive Cross-Layer Selective Streaming Engine:
-Синтез послойного макро-конвейера AirLLM и поперечного селектора компонентов Colibri.
+Синтез послойного макро-конвейера AirLLM и поперечного селектора компонентов Quintessentia.
 
 Архитектура:
 1. CrossLayerPlanMap: двумерная карта (Слой x Компонент x Время).
@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import torch
 import safetensors
 import safetensors.torch
-from src.lfru_cache import ColibriLFRUCache
+from src.lfru_cache import QuintessentiaLFRUCache
 
 
 class ResidencyTier(Enum):

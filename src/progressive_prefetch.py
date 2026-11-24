@@ -60,7 +60,7 @@ class ThreeBankExpertPrefetch:
         self.consumptions = [0, 0, 0]
         self.trace, self.updates = [], []
         self.step_done = {}
-        self.thread = threading.Thread(target=self._run, name="aircolibri-probability-warmup", daemon=True)
+        self.thread = threading.Thread(target=self._run, name="quintessentia-probability-warmup", daemon=True)
         self.thread.start()
 
     def _check(self):

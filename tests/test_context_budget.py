@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, ContextBudgetExceeded
+from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, ContextBudgetExceeded
 
 
 class Tokenizer:
@@ -15,7 +15,7 @@ class Tokenizer:
 
 
 def test_context_rejects_requested_output_before_allocating_cache():
-    engine = AirColibriUnifiedEngine.__new__(AirColibriUnifiedEngine)
+    engine = QuintessentiaUnifiedEngine.__new__(QuintessentiaUnifiedEngine)
     engine.engine = SimpleNamespace(tokenizer=Tokenizer())
     engine.plan = SimpleNamespace(max_context_tokens=16)
     # No model or CUDA context is needed to reject an oversized request.
@@ -30,7 +30,7 @@ def test_context_rejects_requested_output_before_allocating_cache():
 
 
 def test_cached_chat_is_checked_before_unparking():
-    engine = AirColibriUnifiedEngine.__new__(AirColibriUnifiedEngine)
+    engine = QuintessentiaUnifiedEngine.__new__(QuintessentiaUnifiedEngine)
     engine.engine = SimpleNamespace(tokenizer=Tokenizer())
     engine.plan = SimpleNamespace(max_context_tokens=16)
     engine._session_messages = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "reply"}]

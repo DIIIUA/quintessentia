@@ -1,6 +1,6 @@
-"""Self-contained NVRTC + CUDA Driver API runtime for Colibri fused W4A16 / W6A16 kernels.
+"""Self-contained NVRTC + CUDA Driver API runtime for Quintessentia fused W4A16 / W6A16 kernels.
 
-Compiles `src/native/colibri_fused_quant.cu` once via PyTorch's bundled NVRTC
+Compiles `src/native/quintessentia_fused_quant.cu` once via PyTorch's bundled NVRTC
 (`nvrtc64_*.dll` on Windows / `libnvrtc.so*` on Linux), caches PTX keyed by
 source SHA-256 and target SM capability under `data/native/ptx-cache/`, and
 dispatches kernels directly onto `torch.cuda.current_stream(device)` via
@@ -18,7 +18,7 @@ from typing import Optional
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-CU_SOURCE_PATH = ROOT / "src" / "native" / "colibri_fused_quant.cu"
+CU_SOURCE_PATH = ROOT / "src" / "native" / "quintessentia_fused_quant.cu"
 PTX_CACHE_DIR = ROOT / "data" / "native" / "ptx-cache"
 
 _KERNEL_NAMES = (
@@ -116,7 +116,7 @@ def _compile_or_load_ptx(major: int, minor: int, nvrtc) -> bytes:
     src_bytes = CU_SOURCE_PATH.read_bytes()
     digest = hashlib.sha256(src_bytes).hexdigest()[:16]
     PTX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = PTX_CACHE_DIR / f"colibri_fused_quant_sm{major}{minor}_{digest}.ptx"
+    cache_file = PTX_CACHE_DIR / f"quintessentia_fused_quant_sm{major}{minor}_{digest}.ptx"
     if cache_file.is_file():
         data = cache_file.read_bytes()
         if data.endswith(b"\x00"):
@@ -124,7 +124,7 @@ def _compile_or_load_ptx(major: int, minor: int, nvrtc) -> bytes:
         return data + b"\x00"
 
     prog = ctypes.c_void_p()
-    rc = nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src_bytes, b"colibri_fused_quant.cu", 0, None, None)
+    rc = nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src_bytes, b"quintessentia_fused_quant.cu", 0, None, None)
     if rc != 0:
         raise RuntimeError(f"nvrtcCreateProgram failed with error {rc}")
     try:

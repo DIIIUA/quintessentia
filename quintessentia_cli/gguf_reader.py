@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GGUF reader, pure stdlib.
 
-Vendored from JustVugg/colibri ``tools/gguf_reader.py`` (Apache-2.0). AirColibri
+Vendored from JustVugg/colibri ``tools/gguf_reader.py`` (Apache-2.0). Quintessentia
 uses it to index tensors and metadata. It does not decode the weight blocks.
 
 Parses the binary header, the metadata key/value store and the tensor index of

@@ -1,7 +1,7 @@
 """GGUF's default pre-tokenizer name must respect the vocabulary encoding."""
 import pytest
 from transformers import Gemma2Config, Gemma3TextConfig, NemotronConfig
-from aircolibri_cli.gguf_arch_registry import build_extended_gguf_tokenizer
+from quintessentia_cli.gguf_arch_registry import build_extended_gguf_tokenizer
 
 
 @pytest.mark.parametrize("arch,config_type", [("gemma2", Gemma2Config),

@@ -27,8 +27,8 @@ def main():
     args = p.parse_args()
     import torch
     import psutil
-    from aircolibri_cli import unified_runtime as runtime
-    from aircolibri_cli.thought_buffer import InitialProbabilityAnchor
+    from quintessentia_cli import unified_runtime as runtime
+    from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
     torch.set_num_threads(6)
     original = runtime.plan_for_checkpoint
     original_ram_budget = runtime._streaming_ram_budget_bytes
@@ -47,7 +47,7 @@ def main():
               if f.suffix in (".gguf", ".safetensors")}
     sources = ["src/general_speculation.py", "src/native_mtp.py", "src/rowwise_verification.py",
                "src/route_exclusion.py", "src/progressive_execution.py", "src/probability_warmup.py",
-               "aircolibri_cli/unified_runtime.py", "benchmarks/general_speculation.py"]
+               "quintessentia_cli/unified_runtime.py", "benchmarks/general_speculation.py"]
     report = dict(model=name, device_choice=args.device, checkpoint_bytes=sum(s[0] for s in stamps.values()),
                   protocol=__doc__, cpu_threads=6,
                   sources={s: hashlib.sha256((ROOT/s).read_bytes()).hexdigest() for s in sources}, results=[])
@@ -58,7 +58,7 @@ def main():
         started = time.perf_counter()
         print(f"START {name} {mode}", flush=True)
         try:
-            u = runtime.AirColibriUnifiedEngine(folder, device=args.device,
+            u = runtime.QuintessentiaUnifiedEngine(folder, device=args.device,
                 progressive_start=args.device == "cpu", weight_format="q6", speculation=mode,
                 mtp_head_path=head if mode == "native" else None, verbose=False,
                 max_context_tokens=256, prefill_chunk_tokens=16)

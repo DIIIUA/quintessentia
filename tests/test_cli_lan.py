@@ -2,15 +2,15 @@
 import json
 import socket
 
-from aircolibri_cli.cli import build_parser
-from aircolibri_cli.lan_server import (
+from quintessentia_cli.cli import build_parser
+from quintessentia_cli.lan_server import (
     DISCOVER_MAGIC,
     UDPLANBeacon,
     _subnet_broadcast_targets,
     detect_lan_ips,
     format_connection_passport,
 )
-from aircolibri_cli.unified_runtime import _IncrementalThinkSplitter, colibri_spec_lookup
+from quintessentia_cli.unified_runtime import _IncrementalThinkSplitter, quintessentia_spec_lookup
 
 
 def _run_splitter(chunks, start_in_thinking=True):
@@ -38,8 +38,8 @@ def test_think_splitter_without_thinking_phase():
 
 def test_spec_lookup_proposes_tokens_after_repeated_suffix():
     history = [1, 2, 3, 4, 9, 9, 1, 2, 3]
-    assert colibri_spec_lookup(history, max_drafts=2) == [4, 9]
-    assert colibri_spec_lookup([1, 2], max_drafts=2) == []
+    assert quintessentia_spec_lookup(history, max_drafts=2) == [4, 9]
+    assert quintessentia_spec_lookup([1, 2], max_drafts=2) == []
 
 
 def test_lan_helpers_and_passport():
@@ -56,7 +56,7 @@ def test_lan_helpers_and_passport():
             "local_web_url": "http://127.0.0.1:8787",
             "lan_web_url": "http://192.168.1.2:8787",
             "openai_base_url": "http://192.168.1.2:8787/v1",
-            "api_key": "colibri-local",
+            "api_key": "quintessentia-local",
             "require_auth": False,
             "lan_ip": "192.168.1.2",
             "all_lan_ips": ["192.168.1.2"],
@@ -64,14 +64,14 @@ def test_lan_helpers_and_passport():
             "beacon_port": 8788,
         }
     )
-    assert "http://192.168.1.2:8787/v1" in text and "colibri-local" in text
+    assert "http://192.168.1.2:8787/v1" in text and "quintessentia-local" in text
 
 
 def test_udp_beacon_answers_discovery_probe():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tmp:
         tmp.bind(("127.0.0.1", 0))
         port = tmp.getsockname()[1]
-    beacon = UDPLANBeacon(lambda: {"service": "aircolibri", "http_port": 8787}, ["127.0.0.1"], beacon_port=port, interval_s=60)
+    beacon = UDPLANBeacon(lambda: {"service": "quintessentia", "http_port": 8787}, ["127.0.0.1"], beacon_port=port, interval_s=60)
     beacon.start()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as cli:
@@ -80,7 +80,7 @@ def test_udp_beacon_answers_discovery_probe():
             while True:
                 data, _ = cli.recvfrom(4096)
                 info = json.loads(data.decode("utf-8"))
-                if info.get("service") == "aircolibri":
+                if info.get("service") == "quintessentia":
                     break
         assert info["http_port"] == 8787
     finally:

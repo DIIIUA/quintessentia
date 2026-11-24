@@ -1,8 +1,8 @@
-"""Model discovery and weight sources for AirColibri.
+"""Model discovery and weight sources for Quintessentia.
 
 Three on-disk formats are supported:
 
-* ``colibri`` — the per-layer container (``config.hf.json``, ``model-00000.safetensors`` …
+* ``quintessentia`` — the per-layer container (``config.hf.json``, ``model-00000.safetensors`` …
   ``model-globals.safetensors``, optional ``model-mtp.safetensors``).
 * ``hf`` — a standard Hugging Face download (``config.json`` + ``model.safetensors.index.json``
   + ``model-00001-of-0000N.safetensors``, or a single ``model.safetensors``). Shards are read
@@ -35,7 +35,7 @@ import threading
 import types
 from typing import Any, Iterable
 
-from aircolibri_cli.gguf_reader import (
+from quintessentia_cli.gguf_reader import (
     GGML_TYPE_BF16,
     GGML_TYPE_F16,
     GGML_TYPE_F32,
@@ -63,7 +63,7 @@ from aircolibri_cli.gguf_reader import (
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
 SUPPORTED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5")
 
-# aircolibri_cli/kernels.py specializes the fused Q4 kernels to this geometry.
+# quintessentia_cli/kernels.py specializes the fused Q4 kernels to this geometry.
 # A Qwen3.5 hybrid whose config differs stays on the BF16 ring instead of a wrong kernel.
 FAST_KERNEL_FIELDS = {
     "hidden_size": 4096,
@@ -242,10 +242,10 @@ def _single_hf_safetensors(model_dir: Path) -> Path | None:
 
 
 def detect_format(model_dir: str | Path) -> str | None:
-    """Returns ``"colibri"``, ``"hf"``, ``"gguf"`` or ``None`` for an unrecognised folder."""
+    """Returns ``"quintessentia"``, ``"hf"``, ``"gguf"`` or ``None`` for an unrecognised folder."""
     d = Path(model_dir)
     if (d / "config.hf.json").is_file() and (d / "model-00000.safetensors").is_file():
-        return "colibri"
+        return "quintessentia"
     if (d / "config.json").is_file() and (
         (d / "model.safetensors.index.json").is_file() or _single_hf_safetensors(d) is not None
     ):
@@ -257,7 +257,7 @@ def detect_format(model_dir: str | Path) -> str | None:
 
 def find_gguf_files(model_dir: str | Path) -> list[Path]:
     """Returns the single ``.gguf`` file or ordered split ``.gguf`` shards (ignoring ``mmproj``)."""
-    from aircolibri_cli.gguf_arch_registry import find_gguf_files as _find_files
+    from quintessentia_cli.gguf_arch_registry import find_gguf_files as _find_files
 
     return _find_files(model_dir, error_cls=UnsupportedModelError)
 
@@ -326,7 +326,7 @@ def _read_gguf_shards_cached(gguf_paths: list[Path]) -> tuple[dict[str, Any], li
 
 def _validate_gguf_header(gguf_path: Path) -> str:
     """Validates GGUF binary header with pure positioned I/O (no mmap) and checks arch support."""
-    from aircolibri_cli.gguf_arch_registry import is_extended_gguf_arch_supported
+    from quintessentia_cli.gguf_arch_registry import is_extended_gguf_arch_supported
 
     meta, _ = _read_gguf_header_cached(gguf_path)
     arch = str(meta.get("general.architecture") or "")
@@ -456,7 +456,7 @@ def runtime_profile(model_dir: str | Path) -> dict[str, Any]:
 
 
 def is_qwen35_hybrid(model_dir: str | Path) -> bool:
-    """True for the fast path: dense safetensors/Colibri Qwen3.5 text with GatedDeltaNet layers."""
+    """True for the fast path: dense safetensors/Quintessentia Qwen3.5 text with GatedDeltaNet layers."""
     if detect_format(model_dir) == "gguf":
         return False
     try:
@@ -492,7 +492,7 @@ def check_supported(model_dir: str | Path) -> None:
     fmt = detect_format(model_dir)
     if fmt is None:
         raise UnsupportedModelError(
-            f"{model_dir}: no Colibri container, Hugging Face safetensors checkpoint, or GGUF file found"
+            f"{model_dir}: no Quintessentia container, Hugging Face safetensors checkpoint, or GGUF file found"
         )
     if fmt == "gguf":
         src = GGUFModelSource(model_dir)
@@ -502,7 +502,7 @@ def check_supported(model_dir: str | Path) -> None:
         cfg = raw_text_config_dict(model_dir)
     except (OSError, json.JSONDecodeError) as exc:
         raise UnsupportedModelError(f"{model_dir}: unreadable config ({exc})") from exc
-    if fmt == "colibri":
+    if fmt == "quintessentia":
         _require_qwen35_hybrid(model_dir, cfg)
         return
     if is_qwen35_hybrid(model_dir):
@@ -530,7 +530,7 @@ def load_text_config(model_dir: str | Path):
     d = Path(model_dir)
     cfg_dict = raw_text_config_dict(d)
     _require_qwen35_hybrid(d, cfg_dict)
-    if detect_format(d) == "colibri":
+    if detect_format(d) == "quintessentia":
         return AutoConfig.from_pretrained(str(d), config_file="config.hf.json")
     if cfg_dict.get("model_type") in ("qwen3_5", "qwen3_5_text"):
         kwargs = {k: v for k, v in cfg_dict.items() if k not in ("model_type", "transformers_version")}
@@ -549,7 +549,7 @@ def load_runtime_config(model_dir: str | Path):
         gguf_paths = find_gguf_files(d)
         _validate_gguf_header(gguf_paths[0])
         from transformers import AutoConfig
-        from aircolibri_cli.gguf_arch_registry import build_gguf_config_dict
+        from quintessentia_cli.gguf_arch_registry import build_gguf_config_dict
 
         try:
             meta, raw_tensors = _read_gguf_shards_cached(gguf_paths)
@@ -587,7 +587,7 @@ def load_runtime_tokenizer(model_dir: str | Path, config: Any = None):
     if detect_format(d) == "gguf":
         gguf_paths = find_gguf_files(d)
         _validate_gguf_header(gguf_paths[0])
-        from aircolibri_cli.gguf_arch_registry import build_extended_gguf_tokenizer
+        from quintessentia_cli.gguf_arch_registry import build_extended_gguf_tokenizer
 
         cfg = config if config is not None else load_runtime_config(d)
         meta, _ = _read_gguf_shards_cached(gguf_paths)
@@ -622,14 +622,14 @@ def local_model_candidates(root):
     result = {}
     for p in folders:
         if p.is_dir() and not p.name.startswith("_") and (detect_format(p) or
-                (p/"aircolibri-source.json").is_file() or any(p.glob("*.bin"))):
+                (p/"quintessentia-source.json").is_file() or any(p.glob("*.bin"))):
             result[str(p.resolve()).casefold()] = p.resolve()
     return sorted(result.values(), key=lambda p: (p.name.casefold(), str(p).casefold()))
 
 
 def runtime_model_dir(folder):
     folder = Path(folder)
-    marker = folder/"aircolibri-source.json"
+    marker = folder/"quintessentia-source.json"
     if marker.is_file():
         relative = _read_json(marker).get("runtime_subdir", ".")
         target = (folder/relative).resolve()
@@ -725,7 +725,7 @@ def hf_snapshot(repo_id: str, allow_download: bool, *, local_dir=None, filename=
     if reference.revision:
         options["revision"] = reference.revision
     if local_dir is not None:
-        options.update(local_dir=str(local_dir), ignore_patterns=["aircolibri-source.json", "*/aircolibri-source.json"])
+        options.update(local_dir=str(local_dir), ignore_patterns=["quintessentia-source.json", "*/quintessentia-source.json"])
     metadata = ["*.json", "*.jinja", "*.txt", "*.model", "tokenizer*"]
     patterns = metadata + (selected or ["*.safetensors"])
     try:
@@ -759,7 +759,7 @@ def hf_snapshot(repo_id: str, allow_download: bool, *, local_dir=None, filename=
         if set(selected)-set(files):
             raise ModelNotFoundError(f"Incomplete GGUF split in {repo_id}")
     patterns = metadata + (selected or ["*.safetensors"])
-    print(f"[AirColibri] Downloading {repo_id}; runtime adaptation and packing follow automatically on load...", flush=True)
+    print(f"[Quintessentia] Downloading {repo_id}; runtime adaptation and packing follow automatically on load...", flush=True)
     try:
         downloaded = Path(snapshot_download(repo_id, allow_patterns=patterns, **options))
     except (HfHubHTTPError, OfflineModeIsEnabled, OSError) as exc:
@@ -776,10 +776,10 @@ def hf_snapshot(repo_id: str, allow_download: bool, *, local_dir=None, filename=
 def resolve_model_dir(model: str | Path | None, root: str | Path, allow_download: bool = False) -> Path:
     """Resolves ``--model`` (folder or Hugging Face repo id) or auto-detects a supported local model.
 
-    Order: explicit value → ``AIRCOLIBRI_MODEL`` → runnable folders in ``<root>/models``
+    Order: explicit value → ``QUINTESSENTIA_MODEL`` → runnable folders in ``<root>/models``
     (Qwen3.5 first) → a cached ``Qwen/Qwen3.5-9B`` snapshot.
     """
-    value = str(model) if model else os.environ.get("AIRCOLIBRI_MODEL")
+    value = str(model) if model else os.environ.get("QUINTESSENTIA_MODEL")
     if value:
         p = Path(value).expanduser()
         if p.exists():
@@ -795,7 +795,7 @@ def resolve_model_dir(model: str | Path | None, root: str | Path, allow_download
             choices = local_model_candidates(root)
             index = int(value)-1
             if not 0 <= index < len(choices):
-                raise ModelNotFoundError("Model number is outside the current `aircolibri models` list")
+                raise ModelNotFoundError("Model number is outside the current `quintessentia models` list")
             selected = runtime_model_dir(choices[index])
             check_supported(selected)
             return selected.resolve()
@@ -1153,7 +1153,7 @@ class _ParallelSliceStagingPool:
                 self._read_one(t, view)
         else:
             if self._pool is None:
-                self._pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="aircolibri-moe-io")
+                self._pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="quintessentia-moe-io")
             list(self._pool.map(lambda t: self._read_one(t, view), tasks))
 
         src_u8 = self._slots[idx][:total_bytes]
@@ -1354,7 +1354,7 @@ def _get_nvrtc_gguf_kernels(device: Any):
         if dev_idx in _NVRTC_GGUF_MODS:
             return _NVRTC_GGUF_MODS[dev_idx]
         try:
-            from src.colibri_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
+            from src.quintessentia_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
 
             nvcuda, nvrtc = _load_driver_and_nvrtc()
             with torch.cuda.device(dev_idx):
@@ -2414,7 +2414,7 @@ class _GGUFGlobalsMap(collections.abc.MutableMapping):
 def _apply_shape_ops(torch_shape: tuple[int, ...], operations: Iterable[Any]) -> tuple[int, ...]:
     """Computes the target PyTorch shape after 1-to-1 GGUF ``ConversionOps`` (without reading bytes)."""
     from transformers.integrations.gguf.gguf_conversion_mapping import Unsqueeze
-    from aircolibri_cli.gguf_arch_registry import Transpose2D
+    from quintessentia_cli.gguf_arch_registry import Transpose2D
 
     shape = tuple(torch_shape)
     for op in operations:
@@ -2719,7 +2719,7 @@ class GGUFModelSource:
     def __init__(self, model_dir: str | Path):
         from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
         from transformers.integrations.gguf.dequant import GGML_BLOCK
-        from aircolibri_cli.gguf_arch_registry import get_extended_gguf_mapping
+        from quintessentia_cli.gguf_arch_registry import get_extended_gguf_mapping
 
         self.model_dir = Path(model_dir).resolve()
         if detect_format(self.model_dir) != "gguf":
@@ -3255,16 +3255,16 @@ class GGUFModelSource:
 
 
 def open_model_source(model_dir: str | Path):
-    """Returns ``HFShardedSource`` or ``GGUFModelSource``; ``None`` for Colibri containers."""
+    """Returns ``HFShardedSource`` or ``GGUFModelSource``; ``None`` for Quintessentia containers."""
     fmt = detect_format(model_dir)
     if fmt == "hf":
         quant = raw_text_config_dict(model_dir).get("quantization_config") or {}
         if quant.get("quant_method") in {"fp8", "awq", "gptq"}:
-            from aircolibri_cli.hf_quantized_source import HFQuantizedSource
+            from quintessentia_cli.hf_quantized_source import HFQuantizedSource
             return HFQuantizedSource(model_dir)
         return HFShardedSource(model_dir)
     if fmt == "gguf":
         return GGUFModelSource(model_dir)
-    if fmt == "colibri":
+    if fmt == "quintessentia":
         return None
     raise UnsupportedModelError(f"{model_dir}: unrecognised model folder")

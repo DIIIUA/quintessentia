@@ -1,6 +1,6 @@
-"""Colibri LFRU (Least Frequently / Recently Used) Expert Cache Algorithm.
+"""Quintessentia LFRU (Least Frequently / Recently Used) Expert Cache Algorithm.
 
-Direct port of tier.h admission logic from Colibri:
+Direct port of tier.h admission logic from Quintessentia:
 - tier_should_promote(hot, cold): 25% margin + 4 threshold prevents ping-pong thrashing.
 - tier_lfru_score(heat, last, clock): frequency is primary signal (8-bit shifted),
   recency (0-255) breaks ties without displacing genuinely hotter experts.
@@ -18,8 +18,8 @@ class ExpertSlot:
     is_dirty: bool = False
 
 
-class ColibriLFRUCache:
-    """Manages expert slot allocation in VRAM using Colibri's tier.h LFRU strategy."""
+class QuintessentiaLFRUCache:
+    """Manages expert slot allocation in VRAM using Quintessentia's tier.h LFRU strategy."""
 
     def __init__(self, num_slots: int, num_experts: int, decay_interval: int = 100):
         if num_slots < 0 or num_experts < 1 or decay_interval < 1:

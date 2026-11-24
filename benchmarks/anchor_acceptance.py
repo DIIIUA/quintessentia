@@ -31,11 +31,11 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
     import torch
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
-    from aircolibri_cli.thought_buffer import InitialProbabilityAnchor
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
+    from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
     torch.set_num_threads(6)
     digest=hashlib.sha256()
-    for directory in ('aircolibri_cli','src'):
+    for directory in ('quintessentia_cli','src'):
         for file in sorted((ROOT/directory).rglob('*')):
             if file.suffix in ('.py','.cu','.h','.c'):
                 digest.update(file.relative_to(ROOT).as_posix().encode())
@@ -62,7 +62,7 @@ def main():
         matches=list((ROOT/'models').glob(prefix+'_*'))
         if len(matches)!=1:raise ValueError(f'Ambiguous/missing model prefix: {prefix}')
         model=matches[0]
-        with AirColibriUnifiedEngine(model_dir=model,weight_format=args.weight_format,enable_mtp=False,
+        with QuintessentiaUnifiedEngine(model_dir=model,weight_format=args.weight_format,enable_mtp=False,
                 verbose=False,max_context_tokens=2048,prefill_chunk_tokens=64) as engine:
             for name,prompt,expected in CASES:
                 row=dict(model=model.name,case=name,prompt=prompt,expected=expected)

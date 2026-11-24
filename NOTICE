@@ -1,8 +1,8 @@
-AirColibri
-Copyright 2026 AirColibri contributors
+Quintessentia
+Copyright 2026 Quintessentia contributors
 
-AirColibri is an independent experimental integration maintained at
-https://github.com/DIIIUA/air-colibri .
+Quintessentia is an independent experimental integration maintained at
+https://github.com/DIIIUA/quintessentia .
 
 AirLLM is developed by Gavin Li (lyogavin) and contributors.
 https://github.com/lyogavin/airllm
@@ -11,12 +11,12 @@ Colibrì is developed by Vincenzo Fornaro (JustVugg) and contributors.
 Copyright 2026 Vincenzo Fornaro, as stated in the upstream license.
 https://github.com/JustVugg/colibri
 
-AirColibri reimplements selected AirLLM and Colibrì mechanisms (layer
+Quintessentia reimplements selected AirLLM and Colibrì mechanisms (layer
 streaming, tiered placement, MTP speculation). Upstream sources are not
 vendored here. An optional native tier library, when present locally, is
 built from Colibrì's original tier.h; its license and notice apply to it.
 
-The AirColibri project mark is an AI-assisted visual adaptation inspired by
+The Quintessentia project mark is an AI-assisted visual adaptation inspired by
 AirLLM's rocket and Colibrì's pixel hummingbird. Original marks and names
 remain associated with their respective authors. This integration and its
 mark do not imply upstream endorsement. See assets/README.md for sources.

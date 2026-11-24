@@ -1,6 +1,6 @@
-/* Fused Colibri Affine Quantization CUDA Kernels (W4A16 & W6A16, BF16 I/O).
+/* Fused Quintessentia Affine Quantization CUDA Kernels (W4A16 & W6A16, BF16 I/O).
  *
- * Implements zero-scratch register-level dequantization using Colibri's
+ * Implements zero-scratch register-level dequantization using Quintessentia's
  * grouped affine identity (`affine_quant.h`):
  *   sum_{j=0..GS-1} (scale * q_j + zero) * x_j = scale * sum(q_j * x_j) + zero * sum(x_j)
  *
@@ -627,7 +627,7 @@ extern "C" __global__ void f32_to_bf16_vec(
 }
 
 /* ============================================================================
- * 6. Dense Linear W4A16 GEMV/Small-Batch GEMM (for Qwen3.5-9B ColibriQ4Linear)
+ * 6. Dense Linear W4A16 GEMV/Small-Batch GEMM (for Qwen3.5-9B QuintessentiaQ4Linear)
  *    Computes y[M, N] = x[M, K] @ dequant(W[N, K])^T + bias[N] for small M.
  * ============================================================================ */
 extern "C" __global__ void dense_gemv_q6_bf16(

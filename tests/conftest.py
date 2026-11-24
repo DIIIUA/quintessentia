@@ -24,13 +24,13 @@ def _release_runtime_memory(reset_peak: bool = False) -> None:
 
 @pytest.fixture
 def engine_factory():
-    """Creates AirColibri engine/cache objects and guarantees deterministic cleanup."""
+    """Creates Quintessentia engine/cache objects and guarantees deterministic cleanup."""
     created = []
 
     def make(*args, cls=None, **kwargs):
         if cls is None:
-            from src.aircolibri_engine import AirColibriEngine
-            cls = AirColibriEngine
+            from src.quintessentia_engine import QuintessentiaEngine
+            cls = QuintessentiaEngine
         obj = cls(*args, **kwargs)
         created.append(obj)
         return obj

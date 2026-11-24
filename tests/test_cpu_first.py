@@ -19,7 +19,7 @@ def test_cache_transfer_preserves_metadata_aliases_and_all_state_kinds():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_optional_recurrent_anchor_can_keep_cpu_original_after_gpu_adoption():
-    from aircolibri_cli.thought_buffer import blend_recurrent_anchor
+    from quintessentia_cli.thought_buffer import blend_recurrent_anchor
     original = torch.ones(2, 3)
     snapshot = SimpleNamespace(rec_states={0: original})
     live = torch.zeros(1, 2, 3, device="cuda")
@@ -76,9 +76,9 @@ def test_cpu_expert_payload_moves_to_gpu_without_second_read_or_quantization(bit
 def test_common_start_and_readiness_handoff_preserve_state(tmp_path, bits):
     from transformers import LlamaConfig, LlamaForCausalLM
     from test_model_source import _write_tiny_hf_tokenizer
-    from aircolibri_cli.model_source import open_model_source, PreadSafetensorsReader
-    from aircolibri_cli.unified_runtime import plan_for_checkpoint
-    from src.aircolibri_integrated import AirColibriModel
+    from quintessentia_cli.model_source import open_model_source, PreadSafetensorsReader
+    from quintessentia_cli.unified_runtime import plan_for_checkpoint
+    from src.quintessentia_integrated import QuintessentiaModel
 
     torch.set_num_threads(6)
     torch.manual_seed(451)
@@ -105,7 +105,7 @@ def test_common_start_and_readiness_handoff_preserve_state(tmp_path, bits):
 
     source = open_model_source(tmp_path)
     reader = PreadSafetensorsReader()
-    engine = AirColibriModel(str(tmp_path), model_source=source, weight_reader=reader,
+    engine = QuintessentiaModel(str(tmp_path), model_source=source, weight_reader=reader,
                              cpu_first_plan=plan, weight_format=f"q{bits}",
                              universal_quantization=True, vram_resident_layers=0,
                              max_ram_layers=2, max_ram_bytes=8*1024**2)
@@ -147,7 +147,7 @@ def test_common_start_and_readiness_handoff_preserve_state(tmp_path, bits):
         gpu_source = open_model_source(tmp_path)
         gpu_reader = PreadSafetensorsReader()
         try:
-            with AirColibriModel(str(tmp_path), model_source=gpu_source, weight_reader=gpu_reader,
+            with QuintessentiaModel(str(tmp_path), model_source=gpu_source, weight_reader=gpu_reader,
                                   weight_format=f"q{bits}", universal_quantization=True,
                                   vram_resident_layers=5) as reference:
                 expected, ref_past = reference._forward_step(torch.tensor([[3, 7, 4]]))
@@ -169,7 +169,7 @@ def test_common_start_and_readiness_handoff_preserve_state(tmp_path, bits):
 def test_public_common_start_does_not_order_devices_or_wait_for_gpu(tmp_path, monkeypatch):
     from transformers import LlamaConfig, LlamaForCausalLM, AutoModelForCausalLM
     from test_model_source import _write_tiny_hf_tokenizer
-    import aircolibri_cli.unified_runtime as runtime
+    import quintessentia_cli.unified_runtime as runtime
     LlamaForCausalLM(LlamaConfig(vocab_size=259, hidden_size=64, intermediate_size=128,
                                 num_hidden_layers=2, num_attention_heads=2,
                                 num_key_value_heads=2)).save_pretrained(tmp_path)
@@ -181,7 +181,7 @@ def test_public_common_start_does_not_order_devices_or_wait_for_gpu(tmp_path, mo
         assert release_gpu.wait(30)
         return original_plan(*args, **kwargs)
     monkeypatch.setattr(runtime, "plan_for_checkpoint", blocked_gpu_plan)
-    engine = runtime.AirColibriUnifiedEngine(tmp_path, enable_mtp=False, verbose=False)
+    engine = runtime.QuintessentiaUnifiedEngine(tmp_path, enable_mtp=False, verbose=False)
     try:
         assert gpu_entered.wait(10)
         assert engine.engine.progressive.cpu_layers == 0
@@ -211,8 +211,8 @@ def test_public_common_start_does_not_order_devices_or_wait_for_gpu(tmp_path, mo
 def test_cpu_prefill_map_survives_ring_and_thought_anchor_handoff(tmp_path, monkeypatch, bits):
     from dataclasses import replace
     from test_probability_warmup import make_model
-    import aircolibri_cli.unified_runtime as runtime
-    from aircolibri_cli.thought_buffer import InitialProbabilityAnchor
+    import quintessentia_cli.unified_runtime as runtime
+    from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
     make_model(tmp_path, "granitemoe")
     original = runtime.plan_for_checkpoint
     def streaming(*args, **kwargs):
@@ -220,7 +220,7 @@ def test_cpu_prefill_map_survives_ring_and_thought_anchor_handoff(tmp_path, monk
         return profile, replace(plan, resident_layers=2, ring_slots=3,
                                 full_residency=False), mtp
     monkeypatch.setattr(runtime, "plan_for_checkpoint", streaming)
-    with runtime.AirColibriUnifiedEngine(tmp_path, weight_format=f"q{bits}",
+    with runtime.QuintessentiaUnifiedEngine(tmp_path, weight_format=f"q{bits}",
                                          enable_mtp=False, verbose=False) as u:
         pending = u.enable_unified_memory(region_experts=2, host_cache_bytes=2**20)
         anchor = InitialProbabilityAnchor()
@@ -258,13 +258,13 @@ def test_recurrent_and_sliding_state_survives_progressive_start(tmp_path, family
     from transformers import AutoModelForCausalLM
     from test_session_state import tiny_config
     from test_model_source import _write_tiny_hf_tokenizer
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, _cache_seq_len
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, _cache_seq_len
     config = tiny_config(family)
     config.vocab_size = 259
     AutoModelForCausalLM.from_config(config, dtype=torch.bfloat16).save_pretrained(tmp_path)
     _write_tiny_hf_tokenizer(tmp_path, vocab_size=259)
     actual = []
-    with AirColibriUnifiedEngine(tmp_path, weight_format="bf16", max_context_tokens=128,
+    with QuintessentiaUnifiedEngine(tmp_path, weight_format="bf16", max_context_tokens=128,
                                  enable_mtp=False, verbose=False) as u:
         past = None
         sequences = [[3, 7, 4, 9], *[[i+3] for i in range(20)]]
@@ -275,7 +275,7 @@ def test_recurrent_and_sliding_state_survives_progressive_start(tmp_path, family
                 assert u.engine.progressive.backend_ready.wait(30), u.engine.progressive.stats()
         assert u.engine.progressive.complete, u.engine.progressive.stats()
         length = _cache_seq_len(past)
-    with AirColibriUnifiedEngine(tmp_path, weight_format="bf16", cpu_first=False,
+    with QuintessentiaUnifiedEngine(tmp_path, weight_format="bf16", cpu_first=False,
                                  max_context_tokens=128, enable_mtp=False, verbose=False) as ref:
         past = None
         for tokens, observed in zip(sequences, actual):
@@ -290,7 +290,7 @@ def test_cancel_drains_preparation_and_next_request_can_take_over(tmp_path):
     from transformers import LlamaConfig, LlamaForCausalLM
     from transformers.convert_slow_tokenizer import bytes_to_unicode
     from test_model_source import _write_tiny_hf_tokenizer
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, GenerationCancelled
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, GenerationCancelled
     LlamaForCausalLM(LlamaConfig(vocab_size=259, hidden_size=128, intermediate_size=256,
                                 num_hidden_layers=5, num_attention_heads=4,
                                 num_key_value_heads=2)).save_pretrained(tmp_path)
@@ -301,7 +301,7 @@ def test_cancel_drains_preparation_and_next_request_can_take_over(tmp_path):
     tokenizer = json.loads(token_path.read_text(encoding="utf-8"))
     tokenizer["model"]["vocab"] = {"<eos>": 0, **{c: i+1 for i, c in enumerate(bytes_to_unicode().values())}}
     token_path.write_text(json.dumps(tokenizer), encoding="utf-8")
-    with AirColibriUnifiedEngine(tmp_path, enable_mtp=False, verbose=False,
+    with QuintessentiaUnifiedEngine(tmp_path, enable_mtp=False, verbose=False,
                                  prefill_chunk_tokens=4, max_context_tokens=128) as u:
         with pytest.raises(GenerationCancelled):
             list(u.stream_chat([{"role": "user", "content": "Hi"}], max_new_tokens=8,

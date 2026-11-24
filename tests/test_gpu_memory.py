@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aircolibri_cli import gpu_memory
+from quintessentia_cli import gpu_memory
 
 
 @pytest.mark.parametrize("driver_free,cuda_free,expected", [(4,7,4), (6,3,3), (0,7,0)])
@@ -39,7 +39,7 @@ def test_optional_nvml_failure_keeps_cuda_with_diagnostic(monkeypatch):
 
 
 def test_physical_budget_changes_residency_without_changing_kv_reserve(monkeypatch):
-    from aircolibri_cli.unified_runtime import plan_vram, GiB, MiB
+    from quintessentia_cli.unified_runtime import plan_vram, GiB, MiB
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (7*GiB, 8*GiB))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(uuid="uuid"))
     plans = []

@@ -55,7 +55,7 @@ CUDA's free counter stayed around 6.90 GiB while a separate process held 2 GiB;
 `nvidia-smi` reflected the additional occupied memory. That first run is retained
 locally as diagnostic evidence and is not the table above.
 
-`aircolibri_cli/gpu_memory.py` now queries the matching GPU by CUDA UUID through
+`quintessentia_cli/gpu_memory.py` now queries the matching GPU by CUDA UUID through
 NVML and uses **min(CUDA free, NVML free)**. GPU-first startup, progressive GPU
 preparation and `doctor` share this helper. Status reports both counters and the
 source; optional NVML failure retains the CUDA reading with an explicit diagnostic.

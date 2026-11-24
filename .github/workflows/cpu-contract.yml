@@ -26,9 +26,9 @@ jobs:
           python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install accelerate==1.15.0 transformers==5.22.2 safetensors==0.8.0 huggingface-hub==2.4.0 psutil==7.2.2 pytest==9.2.0 numpy==2.5.4
       - name: Check source syntax
-        run: python -m compileall -q aircolibri_cli src tests aircolibri.py
+        run: python -m compileall -q quintessentia_cli src tests quintessentia.py
       - name: CLI smoke check
-        run: python aircolibri.py --help
+        run: python quintessentia.py --help
       - name: Run CPU tests
         # GPU and local-model tests skip on this runner; this is not a GPU or performance certification.
         run: python -m pytest tests -q

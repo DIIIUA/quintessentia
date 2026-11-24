@@ -670,3 +670,72 @@ def test_m7_mirror_speculation_reversible_draft_scar_and_kernel6_anchor():
         st_rec = m7.record_verification(proposed=m7._current_cap, accepted=m7._current_cap, position=11 + step, drafts=[1, 2, 3][:m7._current_cap], verified_token=1)
         assert st_rec == "EQUAL"
     assert m7.pick_depth([0.92, 0.88, 0.85], 3) == 3
+
+
+def test_m8_mirror_thought_buffer_immutable_phi0_split_leaves_and_zero_force():
+    """M8: canonical L4 MirrorThoughtBuffer — immutable Phi0, exact Gamma_scar, SPLIT leaf, zero-force orthogonality."""
+    from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
+
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    anchor = InitialProbabilityAnchor(mirror_mode=True)
+
+    # Seed initial immutable Phi0 (64-token vocabulary)
+    phi0 = torch.zeros(64, dtype=torch.float32, device=dev)
+    phi0[10] = 2.0
+    phi0[11] = 1.5
+    phi0[20] = -1.0
+    anchor.phi0 = phi0.clone()
+    anchor.phi_buf = phi0.clone()
+    fp0 = anchor.initial_fingerprint()
+    assert fp0 is not None
+
+    # 1. Agreed revision -> EQUAL, Phi0 fingerprint untouched
+    phi_eq = phi0 * 0.95
+    anchor.revise_input(phi_eq)
+    st_eq = anchor.mirror_stats()
+    assert st_eq["last_mirror_state"] == "EQUAL"
+    assert st_eq["equal_revisions"] == 1
+    assert anchor.initial_fingerprint() == fp0
+
+    # 2. Orthogonal/shifted refinement -> TENSION with exact reversible scar alpha * Phi0 + r_scar == phi_ten
+    phi_ten = torch.zeros(64, dtype=torch.float32, device=dev)
+    phi_ten[10] = 0.6
+    phi_ten[30] = 2.4
+    anchor.revise_input(phi_ten)
+    st_ten = anchor.mirror_stats()
+    assert st_ten["last_mirror_state"] == "TENSION"
+    assert st_ten["tension_revisions"] == 1
+    leaf_ten = anchor.mirror_split_leaves[-1]
+    reconstructed = leaf_ten.alpha * anchor.phi0 + leaf_ten.r_scar
+    assert float((reconstructed - phi_ten).abs().max().item()) < 1e-5
+    assert anchor.initial_fingerprint() == fp0
+
+    # 3. Contradictory user premise change -> SPLIT leaf born, Phi0 STILL immutable!
+    phi_split = -phi0.clone()
+    phi_split[40] = 2.5
+    anchor.revise_input(phi_split)
+    st_sp = anchor.mirror_stats()
+    assert st_sp["last_mirror_state"] == "SPLIT"
+    assert st_sp["split_events"] == 1
+    assert anchor.initial_fingerprint() == fp0
+
+    # 4. Stepwise transform_logits: zero force when model opposes branch (tau_step == 0), gentle dynamic boost on fork
+    #    Case A: opposing logits -> delta == 0 (never overrides strong opposing model direction!)
+    z_oppose = torch.zeros((1, 64), dtype=torch.float32, device=dev)
+    z_oppose[0, 10] = 4.0  # opposes phi_split[10] = -2.0
+    z_oppose[0, 40] = -2.0
+    out_opp = anchor.transform_logits(z_oppose, None, step_index=1)
+    assert int(out_opp.argmax(dim=-1).item()) == 10
+    assert float((out_opp - z_oppose).abs().max().item()) < 1e-6
+    assert anchor.mirror_stats()["zero_force_steps"] >= 1
+
+    #    Case B: balanced uncertain fork aligned with new SPLIT branch -> dynamic mirror cap resolves tie gently
+    z_fork = torch.full((1, 64), -3.0, dtype=torch.float32, device=dev)
+    z_fork[0, 40] = 1.00  # aligned with phi_split[40] = +2.5
+    z_fork[0, 41] = 1.02  # tiny 0.02 lead over token 40 in a high-entropy fork
+    z_fork[0, 42] = 0.95
+    out_fork = anchor.transform_logits(z_fork, None, step_index=2)
+    diff_40 = float((out_fork[0, 40] - z_fork[0, 40]).item())
+    assert diff_40 > 0.0
+    assert int(out_fork.argmax(dim=-1).item()) == 40
+    assert anchor.initial_fingerprint() == fp0

@@ -3479,7 +3479,9 @@ class QuintessentiaUnifiedEngine:
                 if use_session_cache and cached_len > 0 and self._session_thought_anchor is not None:
                     active_anchor_ref = self._session_thought_anchor
                 else:
-                    active_anchor_ref = InitialProbabilityAnchor()
+                    active_anchor_ref = InitialProbabilityAnchor(
+                        mirror_mode=(self.q1_graphify_feedback == "mirror_scales"),
+                    )
                 self._active_thought_anchor = active_anchor_ref
                 auto_anchor_installed = True
             if self.probability_bus is not None and active_anchor_ref is not None:

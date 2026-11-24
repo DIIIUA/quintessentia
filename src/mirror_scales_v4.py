@@ -1274,6 +1274,144 @@ def mirror_cube_depth_math(p_body: float, p_tail: float, min_k: int, max_k: int)
     return max(int(min_k), min(int(max_k), k))
 
 
+class MirrorAcceleratorRouter:
+    """Self-organizing physical accelerator router driven purely by canonical L4 Mirror Equality.
+
+    ZERO hardcoded hardware thresholds (e.g., no fixed `T >= 384`): for each physical regime
+    bucket (such as `seq_len.bit_length()`), measures real local latency & finite stability of
+    candidate accelerators (e.g., native NVRTC vs Linux Triton FLA) and lets `eval_canonical_l4_mirror`
+    (natural threshold 1/2, reversible failure scars) place the right accelerator automatically
+    for THIS exact GPU / driver / input geometry.
+    """
+
+    def __init__(self, name: str = "accelerator_router") -> None:
+        self.name = str(name)
+        # bucket -> chosen backend name ("primary" | "candidate")
+        self._route: Dict[Any, str] = {}
+        # bucket -> telemetry record (ms_primary, ms_candidate, state, tie, delta, winner)
+        self._records: Dict[Any, Dict[str, Any]] = {}
+        # bucket -> reversible failure/NaN scar for candidate
+        self._scars: Dict[Any, str] = {}
+
+    def select_and_run(
+        self,
+        bucket: Any,
+        primary_name: str,
+        primary_fn: Callable[[], Any],
+        candidate_name: Optional[str],
+        candidate_fn: Optional[Callable[[], Any]],
+        *,
+        is_cuda: bool = False,
+        validate_fn: Optional[Callable[[Any], bool]] = None,
+    ) -> Tuple[Any, str]:
+        # Fast steady-state path: 0 overhead once mirror equality has placed this bucket
+        chosen = self._route.get(bucket)
+        if chosen == primary_name or candidate_fn is None or candidate_name is None:
+            return primary_fn(), primary_name
+        if chosen == candidate_name:
+            try:
+                out = candidate_fn()
+                if validate_fn is None or validate_fn(out):
+                    return out, candidate_name
+                self._scars[bucket] = f"{candidate_name}:nonfinite"
+            except Exception as exc:
+                self._scars[bucket] = f"{candidate_name}:{type(exc).__name__}"
+            self._route[bucket] = primary_name
+            return primary_fn(), primary_name
+
+        # First contact for this physical bucket: measure real latency & stability of both sides
+        from src.general_speculation import eval_canonical_l4_mirror
+
+        def _timed_run(fn: Callable[[], Any]) -> Tuple[Any, float, float, Optional[str]]:
+            try:
+                if is_cuda and torch.cuda.is_available():
+                    # One quick warmup run for candidate JIT if needed is folded naturally when
+                    # primary runs first; time with CUDA events for sub-millisecond accuracy.
+                    ev0 = torch.cuda.Event(enable_timing=True)
+                    ev1 = torch.cuda.Event(enable_timing=True)
+                    ev0.record()
+                    res = fn()
+                    ev1.record()
+                    ev1.synchronize()
+                    ms = max(1e-4, float(ev0.elapsed_time(ev1)))
+                else:
+                    t0 = time.perf_counter()
+                    res = fn()
+                    ms = max(1e-4, (time.perf_counter() - t0) * 1000.0)
+                ok = True if validate_fn is None else bool(validate_fn(res))
+                return res, ms, (1.0 if ok else 0.0), (None if ok else "nonfinite")
+            except Exception as exc:
+                return None, 1e9, 0.0, type(exc).__name__
+
+        # Probe primary (baseline)
+        out_p, ms_p, rel_p, err_p = _timed_run(primary_fn)
+
+        # Probe candidate (warm once on CUDA so one-time Triton JIT compile does not distort steady speed)
+        out_c, ms_c, rel_c, err_c = _timed_run(candidate_fn)
+        if rel_c > 0.0 and is_cuda and torch.cuda.is_available():
+            out_c, ms_c, rel_c, err_c = _timed_run(candidate_fn)
+            # Re-time primary once warm as well for symmetric comparison
+            out_p2, ms_p2, rel_p2, err_p2 = _timed_run(primary_fn)
+            if rel_p2 > 0.0:
+                out_p, ms_p, rel_p, err_p = out_p2, ms_p2, rel_p2, err_p2
+
+        if rel_c <= 0.0:
+            self._scars[bucket] = f"{candidate_name}:{err_c or 'failed'}"
+            self._route[bucket] = primary_name
+            self._records[bucket] = {
+                "winner": primary_name,
+                "ms_primary": round(ms_p, 4),
+                "ms_candidate": None,
+                "mirror_state": "SPLIT",
+                "scar": self._scars[bucket],
+            }
+            return out_p, primary_name
+
+        if rel_p <= 0.0:
+            self._route[bucket] = candidate_name
+            self._records[bucket] = {
+                "winner": candidate_name,
+                "ms_primary": None,
+                "ms_candidate": round(ms_c, 4),
+                "mirror_state": "SPLIT",
+                "scar": f"{primary_name}:{err_p or 'failed'}",
+            }
+            return out_c, candidate_name
+
+        # Canonical L4 Mirror Equality on physical throughput (1/ms) and stability (rel)
+        sp_p = 1.0 / ms_p
+        sp_c = 1.0 / ms_c
+        s_ref = max(sp_p, sp_c, 1e-12)
+        v_p = (sp_p / s_ref, rel_p)
+        v_c = (sp_c / s_ref, rel_c)
+        strat = (0.5 * (v_p[0] + v_c[0]), 0.5 * (v_p[1] + v_c[1]))
+        state, tau_core, tau_wing, delta_res = eval_canonical_l4_mirror(v_p, v_p, strat, v_c, v_c)
+
+        # Pure canonical L4 decision (ONLY natural threshold 1/2, zero magic constants):
+        # Under EQUAL, keep zero-churn primary; under TENSION/SPLIT, place the faster hardware path.
+        winner = primary_name if state == "EQUAL" else (candidate_name if sp_c > sp_p else primary_name)
+
+        self._route[bucket] = winner
+        self._records[bucket] = {
+            "winner": winner,
+            "ms_primary": round(ms_p, 4),
+            "ms_candidate": round(ms_c, 4),
+            "mirror_state": state,
+            "tau_core": round(tau_core, 4),
+            "tau_wing": round(tau_wing, 4),
+            "delta_res": round(delta_res, 4),
+        }
+        return (out_c, candidate_name) if winner == candidate_name else (out_p, primary_name)
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "router": self.name,
+            "routes": {str(k): v for k, v in sorted(self._route.items(), key=lambda kv: str(kv[0]))},
+            "records": {str(k): v for k, v in sorted(self._records.items(), key=lambda kv: str(kv[0]))},
+            "scars": {str(k): v for k, v in sorted(self._scars.items(), key=lambda kv: str(kv[0]))},
+        }
+
+
 class Q1DiskL3Cache:
     """Isolated physical L3 SSD cache for Q1 crystals evicted from L2 Host RAM.
 
@@ -1304,10 +1442,10 @@ class Q1DiskL3Cache:
 
         self._lock = threading.Lock()
         self._pending: Dict[
-            Tuple[int, int], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int]
+            Tuple[int, int], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int, Tuple[int, int]]
         ] = {}
-        # key -> (safetensors_path, disk_bytes, logical_entry_bytes)
-        self._disk_lru: "OrderedDict[Tuple[int, int], Tuple[Path, int, int]]" = OrderedDict()
+        # key -> (safetensors_path, disk_bytes, logical_entry_bytes, (k_gu, k_dn))
+        self._disk_lru: "OrderedDict[Tuple[int, int], Tuple[Path, int, int, Tuple[int, int]]]" = OrderedDict()
         self._disk_bytes: int = 0
         self._pool: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="quintessentia-l3-spill"
@@ -1316,6 +1454,7 @@ class Q1DiskL3Cache:
 
         # Telemetry
         self.spills: int = 0
+        self.spills_deduped: int = 0
         self.hits: int = 0
         self.evictions: int = 0
         self.write_errors: int = 0
@@ -1324,6 +1463,12 @@ class Q1DiskL3Cache:
 
     def _entry_path(self, key: Tuple[int, int]) -> Path:
         return self.session_dir / f"L{int(key[0]):04d}_E{int(key[1]):05d}.safetensors"
+
+    @staticmethod
+    def _depth_sig(gu_t: Dict[str, torch.Tensor], dn_t: Dict[str, torch.Tensor]) -> Tuple[int, int]:
+        kg = int(gu_t["packed_lo"].shape[0]) if "packed_lo" in gu_t else 0
+        kd = int(dn_t["packed_lo"].shape[0]) if "packed_lo" in dn_t else 0
+        return (kg, kd)
 
     def spill_async(
         self,
@@ -1334,6 +1479,18 @@ class Q1DiskL3Cache:
     ) -> None:
         if self._closed or self.max_bytes <= 0 or int(entry_bytes) > self.max_bytes:
             return
+        sig = self._depth_sig(gu_t, dn_t)
+        eb_i = int(entry_bytes)
+        with self._lock:
+            if self._closed or self._pool is None:
+                return
+            # Read-keep dedup: if an identical (entry_bytes, depth_sig) crystal is already
+            # resident on ext4, refresh its LRU position with 0 disk writes!
+            existing = self._disk_lru.get(key)
+            if existing is not None and existing[2] == eb_i and existing[3] == sig:
+                self._disk_lru.move_to_end(key)
+                self.spills_deduped += 1
+                return
         cpu_gu = {
             k: (v.detach().contiguous() if v.device.type == "cpu" else v.detach().cpu().contiguous())
             for k, v in gu_t.items()
@@ -1342,21 +1499,16 @@ class Q1DiskL3Cache:
             k: (v.detach().contiguous() if v.device.type == "cpu" else v.detach().cpu().contiguous())
             for k, v in dn_t.items()
         }
-        old_path: Optional[Path] = None
         with self._lock:
             if self._closed or self._pool is None:
                 return
-            old_disk = self._disk_lru.pop(key, None)
-            if old_disk is not None:
-                old_path, old_db, _ = old_disk
-                self._disk_bytes -= old_db
-            self._pending[key] = (cpu_gu, cpu_dn, int(entry_bytes))
+            existing = self._disk_lru.get(key)
+            if existing is not None and existing[2] == eb_i and existing[3] == sig:
+                self._disk_lru.move_to_end(key)
+                self.spills_deduped += 1
+                return
+            self._pending[key] = (cpu_gu, cpu_dn, eb_i, sig)
             pool = self._pool
-        if old_path is not None:
-            try:
-                old_path.unlink(missing_ok=True)
-            except OSError:
-                pass
         try:
             pool.submit(self._write_worker, key)
         except RuntimeError:
@@ -1372,7 +1524,7 @@ class Q1DiskL3Cache:
             pending_ent = self._pending.get(key)
             if pending_ent is None:
                 return
-            cpu_gu, cpu_dn, entry_bytes = pending_ent
+            cpu_gu, cpu_dn, entry_bytes, sig = pending_ent
 
         flat: Dict[str, torch.Tensor] = {}
         for k, v in cpu_gu.items():
@@ -1408,12 +1560,12 @@ class Q1DiskL3Cache:
                 if prev is not None:
                     self._disk_bytes -= prev[1]
                 while self._disk_lru and (self._disk_bytes + disk_b > self.max_bytes):
-                    _, (ev_path, ev_db, _ev_eb) = self._disk_lru.popitem(last=False)
+                    _, (ev_path, ev_db, _ev_eb, _ev_sig) = self._disk_lru.popitem(last=False)
                     self._disk_bytes -= ev_db
                     self.evictions += 1
                     evict_paths.append(ev_path)
                 if disk_b <= self.max_bytes:
-                    self._disk_lru[key] = (dst_path, disk_b, entry_bytes)
+                    self._disk_lru[key] = (dst_path, disk_b, entry_bytes, sig)
                     self._disk_bytes += disk_b
                     self.spills += 1
                 else:
@@ -1452,25 +1604,25 @@ class Q1DiskL3Cache:
         with self._lock:
             if self._closed:
                 return None
-            pend = self._pending.pop(key, None)
+            pend = self._pending.get(key)
             if pend is not None:
                 self.hits += 1
-                return pend
-            disk_ent = self._disk_lru.pop(key, None)
+                return pend[0], pend[1], pend[2]
+            disk_ent = self._disk_lru.get(key)
             if disk_ent is None:
                 return None
-            path, disk_b, entry_bytes = disk_ent
-            self._disk_bytes -= disk_b
+            # Read-keep LRU: keep crystal on ext4 so future L2 evictions deduplicate in 0 ms
+            self._disk_lru.move_to_end(key)
+            path, _disk_b, entry_bytes, _sig = disk_ent
 
         try:
             flat = load_file(str(path), device="cpu")
         except Exception:
+            with self._lock:
+                stale = self._disk_lru.pop(key, None)
+                if stale is not None:
+                    self._disk_bytes -= stale[1]
             return None
-        finally:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
         gu_t = {k[3:]: v for k, v in flat.items() if k.startswith("gu.")}
         dn_t = {k[3:]: v for k, v in flat.items() if k.startswith("dn.")}
@@ -1486,6 +1638,7 @@ class Q1DiskL3Cache:
                 "enabled": not self._closed,
                 "dir": str(self.session_dir),
                 "spills": self.spills,
+                "spills_deduped": self.spills_deduped,
                 "hits": self.hits,
                 "evictions": self.evictions,
                 "write_errors": self.write_errors,
@@ -1619,6 +1772,7 @@ class MirrorIsolatedMoEOverlayV4:
 
         # M5 telemetry
         self.prefill_crystallized: int = 0
+        self.total_crystallized: int = 0
         self.prefill_direct_pass: int = 0
         self.prefill_carves_avoided: int = 0
         self.crystal_k_opt_sum: int = 0
@@ -2059,6 +2213,7 @@ class MirrorIsolatedMoEOverlayV4:
         kg = int(gu_scar["k_opt"])
         kd = int(dn_scar["k_opt"])
         self.crystal_k_opt_sum += kg + kd
+        self.total_crystallized += 1
         if kg < max_k:
             self.crystal_early_stops += 1
         if kd < max_k:
@@ -2695,11 +2850,12 @@ class MirrorIsolatedMoEOverlayV4:
             "m5_layer_execution": {
                 "scale": "M5_layer_moe_execution",
                 "prefill_crystallized": self.prefill_crystallized,
+                "total_crystallized": self.total_crystallized,
                 "prefill_direct_pass": self.prefill_direct_pass,
                 "prefill_carves_avoided": self.prefill_carves_avoided,
                 "crystal_k_opt_avg": round(
-                    self.crystal_k_opt_sum / max(1, 2 * self.prefill_crystallized), 2
-                ) if self.prefill_crystallized > 0 else 0.0,
+                    self.crystal_k_opt_sum / max(1, 2 * max(self.total_crystallized, self.prefill_crystallized)), 2
+                ) if max(self.total_crystallized, self.prefill_crystallized) > 0 else 0.0,
                 "crystal_early_stops": self.crystal_early_stops,
                 "crystal_scars_active": len(self._crystal_scars),
                 "decode_direct_unclosed": self.decode_direct_unclosed,
@@ -2722,6 +2878,7 @@ class MirrorIsolatedMoEOverlayV4:
                 "post_prefill_bg_adoptions": self.post_prefill_bg_adoptions,
                 "l3_enabled": self.l3_cache is not None,
                 "l3_spills": self.l3_cache.spills if self.l3_cache is not None else 0,
+                "l3_spills_deduped": self.l3_cache.spills_deduped if self.l3_cache is not None else 0,
                 "l3_hits": self.l3_cache.hits if self.l3_cache is not None else 0,
                 "l3_evictions": self.l3_cache.evictions if self.l3_cache is not None else 0,
                 "l3_mib_used": self.l3_cache.stats()["mib_used"] if self.l3_cache is not None else 0.0,

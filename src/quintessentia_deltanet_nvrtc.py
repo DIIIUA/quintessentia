@@ -1007,6 +1007,32 @@ def nvrtc_recurrent_gated_delta_rule(
     raise RuntimeError("No fallback available for recurrent_gated_delta_rule")
 
 
+_FLA_CHUNK_GATED_DELTA_RULE: Callable | None = None
+_FLA_CHECKED: bool = False
+_DELTANET_MIRROR_ROUTER = None
+
+
+def _get_fla_chunk_gated_delta_rule() -> Callable | None:
+    global _FLA_CHUNK_GATED_DELTA_RULE, _FLA_CHECKED
+    if not _FLA_CHECKED:
+        _FLA_CHECKED = True
+        try:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_fn
+            _FLA_CHUNK_GATED_DELTA_RULE = _fla_fn
+        except Exception:
+            _FLA_CHUNK_GATED_DELTA_RULE = None
+    return _FLA_CHUNK_GATED_DELTA_RULE
+
+
+def get_deltanet_mirror_router():
+    """Return the self-organizing MirrorAcceleratorRouter placing NVRTC vs FLA by live hardware timing."""
+    global _DELTANET_MIRROR_ROUTER
+    if _DELTANET_MIRROR_ROUTER is None:
+        from src.mirror_scales_v4 import MirrorAcceleratorRouter
+        _DELTANET_MIRROR_ROUTER = MirrorAcceleratorRouter(name="deltanet_chunk_nvrtc_vs_fla")
+    return _DELTANET_MIRROR_ROUTER
+
+
 def nvrtc_chunk_gated_delta_rule(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1020,7 +1046,52 @@ def nvrtc_chunk_gated_delta_rule(
     _fallback: Callable | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if _can_run_deltanet_cuda(query, key, value, g, beta, initial_state, kwargs):
+    can_nvrtc = _can_run_deltanet_cuda(query, key, value, g, beta, initial_state, kwargs)
+    fla_fn = _get_fla_chunk_gated_delta_rule() if (query.is_cuda and query.ndim == 4 and not kwargs.get("cu_seqlens")) else None
+
+    if can_nvrtc and fla_fn is not None:
+        # Pure canonical Mirror Equality accelerator placement — ZERO hardcoded length thresholds!
+        # Buckets by log2(seq_len) so each sequence regime self-selects NVRTC vs FLA on this GPU.
+        seq_len = int(query.shape[1])
+        bucket = seq_len.bit_length()
+        router = get_deltanet_mirror_router()
+
+        def _run_nvrtc():
+            return _launch_gated_delta_rule_cuda(
+                query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
+            )
+
+        def _run_fla():
+            return fla_fn(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        def _is_valid(res) -> bool:
+            if not isinstance(res, tuple) or len(res) < 1 or not isinstance(res[0], torch.Tensor):
+                return False
+            return bool(torch.isfinite(res[0]).all().item())
+
+        out, chosen = router.select_and_run(
+            bucket=bucket,
+            primary_name="nvrtc",
+            primary_fn=_run_nvrtc,
+            candidate_name="fla",
+            candidate_fn=_run_fla,
+            is_cuda=True,
+            validate_fn=_is_valid,
+        )
+        stat_key = "fla_chunk_gated_delta_rule" if chosen == "fla" else "chunk_gated_delta_rule"
+        KERNEL_CALL_STATS[stat_key] = KERNEL_CALL_STATS.get(stat_key, 0) + 1
+        return out
+
+    if can_nvrtc:
         out = _launch_gated_delta_rule_cuda(
             query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
         )

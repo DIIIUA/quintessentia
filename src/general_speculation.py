@@ -617,6 +617,9 @@ class GeneralSpeculation:
         gate = QuintessentiaSpecGate(max_drafts=u.max_drafts)
         before = self.counters.copy()
         all_ids = list(prompt_ids)
+        gen_history: list[int] = []
+        sampling = getattr(u, "_active_sampling", None)
+        stochastic_sampling = bool(sampling is not None and float(sampling.temperature) > 0.0)
         past = past_kv if cached_prefix_len else None
         native_ready = self.native is not None and self.native.resume(cached_prefix_len, prompt_ids[cached_prefix_len])
         cursor = cached_prefix_len
@@ -638,13 +641,14 @@ class GeneralSpeculation:
                     if b == len(prompt_ids):
                         if anchor is not None:
                             logits = anchor.on_prefill_end(u, past, logits)
-                        picked = int(logits[0].argmax().item())
+                        picked = u._sample_next_token(logits[0], gen_history)
                     if native_ready:
                         next_tokens = prompt_ids[a+1:b+1] if b < len(prompt_ids) else prompt_ids[a+1:b]+[picked]
                         self.native.commit(hidden, next_tokens)
                         native_rows += len(next_tokens)
                     cursor = b
                 all_ids.append(picked)
+                gen_history.append(picked)
                 u._sync_compute()
                 prefill_ms = (time.perf_counter()-started)*1000
                 yield {"kind": "tokens", "new_ids": [picked]}
@@ -657,8 +661,15 @@ class GeneralSpeculation:
                     past = self._boundary(past)
                     remaining = max_new_tokens-generated
                     # Recurrent anchor mixing changes state after each token;
-                    # use ordinary steps while that explicitly enabled option runs.
-                    depth = 0 if anchor is not None and getattr(anchor, "rec_anchor_lambda", 0) > 0 else min(u.max_drafts, remaining-1)
+                    # stochastic sampling also runs plain 1-token steps to preserve exact distribution.
+                    depth = (
+                        0
+                        if (
+                            stochastic_sampling
+                            or (anchor is not None and getattr(anchor, "rec_anchor_lambda", 0) > 0)
+                        )
+                        else min(u.max_drafts, remaining-1)
+                    )
                     if depth and not self.rowwise.supported:
                         depth = 0
                         self.counters["decoder_contract_plain_steps"] += 1
@@ -711,7 +722,7 @@ class GeneralSpeculation:
                             row = logits[:, j, :]
                             if anchor is not None:
                                 row = anchor.transform_logits(row, past, generated+len(emitted))
-                            token = int(row[0].argmax().item())
+                            token = u._sample_next_token(row[0], gen_history + emitted)
                             rows.append(token)
                             emitted.append(token)
                             if j < depth and token == drafts[j]:
@@ -789,6 +800,7 @@ class GeneralSpeculation:
                     passes += 1
                     generated += len(emitted)
                     all_ids.extend(emitted)
+                    gen_history.extend(emitted)
                     picked = emitted[-1]
                     yield {"kind": "tokens", "new_ids": emitted}
                 u._sync_compute()

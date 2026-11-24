@@ -55,6 +55,69 @@ from quintessentia_cli.runtime_config import (
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_MODEL = 0, 1, 2, 3
 WEIGHT_FORMAT_CHOICES = ("auto", "q1_cubes", "q1", "q2", "q4", "q6", "q8", "bf16")
 FEEDBACK_MODE_CHOICES = ("auto", "off", "spiral_sphere", "pure_mirror", "mirror_scales", "v4")
+PROFILE_MODE_CHOICES = ("default", "custom")
+
+
+def resolve_generation_profile(
+    mode: str = "default",
+    *,
+    thinking: bool = True,
+    max_tokens: int = 0,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    repetition_penalty: float | None = None,
+    presence_penalty: float | None = None,
+    seed: int | None = None,
+) -> dict:
+    """Resolve user-facing `default` vs `custom` generation & anti-loop sampling profile.
+
+    - `default`: out-of-the-box user mode — unlimited tokens (`0` -> natural EOS) and
+      anti-loop sampling tuned separately for `<think>` (stops greedy draft-rewriting loops)
+      and `--no-think` (crisp, direct answers). Any explicitly passed CLI flag overrides.
+    - `custom`: full manual control — zero hidden sampling overrides (deterministic greedy
+      unless the user passes `--temperature`, `--top-p`, `--top-k`, `--presence-penalty`, etc.).
+    """
+    prof = str(mode or "default").strip().lower()
+    if prof not in PROFILE_MODE_CHOICES:
+        raise ValueError(f"Unsupported mode {mode!r}; expected one of {PROFILE_MODE_CHOICES}")
+
+    if prof == "default":
+        if thinking:
+            base = dict(
+                temperature=0.6,
+                top_p=0.95,
+                top_k=20,
+                repetition_penalty=1.05,
+                presence_penalty=1.2,
+            )
+        else:
+            base = dict(
+                temperature=0.35,
+                top_p=0.9,
+                top_k=20,
+                repetition_penalty=1.03,
+                presence_penalty=0.5,
+            )
+    else:
+        base = dict(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+        )
+
+    return {
+        "mode": prof,
+        "max_new_tokens": int(max_tokens),
+        "temperature": float(base["temperature"] if temperature is None else temperature),
+        "top_p": float(base["top_p"] if top_p is None else top_p),
+        "top_k": int(base["top_k"] if top_k is None else top_k),
+        "repetition_penalty": float(base["repetition_penalty"] if repetition_penalty is None else repetition_penalty),
+        "presence_penalty": float(base["presence_penalty"] if presence_penalty is None else presence_penalty),
+        "seed": seed,
+    }
 
 
 def _model_weight_bytes(folder: Path) -> int:
@@ -292,10 +355,22 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--puzzle-slice-ratio", type=float, default=0.35,
                    help="Fraction of delta-cubes selected per dynamic slice S_t when --puzzle-overlay is enabled (0.0..1.0, default: 0.35)")
     p.add_argument(
+        "--mode",
+        choices=PROFILE_MODE_CHOICES,
+        default="default",
+        help="User profile: default (auto V4 + unlimited EOS + anti-loop sampling) or custom (manual control over all sampling & engine flags)",
+    )
+    p.add_argument(
         "--feedback-mode",
         choices=FEEDBACK_MODE_CHOICES,
         default="auto",
         help="Q1 mirror feedback mode: auto (auto-selects V4 M0-M8 on large MoE exceeding VRAM), off, spiral_sphere (V2), pure_mirror (V3), or mirror_scales/v4 (V4 isolated pure-math mirror scales)",
+    )
+    p.add_argument(
+        "--rest-tol",
+        type=float,
+        default=None,
+        help="Custom MoE cold-expert mirror rest tolerance (requires q1_cubes / V4; default: 0.24)",
     )
     p.add_argument("--max-drafts", type=int, default=2, help="Max speculative draft depth (1..3, default: 2)")
     p.add_argument(
@@ -303,6 +378,23 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Experimental vocabulary pruner (off by default: it drops rare tokens on long outputs)",
     )
+
+
+def _add_generation_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=0,
+        help="Max new tokens (0 = unlimited until natural EOS, default: 0)",
+    )
+    p.add_argument("--no-think", action="store_true", help="Disable `<think>` reasoning block")
+    p.add_argument("--system", type=str, default=None, help="Optional system prompt")
+    p.add_argument("--temperature", type=float, default=None, help="Sampling temperature (overrides mode default; 0 = greedy)")
+    p.add_argument("--top-p", dest="top_p", type=float, default=None, help="Nucleus top-p sampling cutoff (0..1)")
+    p.add_argument("--top-k", dest="top_k", type=int, default=None, help="Top-k sampling cutoff (0 = disabled)")
+    p.add_argument("--repetition-penalty", dest="repetition_penalty", type=float, default=None, help="Repetition penalty on generated tokens (>=1.0)")
+    p.add_argument("--presence-penalty", dest="presence_penalty", type=float, default=None, help="Presence penalty on generated tokens (>=0.0)")
+    p.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible sampling")
 
 
 def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
@@ -379,6 +471,11 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         q1_early_stop=getattr(args, "q1_early_stop", True),
         puzzle_overlay=getattr(args, "puzzle_overlay", False),
         puzzle_slice_ratio=getattr(args, "puzzle_slice_ratio", 0.35),
+        q1_expert_rest_tol=(
+            getattr(args, "rest_tol", None)
+            if v4_plan["weight_format"] == "q1_cubes"
+            else None
+        ),
         q1_imprint_puzzle=bool(v4_plan["q1_imprint_puzzle"]),
         q1_graphify_feedback=v4_plan["feedback_mode"],
     )
@@ -607,17 +704,32 @@ def cmd_download(args):
     return EXIT_OK
 
 
-def _stream_to_console(engine: QuintessentiaUnifiedEngine, messages: list[dict[str, str]], max_tokens: int, thinking: bool, use_session: bool) -> dict:
+def _stream_to_console(
+    engine: QuintessentiaUnifiedEngine,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    thinking: bool,
+    use_session: bool,
+    *,
+    gen_profile: dict | None = None,
+) -> dict:
     in_think_printed = False
     in_ans_printed = False
     done_packet: dict = {}
+    gp = gen_profile or {}
 
     gen = engine.stream_chat(
         messages,
-        max_new_tokens=max_tokens,
+        max_new_tokens=int(gp.get("max_new_tokens", max_tokens)),
         enable_thinking=thinking,
         use_session_cache=use_session,
         stop_on_eos=True,
+        temperature=float(gp.get("temperature", 0.0)),
+        top_p=float(gp.get("top_p", 1.0)),
+        top_k=int(gp.get("top_k", 0)),
+        repetition_penalty=float(gp.get("repetition_penalty", 1.0)),
+        presence_penalty=float(gp.get("presence_penalty", 0.0)),
+        seed=gp.get("seed"),
     )
     try:
         for ev in gen:
@@ -671,8 +783,29 @@ def _stream_to_console(engine: QuintessentiaUnifiedEngine, messages: list[dict[s
 def cmd_ask(args: argparse.Namespace) -> int:
     prompt_text = " ".join(args.prompt).strip()
     if not prompt_text:
-        print("Error: please provide a prompt, e.g. `quintessentia ask \"Привет!\"`", file=sys.stderr)
+        print("Error: please provide a prompt, e.g. `quint ask \"Привет!\"`", file=sys.stderr)
         return EXIT_USAGE
+
+    thinking = not args.no_think
+    gen_profile = resolve_generation_profile(
+        getattr(args, "mode", "default"),
+        thinking=thinking,
+        max_tokens=args.max_tokens,
+        temperature=getattr(args, "temperature", None),
+        top_p=getattr(args, "top_p", None),
+        top_k=getattr(args, "top_k", None),
+        repetition_penalty=getattr(args, "repetition_penalty", None),
+        presence_penalty=getattr(args, "presence_penalty", None),
+        seed=getattr(args, "seed", None),
+    )
+    tok_label = "unlimited->EOS" if gen_profile["max_new_tokens"] == 0 else f"max={gen_profile['max_new_tokens']}"
+    print(
+        f"[Quintessentia Mode: {gen_profile['mode']} | {tok_label} | think={'ON' if thinking else 'OFF'} | "
+        f"temp={gen_profile['temperature']}, top_p={gen_profile['top_p']}, top_k={gen_profile['top_k']}, "
+        f"presence={gen_profile['presence_penalty']}, rep={gen_profile['repetition_penalty']}]",
+        file=sys.stderr,
+        flush=True,
+    )
 
     messages: list[dict[str, str]] = []
     if args.system:
@@ -684,8 +817,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
             eng,
             messages=messages,
             max_tokens=args.max_tokens,
-            thinking=not args.no_think,
+            thinking=thinking,
             use_session=False,
+            gen_profile=gen_profile,
         )
         if args.json_out and done_pkt:
             Path(args.json_out).write_text(json.dumps(done_pkt, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -694,13 +828,15 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 def cmd_chat(args: argparse.Namespace) -> int:
     thinking = not args.no_think
+    cur_mode = getattr(args, "mode", "default")
     messages: list[dict[str, str]] = []
     if args.system:
         messages.append({"role": "system", "content": args.system})
 
     with _engine_from_args(args) as eng:
         print(
-            "\n[Quintessentia Interactive Chat] Commands: `/reset`, `/think on|off`, `/status`, `/exit`. "
+            f"\n[Quintessentia Interactive Chat | mode={cur_mode}] "
+            "Commands: `/reset`, `/think on|off`, `/mode default|custom`, `/status`, `/exit`. "
             "Ctrl+C stops the current answer.\n",
             flush=True,
         )
@@ -724,10 +860,29 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 thinking = (parts[1].lower() == "on") if len(parts) > 1 else (not thinking)
                 print(f"[Режим <think>: {'ON' if thinking else 'OFF'}]", flush=True)
                 continue
+            if user_in.lower().startswith("/mode"):
+                parts = user_in.split()
+                if len(parts) > 1 and parts[1].lower() in PROFILE_MODE_CHOICES:
+                    cur_mode = parts[1].lower()
+                    print(f"[Режим профиля: {cur_mode}]", flush=True)
+                else:
+                    print(f"[Текущий режим: {cur_mode}. Использование: /mode default|custom]", flush=True)
+                continue
             if user_in.lower() == "/status":
                 print(json.dumps(eng.status_snapshot(), ensure_ascii=False, indent=2), flush=True)
                 continue
 
+            gen_profile = resolve_generation_profile(
+                cur_mode,
+                thinking=thinking,
+                max_tokens=args.max_tokens,
+                temperature=getattr(args, "temperature", None),
+                top_p=getattr(args, "top_p", None),
+                top_k=getattr(args, "top_k", None),
+                repetition_penalty=getattr(args, "repetition_penalty", None),
+                presence_penalty=getattr(args, "presence_penalty", None),
+                seed=getattr(args, "seed", None),
+            )
             messages.append({"role": "user", "content": user_in})
             done_pkt = _stream_to_console(
                 eng,
@@ -735,6 +890,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 max_tokens=args.max_tokens,
                 thinking=thinking,
                 use_session=True,
+                gen_profile=gen_profile,
             )
             if done_pkt:
                 messages.append({"role": "assistant", "content": done_pkt.get("answer_text", "")})
@@ -834,18 +990,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ask = sub.add_parser("ask", help="Stream a single prompt (`<think>...</think>` -> `<|im_end|>`)")
     _add_engine_args(p_ask)
-    p_ask.add_argument("--max-tokens", type=int, default=1024, help="Max new tokens (default: 1024)")
-    p_ask.add_argument("--no-think", action="store_true", help="Disable `<think>` reasoning block")
-    p_ask.add_argument("--system", type=str, default=None, help="Optional system prompt")
+    _add_generation_args(p_ask)
     p_ask.add_argument("--json-out", type=str, default=None, help="Save full response + telemetry JSON")
     p_ask.add_argument("prompt", nargs="+", help="Prompt text")
     p_ask.set_defaults(func=cmd_ask)
 
     p_chat = sub.add_parser("chat", help="Interactive terminal chat with `kv_prefix` reuse & RAM parking")
     _add_engine_args(p_chat)
-    p_chat.add_argument("--max-tokens", type=int, default=1024)
-    p_chat.add_argument("--no-think", action="store_true")
-    p_chat.add_argument("--system", type=str, default=None)
+    _add_generation_args(p_chat)
     p_chat.set_defaults(func=cmd_chat)
 
     p_srv = sub.add_parser("serve", help="Start LAN HTTP/SSE server + UDP LAN self-broadcaster")

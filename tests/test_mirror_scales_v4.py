@@ -980,3 +980,179 @@ def test_phase5_auto_v4_cli_plan_and_quint_launcher(tmp_path):
     raw_sh = quint_sh.read_bytes()
     assert b"\r\n" not in raw_sh
     assert raw_sh.startswith(b"#!/usr/bin/env bash\n")
+
+
+def test_mirror_accelerator_router_self_places_without_hardcodes():
+    """Canonical L4 MirrorAcceleratorRouter self-places faster hardware path & scars NaN/errors."""
+    import time as _t
+    from src.mirror_scales_v4 import MirrorAcceleratorRouter
+
+    router = MirrorAcceleratorRouter(name="test_router")
+
+    # Bucket A: candidate is clearly faster -> Mirror Equality places candidate
+    res_a, w_a = router.select_and_run(
+        bucket="fast_cand",
+        primary_name="slow_a",
+        primary_fn=lambda: (_t.sleep(0.015), "A")[1],
+        candidate_name="fast_b",
+        candidate_fn=lambda: (_t.sleep(0.001), "B")[1],
+        is_cuda=False,
+    )
+    assert w_a == "fast_b" and res_a == "B"
+    # Steady-state second call skips timing and routes directly to fast_b
+    res_a2, w_a2 = router.select_and_run(
+        bucket="fast_cand",
+        primary_name="slow_a",
+        primary_fn=lambda: (_ for _ in ()).throw(AssertionError("should not run primary")),
+        candidate_name="fast_b",
+        candidate_fn=lambda: "B2",
+        is_cuda=False,
+    )
+    assert w_a2 == "fast_b" and res_a2 == "B2"
+
+    # Bucket B: candidate fails / nonfinite -> reversible scar keeps primary safely
+    res_b, w_b = router.select_and_run(
+        bucket="bad_cand",
+        primary_name="safe_a",
+        primary_fn=lambda: "OK",
+        candidate_name="broken_b",
+        candidate_fn=lambda: float("nan"),
+        is_cuda=False,
+        validate_fn=lambda x: isinstance(x, str),
+    )
+    assert w_b == "safe_a" and res_b == "OK"
+    assert "bad_cand" in router.stats()["scars"]
+
+    # Live CUDA check if Linux FLA is installed: router self-places NVRTC vs FLA with 0 hardcodes
+    if torch.cuda.is_available():
+        try:
+            import fla  # noqa: F401
+            from src.quintessentia_deltanet_nvrtc import (
+                nvrtc_chunk_gated_delta_rule,
+                get_deltanet_mirror_router,
+            )
+
+            dev = torch.device("cuda:0")
+            for seq_len in (64, 512):
+                q = torch.randn((1, seq_len, 16, 128), device=dev, dtype=torch.bfloat16)
+                k = torch.randn((1, seq_len, 16, 128), device=dev, dtype=torch.bfloat16)
+                v = torch.randn((1, seq_len, 16, 128), device=dev, dtype=torch.bfloat16)
+                g = -torch.rand((1, seq_len, 16), device=dev, dtype=torch.float32) * 0.5
+                beta = torch.sigmoid(torch.randn((1, seq_len, 16), device=dev, dtype=torch.bfloat16))
+                out, _ = nvrtc_chunk_gated_delta_rule(
+                    q, k, v, g, beta, output_final_state=True, use_qk_l2norm_in_kernel=True
+                )
+                assert torch.isfinite(out).all()
+            st = get_deltanet_mirror_router().stats()
+            assert str((64).bit_length()) in st["routes"]
+            assert str((512).bit_length()) in st["routes"]
+        except ImportError:
+            pass
+
+
+def test_l3_cache_read_keep_dedup_and_direct_staging(tmp_path):
+    """Q1DiskL3Cache deduplicates identical re-spills (0 extra writes) & staging pool reads exact bytes."""
+    from quintessentia_cli.model_source import _ParallelSliceStagingPool
+    from src.mirror_scales_v4 import Q1DiskL3Cache
+
+    # 1. L3 read-keep + dedup
+    l3 = Q1DiskL3Cache(cache_dir=tmp_path / "l3_dedup", max_bytes=16 * 1024**2)
+    try:
+        gu = {"packed_lo": torch.randint(0, 255, (4, 16, 8), dtype=torch.uint8)}
+        dn = {"packed_lo": torch.randint(0, 255, (4, 8, 16), dtype=torch.uint8)}
+        eb = 1024
+        l3.spill_async((0, 7), gu, dn, eb)
+        l3.flush()
+        assert l3.spills == 1
+        # Load keeps the crystal on disk under LRU
+        loaded = l3.load((0, 7))
+        assert loaded is not None and l3.hits == 1
+        assert l3.contains((0, 7))
+        # Re-spilling the same expert at the same depth deduplicates with 0 disk writes
+        l3.spill_async((0, 7), gu, dn, eb)
+        l3.flush()
+        assert l3.spills == 1
+        assert l3.spills_deduped == 1
+    finally:
+        l3.close()
+    assert not l3.session_dir.exists()
+
+    # 2. _ParallelSliceStagingPool (O_DIRECT on ext4 or fallback on tmpfs) exact byte check
+    raw = bytes((i * 73 + 11) & 0xFF for i in range(96 * 1024))
+    bin_path = tmp_path / "weights_96k.bin"
+    bin_path.write_bytes(raw)
+    pool = _ParallelSliceStagingPool(slot_bytes=128 * 1024, device="cpu", workers=2)
+    try:
+        # Unaligned offset & length to stress O_DIRECT 4 KiB alignment slicing
+        tasks = [
+            (str(bin_path), 123, 0, 5000),
+            (str(bin_path), 17000, 5000, 9123),
+        ]
+        out = pool.fetch_to_device(tasks, 14123)
+        got = bytes(out.numpy())
+        assert got[:5000] == raw[123 : 123 + 5000]
+        assert got[5000:] == raw[17000 : 17000 + 9123]
+    finally:
+        pool.close()
+
+
+def test_user_modes_default_custom_and_anti_loop_sampling():
+    """User modes default/custom, --max-tokens 0 unlimited, and GPU anti-loop sampling work cleanly."""
+    from quintessentia_cli.cli import build_parser, resolve_generation_profile
+    from quintessentia_cli.unified_runtime import SamplingConfig, sample_next_token
+
+    # 1. Default mode: unlimited tokens + anti-loop sampling for both think & no-think
+    p_def_think = resolve_generation_profile("default", thinking=True, max_tokens=0)
+    assert p_def_think["max_new_tokens"] == 0
+    assert p_def_think["temperature"] > 0.0
+    assert p_def_think["presence_penalty"] >= 1.0
+    assert p_def_think["repetition_penalty"] > 1.0
+
+    p_def_no = resolve_generation_profile("default", thinking=False, max_tokens=0)
+    assert p_def_no["temperature"] > 0.0 and p_def_no["temperature"] < p_def_think["temperature"]
+    assert p_def_no["presence_penalty"] > 0.0
+
+    # Explicit overrides win in default mode
+    p_def_ovr = resolve_generation_profile("default", thinking=True, max_tokens=128, temperature=0.0, presence_penalty=0.0)
+    assert p_def_ovr["max_new_tokens"] == 128
+    assert p_def_ovr["temperature"] == 0.0
+    assert p_def_ovr["presence_penalty"] == 0.0
+
+    # 2. Custom mode: clean deterministic defaults unless user specifies flags
+    p_cust = resolve_generation_profile("custom", thinking=True, max_tokens=0)
+    assert p_cust["temperature"] == 0.0
+    assert p_cust["presence_penalty"] == 0.0
+    assert p_cust["repetition_penalty"] == 1.0
+
+    # 3. CLI parser exposes --mode default|custom and defaults to --max-tokens 0 (unlimited)
+    parser = build_parser()
+    args_def = parser.parse_args(["ask", "--model", "1", "Hi"])
+    assert args_def.mode == "default"
+    assert args_def.max_tokens == 0
+
+    args_cust = parser.parse_args(["ask", "--mode", "custom", "--temperature", "0.2", "--presence-penalty", "0.8", "--max-tokens", "64", "Hi"])
+    assert args_cust.mode == "custom"
+    assert args_cust.temperature == 0.2
+    assert args_cust.presence_penalty == 0.8
+    assert args_cust.max_tokens == 64
+
+    # 4. Anti-loop sampler breaks greedy repetition trap when presence/repetition penalty is active
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    logits = torch.full((64,), -2.0, device=dev, dtype=torch.float32)
+    logits[5] = 4.0  # stuck loop token
+    logits[9] = 3.4  # escape token (e.g. `</think>` or fresh continuation)
+
+    # Plain greedy picks loop token 5 forever
+    assert sample_next_token(logits, [5, 5, 5], SamplingConfig()) == 5
+    # Presence penalty > 0.6 breaks the loop deterministically toward escape token 9!
+    assert sample_next_token(logits, [5, 5, 5], SamplingConfig(temperature=0.0, presence_penalty=1.2)) == 9
+    # Stochastic top-k/top-p sampling with fixed seed stays inside top-2 candidates
+    rng = torch.Generator(device=dev)
+    rng.manual_seed(42)
+    tok = sample_next_token(
+        logits,
+        [5],
+        SamplingConfig(temperature=0.6, top_p=0.95, top_k=2, presence_penalty=1.2, repetition_penalty=1.05),
+        rng=rng,
+    )
+    assert tok in (5, 9)

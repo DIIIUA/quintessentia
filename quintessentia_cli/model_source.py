@@ -26,6 +26,7 @@ from copy import deepcopy
 import ctypes
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path, PurePosixPath
 import queue
@@ -862,11 +863,37 @@ def read_safetensors_header(path: str | Path) -> tuple[dict[str, Any], int]:
 
 _PREAD_FADVISE_MIN_BYTES = 262144  # 256 KiB — skip tiny header/metadata reads
 _PREAD_FADVISE_STATS: dict[str, int] = {"calls": 0, "bytes": 0}
+_DIRECT_IO_STATS: dict[str, int] = {"calls": 0, "bytes": 0, "fallbacks": 0}
+_LIBC_PREAD = None
+_LIBC_PREAD_INIT = False
 
 
 def pread_fadvise_stats() -> dict[str, int]:
     """Return telemetry of POSIX_FADV_DONTNEED page-cache evictions after positioned reads."""
     return dict(_PREAD_FADVISE_STATS)
+
+
+def direct_io_stats() -> dict[str, int]:
+    """Return telemetry of Linux O_DIRECT aligned positioned reads (0 page-cache footprint)."""
+    return dict(_DIRECT_IO_STATS)
+
+
+def _get_libc_pread():
+    global _LIBC_PREAD, _LIBC_PREAD_INIT
+    if _LIBC_PREAD_INIT:
+        return _LIBC_PREAD
+    _LIBC_PREAD_INIT = True
+    if os.name != "posix" or not hasattr(os, "O_DIRECT"):
+        return None
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        fn = libc.pread
+        fn.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_longlong]
+        fn.restype = ctypes.c_ssize_t
+        _LIBC_PREAD = fn
+    except Exception:
+        _LIBC_PREAD = None
+    return _LIBC_PREAD
 
 
 def _pread_or_seek_into(f: Any, abs_offset: int, view: memoryview, path: str) -> None:
@@ -1090,6 +1117,10 @@ class _ParallelSliceStagingPool:
         self._pool: ThreadPoolExecutor | None = None
         self._handle_queues: dict[str, queue.SimpleQueue] = {}
         self._all_handles: list[Any] = []
+        # Native Linux O_DIRECT aligned read pools (0 page cache, 0 fadvise lock contention)
+        self._direct_supported: dict[str, bool] = {}
+        self._direct_queues: dict[str, queue.SimpleQueue] = {}
+        self._all_direct_resources: list[tuple[int, mmap.mmap]] = []
 
     def _borrow_handle(self, path: str):
         with self._lock:
@@ -1105,11 +1136,108 @@ class _ParallelSliceStagingPool:
                 self._all_handles.append(f)
             return f, q
 
+    def _probe_direct_path(self, path: str) -> bool:
+        with self._lock:
+            cached = self._direct_supported.get(path)
+            if cached is not None:
+                return cached
+        pread_fn = _get_libc_pread()
+        ok = False
+        if pread_fn is not None and os.environ.get("QUINTESSENTIA_DISABLE_O_DIRECT", "0") != "1":
+            fd = -1
+            buf = None
+            try:
+                if os.path.getsize(path) >= 4096:
+                    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+                    buf = mmap.mmap(-1, 4096)
+                    ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+                    n = pread_fn(fd, ptr, 4096, 0)
+                    ok = (n == 4096)
+            except OSError:
+                ok = False
+            finally:
+                if buf is not None:
+                    try:
+                        buf.close()
+                    except Exception:
+                        pass
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        with self._lock:
+            self._direct_supported[path] = ok
+            if ok and path not in self._direct_queues:
+                self._direct_queues[path] = queue.SimpleQueue()
+        return ok
+
+    def _borrow_direct(self, path: str, min_aligned_bytes: int):
+        with self._lock:
+            q = self._direct_queues[path]
+        try:
+            fd, buf, ptr, cap = q.get_nowait()
+        except queue.Empty:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            cap = max(1024 * 1024, (min_aligned_bytes + 4095) & ~4095)
+            buf = mmap.mmap(-1, cap)
+            ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+            with self._lock:
+                self._all_direct_resources.append((fd, buf))
+        if min_aligned_bytes > cap:
+            new_cap = max((min_aligned_bytes + 4095) & ~4095, cap * 2)
+            new_buf = mmap.mmap(-1, new_cap)
+            new_ptr = ctypes.addressof(ctypes.c_char.from_buffer(new_buf))
+            with self._lock:
+                self._all_direct_resources.append((-1, new_buf))
+            try:
+                buf.close()
+            except Exception:
+                pass
+            buf, ptr, cap = new_buf, new_ptr, new_cap
+        return fd, buf, ptr, cap, q
+
+    def _read_one_direct(self, path: str, abs_offset: int, dst_view: memoryview) -> bool:
+        length = len(dst_view)
+        if length == 0:
+            return True
+        pread_fn = _get_libc_pread()
+        if pread_fn is None:
+            return False
+        a_off = abs_offset & ~4095
+        head = abs_offset - a_off
+        a_len = ((head + length + 4095) & ~4095)
+        fd, buf, ptr, cap, q = self._borrow_direct(path, a_len)
+        try:
+            done = 0
+            while done < a_len:
+                n = pread_fn(fd, ptr + done, a_len - done, a_off + done)
+                if n < 0:
+                    _DIRECT_IO_STATS["fallbacks"] += 1
+                    return False
+                if n == 0:
+                    break
+                done += int(n)
+            if done < head + length:
+                _DIRECT_IO_STATS["fallbacks"] += 1
+                return False
+            with memoryview(buf) as mv:
+                dst_view[:] = mv[head : head + length]
+            _DIRECT_IO_STATS["calls"] += 1
+            _DIRECT_IO_STATS["bytes"] += length
+            return True
+        finally:
+            q.put((fd, buf, ptr, cap))
+
     def _read_one(self, task: tuple[str, int, int, int], view: memoryview) -> None:
         path, abs_offset, dst_offset, length = task
+        dst = view[dst_offset : dst_offset + length]
+        if length >= 4096 and self._probe_direct_path(path):
+            if self._read_one_direct(path, abs_offset, dst):
+                return
         f, q = self._borrow_handle(path)
         try:
-            _pread_or_seek_into(f, abs_offset, view[dst_offset : dst_offset + length], path)
+            _pread_or_seek_into(f, abs_offset, dst, path)
         finally:
             q.put(f)
 
@@ -1206,6 +1334,19 @@ class _ParallelSliceStagingPool:
                     pass
             self._all_handles.clear()
             self._handle_queues.clear()
+            for fd, buf in self._all_direct_resources:
+                try:
+                    buf.close()
+                except Exception:
+                    pass
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            self._all_direct_resources.clear()
+            self._direct_queues.clear()
+            self._direct_supported.clear()
         self._views.clear()
         self._slots.clear()
 

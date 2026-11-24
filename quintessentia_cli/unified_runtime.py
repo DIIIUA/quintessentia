@@ -2046,6 +2046,108 @@ def _eos_token_set(eos_token_id: Any) -> set[int]:
     return set()
 
 
+@dataclass
+class SamplingConfig:
+    """Fast GPU token sampling + anti-loop penalty parameters."""
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    penalty_window: int = 256
+    seed: int | None = None
+
+    @property
+    def is_greedy_plain(self) -> bool:
+        return (
+            float(self.temperature) <= 0.0
+            and float(self.repetition_penalty) == 1.0
+            and float(self.presence_penalty) == 0.0
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "temperature": round(float(self.temperature), 4),
+            "top_p": round(float(self.top_p), 4),
+            "top_k": int(self.top_k),
+            "repetition_penalty": round(float(self.repetition_penalty), 4),
+            "presence_penalty": round(float(self.presence_penalty), 4),
+            "penalty_window": int(self.penalty_window),
+            "seed": self.seed,
+        }
+
+
+@torch.no_grad()
+def sample_next_token(
+    logits_row: torch.Tensor,
+    gen_history: list[int] | None,
+    cfg: SamplingConfig | None,
+    *,
+    rng: torch.Generator | None = None,
+) -> int:
+    """Selects next token id on GPU/CPU with optional anti-loop penalties and top-k/top-p sampling.
+
+    When `cfg is None` or `cfg.is_greedy_plain`, runs zero-overhead exact `argmax`.
+    Penalties apply strictly to `gen_history` (model-generated tokens, never the user prompt).
+    """
+    row = logits_row.reshape(-1)
+    if cfg is None or cfg.is_greedy_plain:
+        return int(row.argmax(dim=-1).item())
+
+    scores = row.float().clone()
+    vocab = int(scores.numel())
+
+    rp = float(cfg.repetition_penalty)
+    pp = float(cfg.presence_penalty)
+    if (rp != 1.0 or pp != 0.0) and gen_history:
+        win = int(cfg.penalty_window)
+        tail = gen_history[-win:] if win > 0 else gen_history
+        uniq = sorted({int(t) for t in tail if 0 <= int(t) < vocab})
+        if uniq:
+            idx = torch.tensor(uniq, dtype=torch.long, device=scores.device)
+            vals = scores.index_select(0, idx)
+            if rp != 1.0:
+                vals = torch.where(vals < 0.0, vals * rp, vals / rp)
+            if pp != 0.0:
+                vals = vals - pp
+            scores.index_copy_(0, idx, vals)
+
+    temp = float(cfg.temperature)
+    if temp <= 0.0:
+        return int(scores.argmax(dim=-1).item())
+
+    scores = scores / temp
+    top_k = int(cfg.top_k)
+    top_p = float(cfg.top_p)
+
+    if 0 < top_k < vocab:
+        top_v, top_i = torch.topk(scores, k=top_k)
+        probs = torch.softmax(top_v, dim=-1)
+        if 0.0 < top_p < 1.0:
+            cdf = torch.cumsum(probs, dim=-1)
+            keep = (cdf - probs) <= top_p
+            keep[0] = True
+            probs = torch.where(keep, probs, torch.zeros_like(probs))
+            probs = probs / probs.sum().clamp_min(1e-12)
+        pos = int(torch.multinomial(probs, num_samples=1, generator=rng).item())
+        return int(top_i[pos].item())
+
+    if 0.0 < top_p < 1.0:
+        sorted_v, sorted_i = torch.sort(scores, descending=True)
+        probs = torch.softmax(sorted_v, dim=-1)
+        cdf = torch.cumsum(probs, dim=-1)
+        keep = (cdf - probs) <= top_p
+        keep[0] = True
+        probs = torch.where(keep, probs, torch.zeros_like(probs))
+        probs = probs / probs.sum().clamp_min(1e-12)
+        pos = int(torch.multinomial(probs, num_samples=1, generator=rng).item())
+        return int(sorted_i[pos].item())
+
+    probs = torch.softmax(scores, dim=-1)
+    return int(torch.multinomial(probs, num_samples=1, generator=rng).item())
+
+
 class QuintessentiaUnifiedEngine:
     """High-level self-contained unified engine for CLI `ask`, `chat`, and LAN `serve`."""
 
@@ -2159,6 +2261,8 @@ class QuintessentiaUnifiedEngine:
         self._q1_cubes_runner = None
         self.thought_anchor_enabled = bool(thought_anchor)
         self._session_thought_anchor = None
+        self._active_sampling: SamplingConfig | None = None
+        self._sampling_rng: torch.Generator | None = None
         self.max_slot_bytes = resolved_slot_bytes
         self.q1_planes = int(q1_planes)
         self.cube_root_bits = int(cube_root_bits)
@@ -3089,6 +3193,14 @@ class QuintessentiaUnifiedEngine:
             self.captured.pop("post_norm", None)
         return picked, past, last_h, mtp_draft
 
+    def _sample_next_token(self, logits_row: torch.Tensor, gen_history: list[int] | None = None) -> int:
+        return sample_next_token(
+            logits_row,
+            gen_history,
+            getattr(self, "_active_sampling", None),
+            rng=getattr(self, "_sampling_rng", None),
+        )
+
     def _stream_bf16(
         self,
         prompt_ids: list[int],
@@ -3112,6 +3224,7 @@ class QuintessentiaUnifiedEngine:
         n = len(prompt_ids)
         start = max(0, min(int(cached_prefix_len), n - 1))
         all_ids = list(prompt_ids)
+        gen_history: list[int] = []
         past = past_kv if start > 0 else None
         picked = -1
         phase_ref = ["prefill"]
@@ -3160,10 +3273,11 @@ class QuintessentiaUnifiedEngine:
                         t_anchor = getattr(self, "_active_thought_anchor", None)
                         if t_anchor is not None:
                             logits = t_anchor.on_prefill_end(self, past, logits)
-                        picked = int(logits[0].argmax().item())
+                        picked = self._sample_next_token(logits[0], gen_history)
                     del logits
                     a = b
                 all_ids.append(picked)
+                gen_history.append(picked)
                 self._sync_compute()
                 prefill_ms = (time.perf_counter() - t_pre0) * 1000.0
                 yield {"kind": "tokens", "new_ids": [picked]}
@@ -3190,9 +3304,10 @@ class QuintessentiaUnifiedEngine:
                     if t_anchor is not None:
                         logits = t_anchor.transform_logits(logits, past, generated)
                         t_anchor.on_step_committed(past, 1)
-                    picked = int(logits[0].argmax().item())
+                    picked = self._sample_next_token(logits[0], gen_history)
                     del logits
                     all_ids.append(picked)
+                    gen_history.append(picked)
                     generated += 1
                     passes += 1
                     yield {"kind": "tokens", "new_ids": [picked]}
@@ -3240,6 +3355,7 @@ class QuintessentiaUnifiedEngine:
         eos_id = self.tokenizer.eos_token_id
         check = self._make_cancel_checker(cancel_check)
         all_ids = list(prompt_ids)
+        gen_history_fq: list[int] = []
         tail_ids = prompt_ids[cached_prefix_len:]
         assert len(tail_ids) >= 1
         past = None
@@ -3253,6 +3369,7 @@ class QuintessentiaUnifiedEngine:
                     tail_ids, past_kv, use_mtp=False, check=check, prefetch_next=max_new_tokens > 1
                 )
                 all_ids.append(picked)
+                gen_history_fq.append(picked)
                 self._sync_compute()
                 prefill_ms = (time.perf_counter() - t_pre0) * 1000.0
                 yield {"kind": "tokens", "new_ids": [picked]}
@@ -3276,9 +3393,10 @@ class QuintessentiaUnifiedEngine:
                     if t_anchor is not None:
                         lg = t_anchor.transform_logits(lg, past, generated_count)
                         t_anchor.on_step_committed(past, 1)
-                    picked = int(lg[0, -1].argmax(dim=-1).item())
+                    picked = self._sample_next_token(lg[0, -1], gen_history_fq)
                     del lg
                     all_ids.append(picked)
+                    gen_history_fq.append(picked)
                     generated_count += 1
                     passes += 1
                     yield {"kind": "tokens", "new_ids": [picked]}
@@ -3445,18 +3563,26 @@ class QuintessentiaUnifiedEngine:
     def stream_chat(
         self,
         messages: list[dict[str, str]],
-        max_new_tokens: int = 1024,
+        max_new_tokens: int | None = 1024,
         enable_thinking: bool = True,
         use_session_cache: bool = False,
         stop_on_eos: bool = True,
         cancel_check: Callable[[], bool] | None = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        penalty_window: int = 256,
+        seed: int | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Streams UTF-8-safe `thinking` and `answer` deltas, followed by a `done` telemetry packet.
 
-        ``cancel_check`` is polled before every prefill chunk, every decode step, and every streamed
-        layer pre-hook; when it returns True the generation stops with ``GenerationCancelled``. On
-        cancellation, errors and early close (``generator.close()``) every per-request tensor and
-        ring slot is released in ``finally``.
+        Pass ``max_new_tokens=0`` (or ``None``) for unlimited generation up to natural EOS or the
+        model's context window. ``cancel_check`` is polled before every prefill chunk, every decode
+        step, and every streamed layer pre-hook; when it returns True the generation stops with
+        ``GenerationCancelled``. On cancellation, errors and early close (``generator.close()``)
+        every per-request tensor and ring slot is released in ``finally``.
         """
         eos_ids = _eos_token_set(self.tokenizer.eos_token_id)
         check = self._make_cancel_checker(cancel_check)
@@ -3466,14 +3592,39 @@ class QuintessentiaUnifiedEngine:
         final_info: dict[str, Any] = {}
         auto_anchor_installed = False
         active_anchor_ref = getattr(self, "_active_thought_anchor", None)
+        sampling_cfg = SamplingConfig(
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+            repetition_penalty=float(repetition_penalty),
+            presence_penalty=float(presence_penalty),
+            penalty_window=int(penalty_window),
+            seed=seed,
+        )
         try:
             check("queue")
-            if max_new_tokens < 1:
-                raise ValueError("max_new_tokens must be positive")
+            if max_new_tokens is not None and int(max_new_tokens) < 0:
+                raise ValueError("max_new_tokens must be >= 0 (0 = unlimited until EOS)")
+            unlimited_tokens = (max_new_tokens is None) or (int(max_new_tokens) == 0)
+            plan_reserve_tokens = 4096 if unlimited_tokens else int(max_new_tokens)
             prompt_ids, cached_len, past_kv, unpark_ms = self._prepare_prompt_and_cache(
                 messages, enable_thinking=enable_thinking, use_session_cache=use_session_cache,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=plan_reserve_tokens,
             )
+            if unlimited_tokens:
+                model_ctx = int(getattr(self.engine.config, "max_position_embeddings", 32768) or 32768)
+                eff_max_new = max(1, min(32768, max(2048, model_ctx - len(prompt_ids))))
+            else:
+                eff_max_new = int(max_new_tokens)
+
+            self._active_sampling = sampling_cfg
+            if sampling_cfg.seed is not None and sampling_cfg.temperature > 0.0:
+                rng_dev = self.engine.device if getattr(self.engine, "device", None) is not None else torch.device("cpu")
+                gen_rng = torch.Generator(device=rng_dev)
+                gen_rng.manual_seed(int(sampling_cfg.seed))
+                self._sampling_rng = gen_rng
+            else:
+                self._sampling_rng = None
             if self.thought_anchor_enabled and active_anchor_ref is None:
                 from .thought_buffer import InitialProbabilityAnchor
                 if use_session_cache and cached_len > 0 and self._session_thought_anchor is not None:
@@ -3497,7 +3648,7 @@ class QuintessentiaUnifiedEngine:
 
             inner = self._stream_token_ids(
                 prompt_ids,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=eff_max_new,
                 stop_on_eos=stop_on_eos,
                 cached_prefix_len=cached_len,
                 past_kv=past_kv,
@@ -3604,6 +3755,8 @@ class QuintessentiaUnifiedEngine:
                 "park_to_ram_ms": round(park_ms, 2),
                 "parked_session_ram_mib": round(self.session.parked_bytes / MiB, 2),
                 "spec_gate": final_info.get("spec_gate", {}),
+                "sampling": sampling_cfg.as_dict(),
+                "unlimited_tokens": unlimited_tokens,
             }
             progressive = getattr(self.engine, "progressive", None)
             if progressive is not None:
@@ -3651,6 +3804,8 @@ class QuintessentiaUnifiedEngine:
             traceback.clear_frames(exc.__traceback__)
             raise
         finally:
+            self._active_sampling = None
+            self._sampling_rng = None
             if auto_anchor_installed:
                 self._active_thought_anchor = None
                 if self.probability_bus is not None:

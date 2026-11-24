@@ -146,16 +146,16 @@ def resolve_auto_v4_plan(
     """Resolve runtime weight format and V4 isolated mirror-scales activation for CLI/doctor.
 
     Rules:
-      - Explicit `--feedback-mode off`: never forces V4 or `q1_cubes`.
+      - Explicit `--feedback-mode off`: never forces V4 or `q1_cubes` (keeps legacy `auto` -> `q4`/`q6`).
       - Explicit `--feedback-mode v4|mirror_scales|pure_mirror|spiral_sphere`: promotes
-        `weight_format=auto` -> `q1_cubes`, enables `q1_imprint_puzzle=True`, and picks
+        `weight_format=auto` -> `q1_cubes`, enables `q1_imprint_puzzle` for MoE/unknown, and picks
         `q1_planes=5`, `cube_root_bits=8` unless overridden.
       - `--feedback-mode auto` + `--weight-format q1_cubes`: enables V4 (`mirror_scales`,
         `M0-M8`) automatically.
-      - `--feedback-mode auto` + `--weight-format auto` on CUDA: inspects model metadata and
-        live free VRAM; when a large MoE (`num_experts >= 8`) exceeds `1.25 * free_vram`,
-        automatically enables full V4 (`q1_cubes` + `mirror_scales` + `q1_imprint_puzzle=True`
-        + `q1_planes=5` + `cube_root_bits=8`). Smaller / dense models keep standard `auto`.
+      - `--feedback-mode auto` + `--weight-format auto` on CUDA: promotes ALL CUDA models
+        (dense and MoE alike) to pure Q1 cubes V4 (`q1_cubes` + `mirror_scales` + `q1_planes=5`
+        + `cube_root_bits=8`; enables `q1_imprint_puzzle=True` when `num_experts >= 2` or model
+        metadata is not yet local). CPU execution (`--device cpu` or no CUDA) keeps standard `auto`.
     """
     from src.stanok_contour import normalize_feedback_mode
 
@@ -221,14 +221,14 @@ def resolve_auto_v4_plan(
             "reason": "explicit_non_q1_or_cpu",
         }
 
-    # Check if CUDA + large MoE exceeding 1.25x free VRAM -> auto-select full V4 (M0-M8)
+    # Default CUDA auto: promote all CUDA checkpoints to pure Q1 cubes V4 (k=5, root_bits=8)
     if cuda_available is None:
         try:
             import torch
             cuda_available = bool(torch.cuda.is_available())
         except Exception:
             cuda_available = False
-    if not cuda_available or model_dir is None or not Path(model_dir).exists():
+    if not cuda_available:
         return {
             "weight_format": wf,
             "feedback_mode": "off",
@@ -236,67 +236,60 @@ def resolve_auto_v4_plan(
             "q1_planes": q1_planes,
             "cube_root_bits": 16,
             "auto_v4_selected": False,
-            "reason": "no_cuda_or_model",
+            "reason": "no_cuda",
         }
 
+    eff_planes = 5 if q1_planes is None else int(q1_planes)
+    eff_root = 16 if eff_planes > 8 else 8
+    has_local_model = model_dir is not None and Path(model_dir).exists()
+
     prof = profile
-    if prof is None:
+    if prof is None and has_local_model:
         try:
             from .model_source import runtime_profile
             prof = runtime_profile(model_dir)
         except Exception:
             prof = {}
     num_experts = int((prof or {}).get("num_experts") or 0)
-    if num_experts < 8:
-        return {
-            "weight_format": wf,
-            "feedback_mode": "off",
-            "q1_imprint_puzzle": False,
-            "q1_planes": q1_planes,
-            "cube_root_bits": 16,
-            "auto_v4_selected": False,
-            "reason": "dense_or_small_moe",
-        }
 
-    wb = weight_bytes
-    if wb is None:
-        try:
-            wb = _model_weight_bytes(Path(model_dir))
-        except Exception:
-            wb = 0
+    if num_experts >= 8 and has_local_model:
+        wb = weight_bytes
+        if wb is None:
+            try:
+                wb = _model_weight_bytes(Path(model_dir))
+            except Exception:
+                wb = 0
 
-    free_b = free_vram_bytes
-    if free_b is None:
-        try:
-            from .gpu_memory import measure_gpu_memory
-            free_b = int(measure_gpu_memory(0).get("free_bytes") or 0)
-        except Exception:
-            free_b = 0
+        free_b = free_vram_bytes
+        if free_b is None:
+            try:
+                from .gpu_memory import measure_gpu_memory
+                free_b = int(measure_gpu_memory(0).get("free_bytes") or 0)
+            except Exception:
+                free_b = 0
 
-    if free_b > 0 and wb > int(1.25 * free_b):
-        eff_planes = 5 if q1_planes is None else int(q1_planes)
-        eff_root = 16 if eff_planes > 8 else 8
-        return {
-            "weight_format": "q1_cubes",
-            "feedback_mode": "mirror_scales",
-            "q1_imprint_puzzle": True,
-            "q1_planes": eff_planes,
-            "cube_root_bits": eff_root,
-            "auto_v4_selected": True,
-            "reason": "auto_large_moe_exceeds_vram",
-            "num_experts": num_experts,
-            "weight_gib": round(wb / 2**30, 2),
-            "free_vram_gib": round(free_b / 2**30, 2),
-        }
+        if free_b > 0 and wb > int(1.25 * free_b):
+            return {
+                "weight_format": "q1_cubes",
+                "feedback_mode": "mirror_scales",
+                "q1_imprint_puzzle": True,
+                "q1_planes": eff_planes,
+                "cube_root_bits": eff_root,
+                "auto_v4_selected": True,
+                "reason": "auto_large_moe_exceeds_vram",
+                "num_experts": num_experts,
+                "weight_gib": round(wb / 2**30, 2),
+                "free_vram_gib": round(free_b / 2**30, 2),
+            }
 
     return {
-        "weight_format": wf,
-        "feedback_mode": "off",
-        "q1_imprint_puzzle": False,
-        "q1_planes": q1_planes,
-        "cube_root_bits": 16,
-        "auto_v4_selected": False,
-        "reason": "fits_vram_standard_auto",
+        "weight_format": "q1_cubes",
+        "feedback_mode": "mirror_scales",
+        "q1_imprint_puzzle": (num_experts >= 2 or not has_local_model),
+        "q1_planes": eff_planes,
+        "cube_root_bits": eff_root,
+        "auto_v4_selected": True,
+        "reason": "auto_q1_cubes_v4",
     }
 
 
@@ -344,9 +337,9 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--progressive-start", "--cpu-first", action=argparse.BooleanOptionalAction, default=True,
                    help="Start CPU and GPU preparation together; devices take work when ready (default); --no-progressive-start selects the GPU-first reference")
     p.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto",
-                   help="Runtime weights: auto keeps native Qwen Q4 or universal Q6; explicit q1_cubes/q1/q2/q4/q6/q8/bf16")
+                   help="Runtime weights: auto selects pure Q1 cubes V4 (k=5) on CUDA or standard CPU path; explicit q1_cubes/q1/q2/q4/q6/q8/bf16")
     p.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None,
-                   help="Explicit prefix depth; q1_cubes defaults to the complete 16-leaf tree, legacy q1 to 4")
+                   help="Explicit prefix depth; auto V4 / q1_cubes defaults to 5 planes (root_bits=8), legacy q1 to 4")
     p.add_argument("--cube-blueprint", help="Method 1 JSON map selecting Method 2 cube prefixes per projection")
     p.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable dynamic Plane-0 vocabulary early-stop on Ideal Q1 LM head (default: on)")
@@ -364,7 +357,7 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         "--feedback-mode",
         choices=FEEDBACK_MODE_CHOICES,
         default="auto",
-        help="Q1 mirror feedback mode: auto (auto-selects V4 M0-M8 on large MoE exceeding VRAM), off, spiral_sphere (V2), pure_mirror (V3), or mirror_scales/v4 (V4 isolated pure-math mirror scales)",
+        help="Q1 mirror feedback mode: auto (pure Q1 cubes V4 M0-M8 on CUDA), off (opt out to legacy q4/q6), spiral_sphere (V2), pure_mirror (V3), or mirror_scales/v4 (V4 isolated pure-math mirror scales)",
     )
     p.add_argument(
         "--rest-tol",
@@ -643,13 +636,23 @@ def cmd_models(args):
 
 
 def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vram_mode="normal",
-                        q1_planes=4, q1_early_stop=True):
+                        q1_planes=None, q1_early_stop=True):
     import torch
     from .unified_runtime import QuintessentiaUnifiedEngine
-    with QuintessentiaUnifiedEngine(folder, quintessentia_root=root, device=device, weight_format=weight_format,
+    v4_plan = resolve_auto_v4_plan(
+        model_dir=Path(folder),
+        weight_format=weight_format,
+        feedback_mode="auto",
+        q1_planes=q1_planes,
+        device=device,
+    )
+    with QuintessentiaUnifiedEngine(
+        folder, quintessentia_root=root, device=device, weight_format=v4_plan["weight_format"],
         vram_mode=vram_mode, enable_mtp=False, speculation="off", verbose=False,
-        max_context_tokens=512, prefill_chunk_tokens=8, q1_planes=q1_planes,
-        q1_early_stop=q1_early_stop) as engine:
+        max_context_tokens=512, prefill_chunk_tokens=8, q1_planes=v4_plan["q1_planes"],
+        cube_root_bits=v4_plan["cube_root_bits"], q1_imprint_puzzle=bool(v4_plan["q1_imprint_puzzle"]),
+        q1_graphify_feedback=v4_plan["feedback_mode"], q1_early_stop=q1_early_stop,
+    ) as engine:
         ids = engine.tokenizer("Hi", return_tensors="pt").input_ids
         with torch.inference_mode():
             logits, cache = engine.engine._forward_step(ids, prefill=True, prefill_end=True, prefetch_next=False)
@@ -668,7 +671,7 @@ def cmd_prepare(args):
     root = find_quintessentia_root(args.quintessentia_root)
     folder = resolve_model_dir(args.model, root, allow_download=bool(args.model) and not Path(args.model).exists())
     report = _verify_preparation(folder, root=root, device=args.device, weight_format=args.weight_format,
-                                 vram_mode=args.vram_mode, q1_planes=getattr(args, "q1_planes", 4),
+                                 vram_mode=args.vram_mode, q1_planes=getattr(args, "q1_planes", None),
                                  q1_early_stop=getattr(args, "q1_early_stop", True))
     from .model_hub import register_model, save_json
     register_model(root, folder)
@@ -687,7 +690,7 @@ def cmd_download(args):
         if not args.no_verify:
             receipt["preparation"] = _verify_preparation(
                 folder, root=root, device=args.device, weight_format=args.weight_format,
-                vram_mode=args.vram_mode, q1_planes=getattr(args, "q1_planes", 4),
+                vram_mode=args.vram_mode, q1_planes=getattr(args, "q1_planes", None),
                 q1_early_stop=getattr(args, "q1_early_stop", True))
             receipt["status"] = "ready"
         save_json(marker, receipt)

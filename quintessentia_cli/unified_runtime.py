@@ -1874,7 +1874,14 @@ def plan_for_checkpoint(
         profile["packed_projections"] = packed_count
         profile["q1_cubes_layer_bytes"] = list(layer_bytes)
         shape = tuple(globals_sh.get("lm_head.weight", (int(cfg.get("vocab_size") or 1), cfg_hidden)))
-        lm_head_bytes = bf16_bytes_for_shape(shape)
+        bf16_lm_b = bf16_bytes_for_shape(shape)
+        if len(shape) == 2 and bf16_lm_b >= 256 * MiB and int(shape[1]) >= 64 and int(shape[1]) % 64 == 0:
+            v_sz, h_sz = int(shape[0]), int(shape[1])
+            lm_root = 16 if q1_p > 8 else 8
+            lm_cubes = max(1, min(lm_root, max(5, q1_p)))
+            lm_head_bytes = lm_cubes * v_sz * (h_sz // 8) + 2 * v_sz * (h_sz // 64) * 2 + 2 * (v_sz + h_sz)
+        else:
+            lm_head_bytes = bf16_lm_b
         profile["q1_cubes_lm_head_bytes"] = int(lm_head_bytes)
         mtp_bytes = 0
         has_mtp = False
@@ -2121,6 +2128,11 @@ def sample_next_token(
     top_k = int(cfg.top_k)
     top_p = float(cfg.top_p)
 
+    def _multinomial_pick(p: torch.Tensor) -> int:
+        if rng is not None and rng.device != p.device:
+            p = p.to(rng.device)
+        return int(torch.multinomial(p, num_samples=1, generator=rng).item())
+
     if 0 < top_k < vocab:
         top_v, top_i = torch.topk(scores, k=top_k)
         probs = torch.softmax(top_v, dim=-1)
@@ -2130,7 +2142,7 @@ def sample_next_token(
             keep[0] = True
             probs = torch.where(keep, probs, torch.zeros_like(probs))
             probs = probs / probs.sum().clamp_min(1e-12)
-        pos = int(torch.multinomial(probs, num_samples=1, generator=rng).item())
+        pos = _multinomial_pick(probs)
         return int(top_i[pos].item())
 
     if 0.0 < top_p < 1.0:
@@ -2141,11 +2153,11 @@ def sample_next_token(
         keep[0] = True
         probs = torch.where(keep, probs, torch.zeros_like(probs))
         probs = probs / probs.sum().clamp_min(1e-12)
-        pos = int(torch.multinomial(probs, num_samples=1, generator=rng).item())
+        pos = _multinomial_pick(probs)
         return int(sorted_i[pos].item())
 
     probs = torch.softmax(scores, dim=-1)
-    return int(torch.multinomial(probs, num_samples=1, generator=rng).item())
+    return _multinomial_pick(probs)
 
 
 class QuintessentiaUnifiedEngine:
@@ -2512,8 +2524,12 @@ class QuintessentiaUnifiedEngine:
                 resident = num_layers if self.plan.full_residency else int(self.plan.resident_layers)
 
             ram_budget = _streaming_ram_budget_bytes() or (2048 * MiB)
-            layer_host_bytes = min(1024 * MiB, ram_budget // 3)
-            moe_host_bytes = min(8192 * MiB, max(0, ram_budget - layer_host_bytes))
+            if has_moe:
+                layer_host_bytes = min(1024 * MiB, ram_budget // 3)
+                moe_host_bytes = min(8192 * MiB, max(0, ram_budget - layer_host_bytes))
+            else:
+                layer_host_bytes = min(8192 * MiB, ram_budget)
+                moe_host_bytes = 0
             is_v4_isolated = (self.q1_graphify_feedback == "mirror_scales")
             if not is_v4_isolated:
                 from src.stanok_contour import StanokContainmentContour, UnifiedProbabilityBus

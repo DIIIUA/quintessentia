@@ -1140,6 +1140,193 @@ extern "C" __global__ void ideal_q1_fwht_gemv_f32(
     }
 }
 
+/* 7b. Bank-Conflict-Free 10-bit Ballot+POPC Ideal Q1 FWHT GEMV (2 rows/warp = 16 rows/block)
+ * Single-pass up to K=32768, GS=64, shared_scale=1, cand_count=0, plane_start=0 (4x-7.3x faster!).
+ */
+extern "C" __global__ void ideal_q1_popc10_r2_gemv_f32(
+    const unsigned short* __restrict__ x_bf16,
+    const unsigned char* __restrict__ packed_lo,
+    const unsigned short* __restrict__ qscale,
+    const unsigned short* __restrict__ qzero,
+    const unsigned short* __restrict__ row_scale,
+    const unsigned short* __restrict__ col_scale,
+    const int* __restrict__ cand_rows,
+    const unsigned short* __restrict__ bias_bf16,
+    void* __restrict__ y_out,
+    int M, int N, int K, int GS,
+    int P_total, int plane_start, int plane_count,
+    int cand_count, int accumulate, int out_is_bf16, int shared_scale
+) {
+    extern __shared__ char smem_raw[];
+    int ng = K >> 6;
+    unsigned int* s_ax_lo = reinterpret_cast<unsigned int*>(smem_raw);
+    unsigned int* s_ax_hi = s_ax_lo + 10 * ng;
+    float* s_xmin  = reinterpret_cast<float*>(s_ax_hi + 10 * ng);
+    float* s_xstep = s_xmin + ng;
+    float* s_xsum  = s_xstep + ng;
+
+    int tid = threadIdx.x;
+    int m = blockIdx.y;
+    if (m >= M) return;
+
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row0 = (blockIdx.x * warps_per_block + warp_id) * 2;
+    int row1 = row0 + 1;
+    bool valid0 = (row0 < N);
+    bool valid1 = (row1 < N);
+
+    const unsigned short* x_row = x_bf16 + (long long)m * K;
+    const float q_max_f = 1023.0f;
+    for (int g = warp_id; g < ng; g += warps_per_block) {
+        int base = g << 6;
+        float v0 = bf16_to_f32(x_row[base + lane]) * bf16_to_f32(col_scale[base + lane]);
+        float v1 = bf16_to_f32(x_row[base + 32 + lane]) * bf16_to_f32(col_scale[base + 32 + lane]);
+        #pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            float p0 = __shfl_xor_sync(0xffffffffu, v0, d);
+            float p1 = __shfl_xor_sync(0xffffffffu, v1, d);
+            v0 = (lane & d) ? (p0 - v0) : (v0 + p0);
+            v1 = (lane & d) ? (p1 - v1) : (v1 + p1);
+        }
+        float y0 = (v0 + v1) * 0.125f;
+        float y1 = (v0 - v1) * 0.125f;
+
+        float g_sum = y0 + y1;
+        float g_min = fminf(y0, y1);
+        float g_max = fmaxf(y0, y1);
+        #pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            g_sum += __shfl_xor_sync(0xffffffffu, g_sum, d);
+            g_min = fminf(g_min, __shfl_xor_sync(0xffffffffu, g_min, d));
+            g_max = fmaxf(g_max, __shfl_xor_sync(0xffffffffu, g_max, d));
+        }
+        float range = g_max - g_min;
+        float inv_step = (range > 1e-12f) ? (q_max_f / range) : 0.0f;
+        float step = (range > 1e-12f) ? (range / q_max_f) : 0.0f;
+        int q0 = __float2int_rn((y0 - g_min) * inv_step);
+        int q1 = __float2int_rn((y1 - g_min) * inv_step);
+        if (q0 < 0) q0 = 0; else if (q0 > 1023) q0 = 1023;
+        if (q1 < 0) q1 = 0; else if (q1 > 1023) q1 = 1023;
+        #pragma unroll
+        for (int a = 0; a < 10; ++a) {
+            unsigned int blo = __ballot_sync(0xffffffffu, (q0 >> a) & 1);
+            unsigned int bhi = __ballot_sync(0xffffffffu, (q1 >> a) & 1);
+            if (lane == 0) {
+                s_ax_lo[a * ng + g] = blo;
+                s_ax_hi[a * ng + g] = bhi;
+            }
+        }
+        if (lane == 0) {
+            s_xmin[g]  = g_min;
+            s_xstep[g] = step;
+            s_xsum[g]  = g_sum;
+        }
+    }
+    __syncthreads();
+
+    if (!valid0) return;
+
+    int k8 = K >> 3;
+    long long plane_byte_stride = (long long)N * k8;
+    const unsigned short* z_r0 = qzero + (long long)row0 * ng;
+    const unsigned short* s_r0 = qscale + (long long)row0 * ng;
+    const unsigned short* z_r1 = valid1 ? (qzero + (long long)row1 * ng) : nullptr;
+    const unsigned short* s_r1 = valid1 ? (qscale + (long long)row1 * ng) : nullptr;
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int g = lane; g < ng; g += 32) {
+        float xm = s_xmin[g];
+        float xs = s_xstep[g];
+        float xsm = s_xsum[g];
+        unsigned int ax_lo[10];
+        unsigned int ax_hi[10];
+        #pragma unroll
+        for (int a = 0; a < 10; ++a) {
+            ax_lo[a] = s_ax_lo[a * ng + g];
+            ax_hi[a] = s_ax_hi[a * ng + g];
+        }
+        acc0 += bf16_to_f32(z_r0[g]) * xsm;
+        {
+            float bs = bf16_to_f32(s_r0[g]);
+            float ga = 0.0f, pm = 1.0f;
+            const unsigned char* bb = packed_lo + (long long)row0 * k8 + (g << 3);
+            for (int p = 0; p < plane_count; ++p) {
+                const uint2 w2 = *reinterpret_cast<const uint2*>(bb + (long long)p * plane_byte_stride);
+                int pc_w = __popc(w2.x) + __popc(w2.y);
+                int ip = 0;
+                #pragma unroll
+                for (int a = 9; a >= 0; --a) {
+                    ip = (ip << 1) + __popc(w2.x & ax_lo[a]) + __popc(w2.y & ax_hi[a]);
+                }
+                float d1 = xm * (float)pc_w + xs * (float)ip;
+                ga += pm * (2.0f * d1 - xsm);
+                pm *= 0.5f;
+            }
+            acc0 += bs * ga;
+        }
+        if (valid1) {
+            acc1 += bf16_to_f32(z_r1[g]) * xsm;
+            float bs = bf16_to_f32(s_r1[g]);
+            float ga = 0.0f, pm = 1.0f;
+            const unsigned char* bb = packed_lo + (long long)row1 * k8 + (g << 3);
+            for (int p = 0; p < plane_count; ++p) {
+                const uint2 w2 = *reinterpret_cast<const uint2*>(bb + (long long)p * plane_byte_stride);
+                int pc_w = __popc(w2.x) + __popc(w2.y);
+                int ip = 0;
+                #pragma unroll
+                for (int a = 9; a >= 0; --a) {
+                    ip = (ip << 1) + __popc(w2.x & ax_lo[a]) + __popc(w2.y & ax_hi[a]);
+                }
+                float d1 = xm * (float)pc_w + xs * (float)ip;
+                ga += pm * (2.0f * d1 - xsm);
+                pm *= 0.5f;
+            }
+            acc1 += bs * ga;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, offset);
+        if (valid1) acc1 += __shfl_down_sync(0xffffffffu, acc1, offset);
+    }
+
+    if (lane == 0) {
+        float val0 = acc0 * bf16_to_f32(row_scale[row0]);
+        if (bias_bf16 != nullptr) val0 += bf16_to_f32(bias_bf16[row0]);
+        long long idx0 = (long long)m * N + row0;
+        if (accumulate) {
+            if (out_is_bf16) {
+                unsigned short* out_p = reinterpret_cast<unsigned short*>(y_out);
+                out_p[idx0] = f32_to_bf16_rne(bf16_to_f32(out_p[idx0]) + val0);
+            } else {
+                reinterpret_cast<float*>(y_out)[idx0] += val0;
+            }
+        } else {
+            if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx0] = f32_to_bf16_rne(val0);
+            else reinterpret_cast<float*>(y_out)[idx0] = val0;
+        }
+        if (valid1) {
+            float val1 = acc1 * bf16_to_f32(row_scale[row1]);
+            if (bias_bf16 != nullptr) val1 += bf16_to_f32(bias_bf16[row1]);
+            long long idx1 = (long long)m * N + row1;
+            if (accumulate) {
+                if (out_is_bf16) {
+                    unsigned short* out_p = reinterpret_cast<unsigned short*>(y_out);
+                    out_p[idx1] = f32_to_bf16_rne(bf16_to_f32(out_p[idx1]) + val1);
+                } else {
+                    reinterpret_cast<float*>(y_out)[idx1] += val1;
+                }
+            } else {
+                if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx1] = f32_to_bf16_rne(val1);
+                else reinterpret_cast<float*>(y_out)[idx1] = val1;
+            }
+        }
+    }
+}
+
 /* Verification kernel for Ampere PTX mma.sync.aligned.m8n8k128.row.col.s32.b1.b1.s32.and.popc */
 extern "C" __global__ void b1_mma_m8n8k128_verify_u32(
     const unsigned int* __restrict__ a_bits,  /* [8, 4] uint32 */
@@ -1917,6 +2104,7 @@ _KERNEL_NAMES = (
     b"q1_cube_adaptive_radar_gemv_f32",
     b"q1_packed_trunc_gemv_f32",
     b"ideal_q1_fwht_gemv_f32",
+    b"ideal_q1_popc10_r2_gemv_f32",
     b"b1_mma_m8n8k128_verify_u32",
     b"ideal_q1_b1_mma_gemm_f32",
     b"quintessentia_q2_fwht_gemv_f32",
@@ -2309,16 +2497,30 @@ def launch_ideal_q1_fwht_gemv(
         ctypes.addressof(c_cc), ctypes.addressof(c_acc), ctypes.addressof(c_ob), ctypes.addressof(c_ss),
     )
 
-    chunk_cap = min(K, 4096)
-    smem = (chunk_cap + chunk_cap // group_size) * 4
-    grid_x = (out_rows + 7) // 8
+    use_popc10_r2 = (
+        int(group_size) == 64
+        and K <= 32768
+        and shared_sc == 1
+        and cand_cnt == 0
+        and int(plane_start) == 0
+    )
+    if use_popc10_r2:
+        ng = K >> 6
+        smem = (23 * ng) * 4
+        grid_x = (out_rows + 15) // 16
+        kname = b"ideal_q1_popc10_r2_gemv_f32"
+    else:
+        chunk_cap = min(K, 4096)
+        smem = (chunk_cap + chunk_cap // group_size) * 4
+        grid_x = (out_rows + 7) // 8
+        kname = b"ideal_q1_fwht_gemv_f32"
     stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
     rc = nvcuda.cuLaunchKernel(
-        fns[b"ideal_q1_fwht_gemv_f32"],
+        fns[kname],
         grid_x, M, 1, 256, 1, 1, smem, stream, args, None,
     )
     if rc != 0:
-        raise RuntimeError(f"cuLaunchKernel(ideal_q1_fwht_gemv_f32) failed with CUresult={rc}")
+        raise RuntimeError(f"cuLaunchKernel({kname.decode()}) failed with CUresult={rc}")
 
 
 def launch_b1_mma_raw_verify(a_bits: torch.Tensor, b_bits: torch.Tensor, c_out: torch.Tensor) -> None:

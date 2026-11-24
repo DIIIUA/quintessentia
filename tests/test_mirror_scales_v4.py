@@ -887,7 +887,7 @@ def test_phase5_auto_v4_cli_plan_and_quint_launcher(tmp_path):
     assert plan_large["cube_root_bits"] == 8
     assert plan_large["reason"] == "auto_large_moe_exceeds_vram"
 
-    # 2. Dense model (num_experts=0) -> keeps standard auto
+    # 2. Dense model (num_experts=0) on CUDA -> promoted to pure Q1 cubes V4 (k=5, root_bits=8)
     plan_dense = resolve_auto_v4_plan(
         model_dir=dummy_model,
         weight_format="auto",
@@ -899,11 +899,15 @@ def test_phase5_auto_v4_cli_plan_and_quint_launcher(tmp_path):
         profile={"num_experts": 0},
         weight_bytes=12 * GiB,
     )
-    assert plan_dense["auto_v4_selected"] is False
-    assert plan_dense["weight_format"] == "auto"
-    assert plan_dense["feedback_mode"] == "off"
+    assert plan_dense["auto_v4_selected"] is True
+    assert plan_dense["weight_format"] == "q1_cubes"
+    assert plan_dense["feedback_mode"] == "mirror_scales"
+    assert plan_dense["q1_imprint_puzzle"] is False
+    assert plan_dense["q1_planes"] == 5
+    assert plan_dense["cube_root_bits"] == 8
+    assert plan_dense["reason"] == "auto_q1_cubes_v4"
 
-    # 3. Small MoE fitting inside 1.25x VRAM -> keeps standard auto
+    # 3. Small MoE fitting inside 1.25x VRAM on CUDA -> promoted to pure Q1 cubes V4 + imprint puzzle
     plan_small_moe = resolve_auto_v4_plan(
         model_dir=dummy_model,
         weight_format="auto",
@@ -915,8 +919,42 @@ def test_phase5_auto_v4_cli_plan_and_quint_launcher(tmp_path):
         profile={"num_experts": 16},
         weight_bytes=4 * GiB,
     )
-    assert plan_small_moe["auto_v4_selected"] is False
-    assert plan_small_moe["feedback_mode"] == "off"
+    assert plan_small_moe["auto_v4_selected"] is True
+    assert plan_small_moe["weight_format"] == "q1_cubes"
+    assert plan_small_moe["feedback_mode"] == "mirror_scales"
+    assert plan_small_moe["q1_imprint_puzzle"] is True
+    assert plan_small_moe["q1_planes"] == 5
+    assert plan_small_moe["cube_root_bits"] == 8
+    assert plan_small_moe["reason"] == "auto_q1_cubes_v4"
+
+    # 3b. CPU-only or no CUDA keeps standard auto without forcing CUDA Q1 cubes
+    plan_cpu = resolve_auto_v4_plan(
+        model_dir=dummy_model,
+        weight_format="auto",
+        feedback_mode="auto",
+        q1_planes=None,
+        device="cpu",
+        cuda_available=True,
+        free_vram_bytes=int(7.5 * GiB),
+        profile={"num_experts": 0},
+        weight_bytes=12 * GiB,
+    )
+    assert plan_cpu["auto_v4_selected"] is False
+    assert plan_cpu["weight_format"] == "auto"
+    assert plan_cpu["feedback_mode"] == "off"
+
+    plan_no_cuda = resolve_auto_v4_plan(
+        model_dir=dummy_model,
+        weight_format="auto",
+        feedback_mode="auto",
+        q1_planes=None,
+        device="auto",
+        cuda_available=False,
+        profile={"num_experts": 0},
+    )
+    assert plan_no_cuda["auto_v4_selected"] is False
+    assert plan_no_cuda["weight_format"] == "auto"
+    assert plan_no_cuda["feedback_mode"] == "off"
 
     # 4. Explicit `--feedback-mode off` always opts out even for large MoE
     plan_off = resolve_auto_v4_plan(

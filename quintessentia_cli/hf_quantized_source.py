@@ -19,6 +19,16 @@ from quintessentia_cli.model_source import (
 TILE_ELEMENTS = 1024 * 1024
 
 
+def decode_bnb_int8(weight, scb, device=None):
+    """bitsandbytes LLM.int8 row-wise dequantization: ``weight * scb[:, None] / 127.0``."""
+    if weight.ndim != 2 or scb.ndim != 1 or int(scb.shape[0]) != int(weight.shape[0]):
+        raise ValueError("bitsandbytes int8 requires 2D weight and 1D SCB matching rows")
+    dst = device or weight.device
+    w_f = weight.to(device=dst, dtype=torch.float32)
+    s_f = scb.to(device=dst, dtype=torch.float32).unsqueeze(1)
+    return (w_f * (s_f / 127.0)).contiguous()
+
+
 def decode_fp8(weight, scales, block_size, device=None):
     """E4M3/E5M2 values multiplied by the corresponding block scale."""
     if weight.ndim != 2 or len(block_size) != 2 or min(block_size) <= 0:
@@ -110,6 +120,9 @@ class HFQuantizedSource(HFShardedSource):
             block = self.quant_config.get("weight_block_size")
             if not isinstance(block, (tuple, list)) or len(block) != 2 or min(block) <= 0:
                 raise UnsupportedModelError("FP8 source requires explicit weight_block_size")
+        elif method == "bitsandbytes":
+            if not (self.quant_config.get("load_in_8bit") or self.quant_config.get("_load_in_8bit")):
+                raise UnsupportedModelError("bitsandbytes source currently requires 8-bit LLM.int8 checkpoints")
         else:
             if int(self.quant_config.get("bits", 0)) != 4:
                 raise UnsupportedModelError("HF packed source currently requires 4-bit AWQ/GPTQ")
@@ -136,6 +149,17 @@ class HFQuantizedSource(HFShardedSource):
                         raise UnsupportedModelError(f"FP8 scale grid does not cover {name}")
                     self._quantized[entry] = {"scale": entries[sibling], "shape": tuple(meta["shape"])}
                     updated.pop(sibling)
+                elif method == "bitsandbytes" and meta["dtype"] == "I8" and name.endswith(".weight"):
+                    prefix = name.removesuffix(".weight")
+                    scb_k = prefix + ".SCB"
+                    if scb_k not in entries:
+                        continue
+                    scb_shape = self._tensor_meta(*entries[scb_k])["shape"]
+                    if len(meta["shape"]) != 2 or len(scb_shape) != 1 or int(scb_shape[0]) != int(meta["shape"][0]):
+                        raise UnsupportedModelError(f"Inconsistent bitsandbytes int8 SCB shape: {name}")
+                    self._quantized[entry] = {"scb": entries[scb_k], "shape": tuple(meta["shape"])}
+                    updated.pop(scb_k, None)
+                    updated.pop(prefix + ".weight_format", None)
                 elif method in {"awq", "gptq"} and name.endswith(".qweight"):
                     prefix = name.removesuffix("qweight")
                     required = ("qzeros", "scales", "g_idx") if method == "gptq" else ("qzeros", "scales")
@@ -220,6 +244,10 @@ class HFQuantizedSource(HFShardedSource):
             rows = torch.arange(r0, r1, device=scale.device)//br - s0
             cols = torch.arange(k, device=scale.device)//bc
             tile = weight.to(device=scale.device, dtype=torch.float32) * scale[rows[:, None], cols[None, :]]
+        elif method == "bitsandbytes":
+            weight = reader.read_matrix_slice(*entry, r0, r1)
+            scb = reader.read_tensor(*spec["scb"])[r0:r1].to(device=device, dtype=torch.float32)
+            tile = weight.to(device=scb.device, dtype=torch.float32) * (scb.unsqueeze(1) / 127.0)
         else:
             # Cover whole words even for an unaligned caller. The packer asks
             # for aligned rows, so its temporary allocation stays within budget.
@@ -239,7 +267,7 @@ class HFQuantizedSource(HFShardedSource):
         with self._tile_lock:
             self._tile_stats["decoded_tiles"] += 1
             self._tile_stats["max_decoded_elements"] = max(self._tile_stats["max_decoded_elements"], tile.numel())
-        return tile if method == "fp8" else tile[r0-a:r1-a].contiguous()
+        return tile if method in {"fp8", "bitsandbytes"} else tile[r0-a:r1-a].contiguous()
 
     def read_decoded(self, entry, device=None):
         weight = self._pread_reader.read_tensor(*entry)
@@ -250,6 +278,9 @@ class HFQuantizedSource(HFShardedSource):
         if method == "fp8":
             scale = self._pread_reader.read_tensor(*spec["scale"])
             return decode_fp8(weight, scale, self.quant_config["weight_block_size"], device)
+        if method == "bitsandbytes":
+            scb = self._pread_reader.read_tensor(*spec["scb"])
+            return decode_bnb_int8(weight, scb, device)
         parts = {key: self._pread_reader.read_tensor(*spec[key]) for key in ("qzeros", "scales")}
         groups = self._pread_reader.read_tensor(*spec["g_idx"]) if "g_idx" in spec else None
         return decode_int4(weight, **parts, method=method, group_size=int(self.quant_config["group_size"]),

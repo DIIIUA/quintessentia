@@ -225,6 +225,29 @@ class SurvivorProbabilityTracker:
             return logits
 
         if hasattr(raw, "packed_lo") and hasattr(raw, "qscale") and hasattr(raw, "qzero"):
+            if getattr(raw, "use_fwht", False) and hasattr(raw, "active_cubes") and raw.packed_lo.is_cuda:
+                from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_fwht_gemv
+
+                c_i32 = cand_ids.to(device=raw.packed_lo.device, dtype=torch.int32).contiguous()
+                x_bf16 = h_norm.to(device=raw.packed_lo.device, dtype=torch.bfloat16).reshape(1, -1).contiguous()
+                y_out = torch.empty((1, int(c_i32.numel())), dtype=torch.float32, device=raw.packed_lo.device)
+                p_use = max(1, min(int(raw.packed_lo.shape[0]), int(getattr(raw, "active_cubes", raw.packed_lo.shape[0]))))
+                launch_ideal_q1_fwht_gemv(
+                    x_bf16,
+                    raw.packed_lo,
+                    raw.qscale,
+                    raw.qzero,
+                    raw.row_scale,
+                    raw.col_scale,
+                    y_out,
+                    group_size=int(getattr(raw, "group_size", 64)),
+                    total_planes=int(raw.packed_lo.shape[0]),
+                    plane_start=0,
+                    plane_count=p_use,
+                    cand_rows=c_i32,
+                    bias=getattr(raw, "bias", None),
+                )
+                return y_out.reshape(-1)
             from src.quantized_projection import PACKED_FIELDS, unpack_weight
 
             c_dev = cand_ids.to(device=raw.packed_lo.device, dtype=torch.long)

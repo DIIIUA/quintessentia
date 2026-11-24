@@ -136,6 +136,7 @@ _GLOBAL_ALIASES = {
         "model.language_model.embed_tokens.weight",
         "language_model.model.embed_tokens.weight",
         "model.embed_tokens.weight",
+        "model.tok_embeddings.weight",
         "model.embeddings.weight",
         "model.decoder.embed_tokens.weight",
         "transformer.wte.weight",
@@ -155,6 +156,7 @@ _GLOBAL_ALIASES = {
         "language_model.model.norm.weight",
         "model.norm.weight",
         "model.norm_f.weight",
+        "model.final_norm.weight",
         "model.embedding_norm.weight",
         "model.final_layernorm.weight",
         "model.decoder.final_layer_norm.weight",
@@ -174,6 +176,7 @@ _GLOBAL_ALIASES = {
         "language_model.lm_head.weight",
         "embed_out.weight",
         "output_projection.weight",
+        "output.weight",
         "head.weight",
     ),
 }
@@ -1869,7 +1872,8 @@ _HF_EXPERT_LEAF_RE = re.compile(
 )
 _HF_PACKED_EXPERT_LEAF_RE = re.compile(
     r"^(mlp\.experts|feed_forward\.experts|block_sparse_moe\.experts|mixer\.experts)"
-    r"\.(gate_up_proj|up_proj|down_proj|gate_up_proj_bias|down_proj_bias)(?:\.weight)?$"
+    r"\.(gate_up_proj|up_proj|down_proj|gate_up_proj_bias|down_proj_bias"
+    r"|gate_up_proj_blocks|gate_up_proj_scales|down_proj_blocks|down_proj_scales)(?:\.weight)?$"
 )
 _HF_EXPERT_ROLE = {
     "gate_proj": "gate",
@@ -1937,6 +1941,54 @@ class _HFExpertCacheAndLoader:
                     max_expert_raw_bytes = max(max_expert_raw_bytes, un + dn)
 
         for l_idx, pmap in packed_experts.items():
+            if {"gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales"}.issubset(pmap):
+                # Native HuggingFace MXFP4 packed experts (e.g. GptOss-20B-MXFP4):
+                #   gate_up_proj_blocks [E, 2*I, H//32, 16] u8 + gate_up_proj_scales [E, 2*I, H//32] u8
+                #   down_proj_blocks    [E, H,   I//32, 16] u8 + down_proj_scales    [E, H,   I//32] u8
+                gub_p, gub_off, gub_n, _, gub_sh = reader.tensor_span(*pmap["gate_up_proj_blocks"])
+                gus_p, gus_off, gus_n, _, gus_sh = reader.tensor_span(*pmap["gate_up_proj_scales"])
+                dnb_p, dnb_off, dnb_n, _, dnb_sh = reader.tensor_span(*pmap["down_proj_blocks"])
+                dns_p, dns_off, dns_n, _, dns_sh = reader.tensor_span(*pmap["down_proj_scales"])
+                n_exp = int(dnb_sh[0])
+                self.num_experts_by_layer[l_idx] = n_exp
+                H_cur = int(dnb_sh[1])
+                I_cur = int(dnb_sh[2]) * int(dnb_sh[3]) * 2
+                if int(gub_sh[0]) != n_exp or int(gub_sh[1]) != 2 * I_cur or int(gub_sh[2]) * int(gub_sh[3]) * 2 != H_cur:
+                    raise UnsupportedModelError(
+                        f"Unrecognised MXFP4 MoE shapes gate_up_blocks={gub_sh}, down_blocks={dnb_sh}"
+                    )
+                if inter_dim == 0 and hidden_dim == 0:
+                    inter_dim, hidden_dim = I_cur, H_cur
+                if (I_cur, H_cur) != (inter_dim, hidden_dim):
+                    uniform_shapes = False
+                bgub, bgus, bdnb, bdns = gub_n // n_exp, gus_n // n_exp, dnb_n // n_exp, dns_n // n_exp
+                for eid in range(n_exp):
+                    self._spans[(l_idx, eid)] = (
+                        "mxfp4_inter",
+                        (
+                            (gub_p, gub_off + eid * bgub, bgub),
+                            (gus_p, gus_off + eid * bgus, bgus),
+                            (dnb_p, dnb_off + eid * bdnb, bdnb),
+                            (dns_p, dns_off + eid * bdns, bdns),
+                        ),
+                        torch.uint8,
+                    )
+                max_expert_raw_bytes = max(max_expert_raw_bytes, bgub + bgus + bdnb + bdns)
+                if "gate_up_proj_bias" in pmap or "down_proj_bias" in pmap:
+                    gub_t = (
+                        reader.read_tensor(*pmap["gate_up_proj_bias"]).to(device=self.device, dtype=dtype)
+                        if "gate_up_proj_bias" in pmap
+                        else None
+                    )
+                    db_t = (
+                        reader.read_tensor(*pmap["down_proj_bias"]).to(device=self.device, dtype=dtype)
+                        if "down_proj_bias" in pmap
+                        else None
+                    )
+                    gb_t = gub_t[:, 0::2].contiguous() if gub_t is not None else None
+                    ub_t = gub_t[:, 1::2].contiguous() if gub_t is not None else None
+                    self._biases[l_idx] = (gb_t, ub_t, db_t)
+                continue
             dp, doff, dn, ddt, dsh = reader.tensor_span(*pmap["down_proj"])
             raw_dt = getattr(torch, ddt)
             n_exp = int(dsh[0])
@@ -2072,6 +2124,38 @@ class _HFExpertCacheAndLoader:
                 tasks.append((path, off, cursor, nbytes))
                 cursor += nbytes
         u8 = self._staging.fetch_to_device(tasks, cursor)
+        if mode == "mxfp4_inter":
+            # Exact HuggingFace MXFP4 dequant matching `transformers.integrations.mxfp4._convert_moe_packed_tensors`
+            n_bh = D // 32
+            n_bi = I // 32
+            bgub = 2 * I * n_bh * 16
+            bgus = 2 * I * n_bh
+            bdnb = D * n_bi * 16
+            bdns = D * n_bi
+            stride = bgub + bgus + bdnb + bdns
+            rows_u8 = u8.reshape(k, stride)
+            lut = torch.tensor(_MXFP4_DOUBLED_LEVELS, device=u8.device, dtype=torch.float32) * 0.5
+
+            def _dec_mxfp4(blk_u8: Any, sc_u8: Any, out_r: int, n_blk: int) -> Any:
+                blk = blk_u8.reshape(k, out_r, n_blk, 16)
+                exp = sc_u8.reshape(k, out_r, n_blk, 1).to(torch.int32) - 127
+                lo = lut[(blk & 0x0F).to(torch.int64)]
+                hi = lut[(blk >> 4).to(torch.int64)]
+                w = torch.stack((lo, hi), dim=-1).reshape(k, out_r, n_blk, 32)
+                torch.ldexp(w, exp, out=w)
+                return w.reshape(k, out_r, n_blk * 32).to(dtype=dtype)
+
+            gu = _dec_mxfp4(rows_u8[:, :bgub], rows_u8[:, bgub : bgub + bgus], 2 * I, n_bh)
+            dn = _dec_mxfp4(
+                rows_u8[:, bgub + bgus : bgub + bgus + bdnb],
+                rows_u8[:, bgub + bgus + bdnb :],
+                D,
+                n_bi,
+            )
+            gate = gu[:, 0::2, :].unsqueeze(1)
+            up = gu[:, 1::2, :].unsqueeze(1)
+            dn_r = dn.reshape(k, 1, I, D)
+            return torch.cat([gate, up, dn_r], dim=1)
         vals = u8.view(raw_dt).to(dtype=dtype)
         if mode in ("std3", "std2"):
             return vals.reshape(k, self.n_proj, I, D)
@@ -2264,7 +2348,8 @@ class HFShardedSource:
         for idx, pmap in self._packed_experts.items():
             has_3 = {"gate_up_proj", "down_proj"}.issubset(pmap)
             has_2 = {"up_proj", "down_proj"}.issubset(pmap)
-            if not (has_3 or has_2):
+            has_mxfp4 = {"gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales"}.issubset(pmap)
+            if not (has_3 or has_2 or has_mxfp4):
                 raise UnsupportedModelError(
                     f"{self.model_dir}: layer {idx} packed experts miss projections ({sorted(pmap)})"
                 )
@@ -2392,8 +2477,12 @@ class HFShardedSource:
         for layer_idx in moe_layers:
             exp_path = self._routed_expert_container[layer_idx]
             experts_mod = layers[layer_idx].get_submodule(exp_path)
-            for pname in ("gate_up_proj", "up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias"):
+            for pname in (
+                "gate_up_proj", "up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias",
+                "gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales",
+            ):
                 experts_mod._parameters.pop(pname, None)
+                experts_mod._buffers.pop(pname, None)
             for child in experts_mod.modules():
                 if child is not experts_mod:
                     child._parameters.clear()
@@ -2409,19 +2498,24 @@ class HFShardedSource:
             def _hf_sliced_experts_forward(
                 self_exp,
                 hidden_states: torch.Tensor,
-                top_k_index: torch.Tensor,
-                top_k_weights: torch.Tensor,
+                top_k_index: torch.Tensor | None = None,
+                top_k_weights: torch.Tensor | None = None,
+                *,
+                router_indices: torch.Tensor | None = None,
+                routing_weights: torch.Tensor | None = None,
                 _layer_idx=layer_idx,
                 _num_exp=num_exp_layer,
                 _is_llama4=is_llama4,
                 _has_bias=has_bias,
             ) -> torch.Tensor:
+                idx_t = router_indices if top_k_index is None else top_k_index
+                w_t = routing_weights if top_k_weights is None else top_k_weights
                 n_e = int(getattr(self_exp, "num_experts", _num_exp))
                 return _fast_moe_dispatch(
                     self_exp,
                     hidden_states,
-                    top_k_index,
-                    top_k_weights,
+                    idx_t,
+                    w_t,
                     n_e,
                     lambda ids, dev, dt, evict: loader.load_batch(_layer_idx, ids, dev, dt, evict),
                     packed_loader=loader if quant_bits else None,
@@ -2591,7 +2685,7 @@ class _GGUFGlobalsMap(collections.abc.MutableMapping):
 def _apply_shape_ops(torch_shape: tuple[int, ...], operations: Iterable[Any]) -> tuple[int, ...]:
     """Computes the target PyTorch shape after 1-to-1 GGUF ``ConversionOps`` (without reading bytes)."""
     from transformers.integrations.gguf.gguf_conversion_mapping import Unsqueeze
-    from quintessentia_cli.gguf_arch_registry import Transpose2D
+    from quintessentia_cli.gguf_arch_registry import SqueezeLast, Transpose2D
 
     shape = tuple(torch_shape)
     for op in operations:
@@ -2602,6 +2696,8 @@ def _apply_shape_ops(torch_shape: tuple[int, ...], operations: Iterable[Any]) ->
             shape = shape[:pos] + (1,) + shape[pos:]
         elif isinstance(op, Transpose2D) and len(shape) == 2:
             shape = (shape[1], shape[0])
+        elif isinstance(op, SqueezeLast) and len(shape) > 1 and shape[-1] == 1:
+            shape = shape[:-1]
     return shape
 
 
@@ -3064,6 +3160,23 @@ class GGUFModelSource:
             self._post_shapes[gguf_name] = _apply_shape_ops(torch_shape, ops)
             self._stored[canonical] = (shard_str, gguf_name)
 
+        # Merge split gate/up shared MLP weights into fused input_linear (e.g. GraniteMoeHybrid)
+        for idx, entries in self._layers.items():
+            for sfx in ("weight", "bias"):
+                gk = f"model.layers.{idx}.shared_mlp._gate_proj.{sfx}"
+                uk = f"model.layers.{idx}.shared_mlp._up_proj.{sfx}"
+                ik = f"model.layers.{idx}.shared_mlp.input_linear.{sfx}"
+                if gk in entries and uk in entries:
+                    g_shard, g_name = entries.pop(gk)
+                    _, u_name = entries.pop(uk)
+                    g_sh = self._post_shapes[g_name]
+                    u_sh = self._post_shapes[u_name]
+                    virt = f"{g_name}#cat0:{u_name}"
+                    self._post_shapes[virt] = (g_sh[0] + u_sh[0], *g_sh[1:])
+                    entries[ik] = (g_shard, virt)
+                elif uk in entries:
+                    entries[ik] = entries.pop(uk)
+
         for idx, exp_parts in self._routed_experts.items():
             if set(exp_parts) != {"gate", "up", "down"}:
                 raise UnsupportedModelError(
@@ -3176,7 +3289,7 @@ class GGUFModelSource:
         tensors: dict[str, Any] = {}
         files: dict[str, Any] = {}
         for name, (shard_path, gguf_name) in sorted(self.layer_entries(layer_idx).items()):
-            base_name = gguf_name.split("#row_slice:", 1)[0]
+            base_name = gguf_name.split("#cat0:", 1)[0].split("#row_slice:", 1)[0]
             info = self._tensor_info[base_name]
             tensors[name] = {
                 "shape": list(self._post_shapes[gguf_name]),
@@ -3251,6 +3364,12 @@ class GGUFModelSource:
     def read_converted_tensor(self, gguf_name: str, dtype: Any = None, device: Any = None):
         import torch
         from transformers.integrations.gguf.gguf_conversion_mapping import LogNegate, SubtractOne
+
+        if "#cat0:" in gguf_name:
+            parts = gguf_name.split("#cat0:")
+            return torch.cat(
+                [self.read_converted_tensor(p, dtype=dtype, device=device) for p in parts], dim=0
+            ).contiguous()
 
         row_slice: tuple[int, int] | None = None
         if "#row_slice:" in gguf_name:
@@ -3430,8 +3549,12 @@ class GGUFModelSource:
                 ) from exc
 
             # Remove meta parameters so neither _load_resident_layer nor ring hooks expect them in slots.
-            for pname in ("gate_up_proj", "up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias"):
+            for pname in (
+                "gate_up_proj", "up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias",
+                "gate_up_proj_blocks", "gate_up_proj_scales", "down_proj_blocks", "down_proj_scales",
+            ):
                 experts_mod._parameters.pop(pname, None)
+                experts_mod._buffers.pop(pname, None)
             for child in experts_mod.modules():
                 if child is not experts_mod:
                     child._parameters.clear()
@@ -3473,7 +3596,10 @@ def open_model_source(model_dir: str | Path):
     fmt = detect_format(model_dir)
     if fmt == "hf":
         quant = raw_text_config_dict(model_dir).get("quantization_config") or {}
-        if quant.get("quant_method") in {"fp8", "awq", "gptq"}:
+        if quant.get("quant_method") in {"fp8", "awq", "gptq"} or (
+            quant.get("quant_method") == "bitsandbytes"
+            and (quant.get("load_in_8bit") or quant.get("_load_in_8bit"))
+        ):
             from quintessentia_cli.hf_quantized_source import HFQuantizedSource
             return HFQuantizedSource(model_dir)
         return HFShardedSource(model_dir)

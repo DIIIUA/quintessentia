@@ -1211,6 +1211,124 @@ __device__ __forceinline__ void pm_block_fwht_and_sum(
     }
 }
 
+__device__ __forceinline__ float pm_warp_all_min_32(float v) {
+    #pragma unroll
+    for (int d = 16; d > 0; d >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffffu, v, d));
+    return v;
+}
+
+__device__ __forceinline__ float pm_warp_all_max_32(float v) {
+    #pragma unroll
+    for (int d = 16; d > 0; d >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, d));
+    return v;
+}
+
+__device__ __forceinline__ float pm_warp_all_sum_32(float v) {
+    #pragma unroll
+    for (int d = 16; d > 0; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+    return v;
+}
+
+/* Cooperative Block-FWHT (GS=64) + 10-bit __ballot_sync bit-slicing into bank-conflict-free smem.
+ * Precision: 1024 levels per 64-element FWHT group (error ~0.0024 = BF16 mantissa floor).
+ * Memory: only 92 B/group -> K up to 32768 fits in ONE SINGLE PASS (< 48 KB smem)!
+ */
+__device__ __forceinline__ void pm_fwht_and_ballot_slice10(
+    const unsigned short* __restrict__ x_row,
+    const unsigned short* __restrict__ x_last_bf16,
+    bool has_anchor,
+    float alpha,
+    const unsigned short* __restrict__ col_scale,
+    unsigned int* s_ax_lo,
+    unsigned int* s_ax_hi,
+    float* s_xmin,
+    float* s_xstep,
+    float* s_xsum,
+    int ng,
+    int warp_id,
+    int lane,
+    int warps_per_block
+) {
+    const float q_max_f = 1023.0f;
+    for (int g = warp_id; g < ng; g += warps_per_block) {
+        int base = g << 6;
+        int c0 = base + lane;
+        int c1 = base + 32 + lane;
+        float rx0 = pm_bf16_to_f32(x_row[c0]) - (has_anchor ? alpha * pm_bf16_to_f32(x_last_bf16[c0]) : 0.0f);
+        float rx1 = pm_bf16_to_f32(x_row[c1]) - (has_anchor ? alpha * pm_bf16_to_f32(x_last_bf16[c1]) : 0.0f);
+        float v0 = rx0 * pm_bf16_to_f32(col_scale[c0]);
+        float v1 = rx1 * pm_bf16_to_f32(col_scale[c1]);
+        #pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            float p0 = __shfl_xor_sync(0xffffffffu, v0, d);
+            float p1 = __shfl_xor_sync(0xffffffffu, v1, d);
+            v0 = (lane & d) ? (p0 - v0) : (v0 + p0);
+            v1 = (lane & d) ? (p1 - v1) : (v1 + p1);
+        }
+        float y0 = (v0 + v1) * 0.125f;
+        float y1 = (v0 - v1) * 0.125f;
+
+        float g_sum = pm_warp_all_sum_32(y0 + y1);
+        float g_min = pm_warp_all_min_32(fminf(y0, y1));
+        float g_max = pm_warp_all_max_32(fmaxf(y0, y1));
+        float range = g_max - g_min;
+        float inv_step = (range > 1e-12f) ? (q_max_f / range) : 0.0f;
+        float step = (range > 1e-12f) ? (range / q_max_f) : 0.0f;
+
+        int q0 = __float2int_rn((y0 - g_min) * inv_step);
+        int q1 = __float2int_rn((y1 - g_min) * inv_step);
+        if (q0 < 0) q0 = 0; else if (q0 > 1023) q0 = 1023;
+        if (q1 < 0) q1 = 0; else if (q1 > 1023) q1 = 1023;
+
+        #pragma unroll
+        for (int a = 0; a < 10; ++a) {
+            unsigned int blo = __ballot_sync(0xffffffffu, (q0 >> a) & 1);
+            unsigned int bhi = __ballot_sync(0xffffffffu, (q1 >> a) & 1);
+            if (lane == 0) {
+                s_ax_lo[a * ng + g] = blo;
+                s_ax_hi[a * ng + g] = bhi;
+            }
+        }
+        if (lane == 0) {
+            s_xmin[g]  = g_min;
+            s_xstep[g] = step;
+            s_xsum[g]  = g_sum;
+        }
+    }
+}
+
+__device__ __forceinline__ float pm_eval_q1_plane_popc10_row(
+    const unsigned int* s_ax_lo,
+    const unsigned int* s_ax_hi,
+    const float* s_xmin,
+    const float* s_xstep,
+    const float* s_xsum,
+    const unsigned char* b_row,
+    const unsigned short* s_row,
+    float p_mult,
+    int ng,
+    int lane
+) {
+    float partial = 0.0f;
+    for (int g = lane; g < ng; g += 32) {
+        const uint2 w2 = *reinterpret_cast<const uint2*>(b_row + (g << 3));
+        unsigned int wlo = w2.x;
+        unsigned int whi = w2.y;
+        int pc_w = __popc(wlo) + __popc(whi);
+        int ip = 0;
+        #pragma unroll
+        for (int a = 9; a >= 0; --a) {
+            ip = (ip << 1)
+               + __popc(wlo & s_ax_lo[a * ng + g])
+               + __popc(whi & s_ax_hi[a * ng + g]);
+        }
+        float d1 = s_xmin[g] * (float)pc_w + s_xstep[g] * (float)ip;
+        float sv = pm_bf16_to_f32(s_row[g]) * p_mult;
+        partial += sv * (2.0f * d1 - s_xsum[g]);
+    }
+    return partial;
+}
+
 __device__ __forceinline__ float pm_eval_q1_plane_chunk(
     const float* s_x,
     const float* s_xsum,
@@ -1518,6 +1636,268 @@ extern "C" __global__ void pure_mirror_diff_q1_gemv_f32(
     }
 }
 
+/* Kernel #6-R2: Bank-Conflict-Free 10-bit Ballot+POPC Differential Pure Mirror Q1 GEMV
+ * (`pure_mirror_diff_q1_gemv_r2_f32`):
+ *   - 2 output rows per warp (16 rows/block), single-pass FWHT + 10-bit __ballot_sync up to K=32768.
+ *   - Coalesced 64-bit `uint2` weight reads + zero-divergence __popc inner loop (4x-7.3x faster!).
+ *   - Exact same 21-arg ABI as Kernel #6; full differential anchor + Zero-Plane EQUAL + early-stop!
+ */
+extern "C" __global__ void pure_mirror_diff_q1_gemv_r2_f32(
+    const unsigned short* __restrict__ x_bf16,
+    const unsigned short* __restrict__ x_last_bf16,
+    const unsigned short* __restrict__ y_last_bf16,
+    const unsigned char* __restrict__ packed_lo,
+    const unsigned short* __restrict__ qscale,
+    const unsigned short* __restrict__ qzero,
+    const unsigned short* __restrict__ row_scale,
+    const unsigned short* __restrict__ col_scale,
+    const unsigned short* __restrict__ bias_bf16,
+    void* __restrict__ y_out,
+    int* __restrict__ used_planes_out,
+    float* __restrict__ mirror_defect_out,
+    int M, int N, int K, int GS,
+    int P_max, int P_min,
+    float mirror_tol,
+    int out_is_bf16,
+    int shared_scale
+) {
+    extern __shared__ char smem_raw[];
+    int ng = K >> 6;
+    unsigned int* s_ax_lo = reinterpret_cast<unsigned int*>(smem_raw);
+    unsigned int* s_ax_hi = s_ax_lo + 10 * ng;
+    float* s_xmin    = reinterpret_cast<float*>(s_ax_hi + 10 * ng);
+    float* s_xstep   = s_xmin + ng;
+    float* s_xsum    = s_xstep + ng;
+    float* sm_tot_e  = s_xsum + ng;
+    float* sm_step_e = sm_tot_e + 8;
+    float* sm_red0   = sm_step_e + 8;
+    float* sm_red1   = sm_red0 + 8;
+    float* sm_red2   = sm_red1 + 8;
+
+    int tid = threadIdx.x;
+    int m = blockIdx.y;
+    if (m >= M) return;
+
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row0 = (blockIdx.x * warps_per_block + warp_id) * 2;
+    int row1 = row0 + 1;
+    bool valid0 = (row0 < N);
+    bool valid1 = (row1 < N);
+
+    const unsigned short* x_row = x_bf16 + (long long)m * K;
+    int k8 = K >> 3;
+    long long plane_byte_stride = (long long)N * k8;
+    bool has_anchor = (x_last_bf16 != nullptr && y_last_bf16 != nullptr);
+
+    /* Step 0: Block-wide non-commutative mirror contact x_t = alpha * x_last + r_x */
+    float alpha = 0.0f;
+    float scar_ratio = 1.0f;
+    if (has_anchor) {
+        float l_dot = 0.0f, l_n2l = 0.0f, l_n2x = 0.0f;
+        for (int c = tid; c < K; c += blockDim.x) {
+            float xt = pm_bf16_to_f32(x_row[c]);
+            float xl = pm_bf16_to_f32(x_last_bf16[c]);
+            l_dot += xl * xt;
+            l_n2l += xl * xl;
+            l_n2x += xt * xt;
+        }
+        l_dot = warp_sum_32(l_dot);
+        l_n2l = warp_sum_32(l_n2l);
+        l_n2x = warp_sum_32(l_n2x);
+        if (lane == 0) {
+            sm_red0[warp_id] = l_dot;
+            sm_red1[warp_id] = l_n2l;
+            sm_red2[warp_id] = l_n2x;
+        }
+        __syncthreads();
+        float t_dot = sm_red0[0] + sm_red0[1] + sm_red0[2] + sm_red0[3]
+                    + sm_red0[4] + sm_red0[5] + sm_red0[6] + sm_red0[7];
+        float t_n2l = sm_red1[0] + sm_red1[1] + sm_red1[2] + sm_red1[3]
+                    + sm_red1[4] + sm_red1[5] + sm_red1[6] + sm_red1[7];
+        float t_n2x = sm_red2[0] + sm_red2[1] + sm_red2[2] + sm_red2[3]
+                    + sm_red2[4] + sm_red2[5] + sm_red2[6] + sm_red2[7];
+        if (t_n2l > 1e-10f) {
+            alpha = t_dot / (t_n2l + 1e-8f);
+            float scar_n2 = fmaxf(0.0f, t_n2x - alpha * t_dot);
+            scar_ratio = sqrtf(scar_n2 / (t_n2x + 1e-8f));
+        } else {
+            has_anchor = false;
+            alpha = 0.0f;
+            scar_ratio = 1.0f;
+        }
+        __syncthreads();
+
+        float zero_cut = (mirror_tol > 0.0f) ? fmaxf(1e-4f, 0.25f * mirror_tol) : 1e-4f;
+        if (has_anchor && scar_ratio < zero_cut) {
+            if (lane == 0) {
+                if (valid0) {
+                    float yv = alpha * pm_bf16_to_f32(y_last_bf16[row0]);
+                    if (bias_bf16 != nullptr) yv += (1.0f - alpha) * pm_bf16_to_f32(bias_bf16[row0]);
+                    long long idx = (long long)m * N + row0;
+                    if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx] = pm_f32_to_bf16_rne(yv);
+                    else reinterpret_cast<float*>(y_out)[idx] = yv;
+                }
+                if (valid1) {
+                    float yv = alpha * pm_bf16_to_f32(y_last_bf16[row1]);
+                    if (bias_bf16 != nullptr) yv += (1.0f - alpha) * pm_bf16_to_f32(bias_bf16[row1]);
+                    long long idx = (long long)m * N + row1;
+                    if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx] = pm_f32_to_bf16_rne(yv);
+                    else reinterpret_cast<float*>(y_out)[idx] = yv;
+                }
+            }
+            return;
+        }
+    }
+
+    /* Step 1: Single-pass cooperative Block-FWHT + 10-bit __ballot_sync slicing */
+    pm_fwht_and_ballot_slice10(
+        x_row, x_last_bf16, has_anchor, alpha, col_scale,
+        s_ax_lo, s_ax_hi, s_xmin, s_xstep, s_xsum,
+        ng, warp_id, lane, warps_per_block
+    );
+    __syncthreads();
+
+    float y_anc0 = (lane == 0 && valid0 && has_anchor) ? (alpha * pm_bf16_to_f32(y_last_bf16[row0])) : 0.0f;
+    float y_anc1 = (lane == 0 && valid1 && has_anchor) ? (alpha * pm_bf16_to_f32(y_last_bf16[row1])) : 0.0f;
+    float rs0 = (lane == 0 && valid0) ? pm_bf16_to_f32(row_scale[row0]) : 0.0f;
+    float rs1 = (lane == 0 && valid1) ? pm_bf16_to_f32(row_scale[row1]) : 0.0f;
+    float scar0 = 0.0f;
+    float scar1 = 0.0f;
+
+    if (mirror_tol <= 0.0f || P_min >= P_max) {
+        if (!valid0) return;
+        /* Full-depth register-reused fast path: load ax_lo/ax_hi ONCE per group across both rows & all P planes! */
+        float acc0 = 0.0f, acc1 = 0.0f;
+        const unsigned short* z_r0 = qzero + (long long)row0 * ng;
+        const unsigned short* s_r0 = qscale + (long long)row0 * ng;
+        const unsigned short* z_r1 = valid1 ? (qzero + (long long)row1 * ng) : nullptr;
+        const unsigned short* s_r1 = valid1 ? (qscale + (long long)row1 * ng) : nullptr;
+        for (int g = lane; g < ng; g += 32) {
+            float xm = s_xmin[g];
+            float xs = s_xstep[g];
+            float xsm = s_xsum[g];
+            unsigned int ax_lo[10];
+            unsigned int ax_hi[10];
+            #pragma unroll
+            for (int a = 0; a < 10; ++a) {
+                ax_lo[a] = s_ax_lo[a * ng + g];
+                ax_hi[a] = s_ax_hi[a * ng + g];
+            }
+            acc0 += pm_bf16_to_f32(z_r0[g]) * xsm;
+            {
+                float bs = pm_bf16_to_f32(s_r0[g]);
+                float ga = 0.0f, pm = 1.0f;
+                const unsigned char* bb = packed_lo + (long long)row0 * k8 + (g << 3);
+                for (int p = 0; p < P_max; ++p) {
+                    const uint2 w2 = *reinterpret_cast<const uint2*>(bb + (long long)p * plane_byte_stride);
+                    int pc_w = __popc(w2.x) + __popc(w2.y);
+                    int ip = 0;
+                    #pragma unroll
+                    for (int a = 9; a >= 0; --a) {
+                        ip = (ip << 1) + __popc(w2.x & ax_lo[a]) + __popc(w2.y & ax_hi[a]);
+                    }
+                    float d1 = xm * (float)pc_w + xs * (float)ip;
+                    ga += pm * (2.0f * d1 - xsm);
+                    pm *= 0.5f;
+                }
+                acc0 += bs * ga;
+            }
+            if (valid1) {
+                acc1 += pm_bf16_to_f32(z_r1[g]) * xsm;
+                float bs = pm_bf16_to_f32(s_r1[g]);
+                float ga = 0.0f, pm = 1.0f;
+                const unsigned char* bb = packed_lo + (long long)row1 * k8 + (g << 3);
+                for (int p = 0; p < P_max; ++p) {
+                    const uint2 w2 = *reinterpret_cast<const uint2*>(bb + (long long)p * plane_byte_stride);
+                    int pc_w = __popc(w2.x) + __popc(w2.y);
+                    int ip = 0;
+                    #pragma unroll
+                    for (int a = 9; a >= 0; --a) {
+                        ip = (ip << 1) + __popc(w2.x & ax_lo[a]) + __popc(w2.y & ax_hi[a]);
+                    }
+                    float d1 = xm * (float)pc_w + xs * (float)ip;
+                    ga += pm * (2.0f * d1 - xsm);
+                    pm *= 0.5f;
+                }
+                acc1 += bs * ga;
+            }
+        }
+        scar0 = warp_sum_32(acc0);
+        scar1 = valid1 ? warp_sum_32(acc1) : 0.0f;
+    } else {
+        /* Adaptive Mirror Self-Stop path: evaluate plane-by-plane with POPC10 and exit early on EQUAL */
+        float z0 = 0.0f, z1 = 0.0f;
+        const unsigned short* z_r0 = valid0 ? (qzero + (long long)row0 * ng) : nullptr;
+        const unsigned short* s_r0 = valid0 ? (qscale + (long long)row0 * ng) : nullptr;
+        const unsigned short* z_r1 = valid1 ? (qzero + (long long)row1 * ng) : nullptr;
+        const unsigned short* s_r1 = valid1 ? (qscale + (long long)row1 * ng) : nullptr;
+        if (valid0) {
+            for (int g = lane; g < ng; g += 32) {
+                float xsm = s_xsum[g];
+                z0 += pm_bf16_to_f32(z_r0[g]) * xsm;
+                if (valid1) z1 += pm_bf16_to_f32(z_r1[g]) * xsm;
+            }
+        }
+        z0 = valid0 ? warp_sum_32(z0) : 0.0f;
+        z1 = valid1 ? warp_sum_32(z1) : 0.0f;
+        scar0 = (lane == 0 && valid0) ? z0 : 0.0f;
+        scar1 = (lane == 0 && valid1) ? z1 : 0.0f;
+
+        for (int p = 0; p < P_max; ++p) {
+            float p_mult = ldexpf(1.0f, -p);
+            float obs0 = 0.0f, obs1 = 0.0f;
+            if (valid0) {
+                const unsigned char* b0 = packed_lo + (long long)p * plane_byte_stride + (long long)row0 * k8;
+                obs0 = pm_eval_q1_plane_popc10_row(s_ax_lo, s_ax_hi, s_xmin, s_xstep, s_xsum, b0, s_r0, p_mult, ng, lane);
+                obs0 = warp_sum_32(obs0);
+            }
+            if (valid1) {
+                const unsigned char* b1 = packed_lo + (long long)p * plane_byte_stride + (long long)row1 * k8;
+                obs1 = pm_eval_q1_plane_popc10_row(s_ax_lo, s_ax_hi, s_xmin, s_xstep, s_xsum, b1, s_r1, p_mult, ng, lane);
+                obs1 = warp_sum_32(obs1);
+            }
+            if (lane == 0) {
+                if (valid0) scar0 += obs0;
+                if (valid1) scar1 += obs1;
+                float yt0 = valid0 ? (y_anc0 + scar0 * rs0) : 0.0f;
+                float ys0 = valid0 ? (obs0 * rs0) : 0.0f;
+                float yt1 = valid1 ? (y_anc1 + scar1 * rs1) : 0.0f;
+                float ys1 = valid1 ? (obs1 * rs1) : 0.0f;
+                sm_tot_e[warp_id] = yt0 * yt0 + yt1 * yt1;
+                sm_step_e[warp_id] = ys0 * ys0 + ys1 * ys1;
+            }
+            __syncthreads();
+            float tile_tot_e = sm_tot_e[0] + sm_tot_e[1] + sm_tot_e[2] + sm_tot_e[3]
+                             + sm_tot_e[4] + sm_tot_e[5] + sm_tot_e[6] + sm_tot_e[7];
+            float tile_stp_e = sm_step_e[0] + sm_step_e[1] + sm_step_e[2] + sm_step_e[3]
+                             + sm_step_e[4] + sm_step_e[5] + sm_step_e[6] + sm_step_e[7];
+            float defect = (1.15470054f * sqrtf(tile_stp_e)) / (sqrtf(tile_tot_e) + 1e-8f);
+            if ((p + 1 >= P_min) && (defect < mirror_tol)) {
+                break;
+            }
+            __syncthreads();
+        }
+    }
+
+    if (lane == 0 && valid0) {
+        float yv0 = y_anc0 + scar0 * rs0;
+        if (bias_bf16 != nullptr) yv0 += (has_anchor ? (1.0f - alpha) : 1.0f) * pm_bf16_to_f32(bias_bf16[row0]);
+        long long idx0 = (long long)m * N + row0;
+        if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx0] = pm_f32_to_bf16_rne(yv0);
+        else reinterpret_cast<float*>(y_out)[idx0] = yv0;
+
+        if (valid1) {
+            float yv1 = y_anc1 + scar1 * rs1;
+            if (bias_bf16 != nullptr) yv1 += (has_anchor ? (1.0f - alpha) : 1.0f) * pm_bf16_to_f32(bias_bf16[row1]);
+            long long idx1 = (long long)m * N + row1;
+            if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx1] = pm_f32_to_bf16_rne(yv1);
+            else reinterpret_cast<float*>(y_out)[idx1] = yv1;
+        }
+    }
+}
+
 /* Kernel #6c: Constant-Memory Batched MoE Differential Q1 GEMV (`pure_mirror_diff_q1_moe_batch_f32`)
  * Executes up to 16 resident hot experts of a MoE layer in a SINGLE GPU launch (`grid=(tiles, 1, H)`),
  * saturating all SMs simultaneously with 0 inter-expert Python overhead and 0 H2D pointer arrays.
@@ -1576,8 +1956,113 @@ extern "C" __global__ void pure_mirror_diff_q1_moe_batch_f32(
     int k8 = K >> 3;
     long long plane_byte_stride = (long long)N * k8;
     long long plane_grp_stride = (long long)N * num_groups_full;
+    bool use_popc10 = (GS == 64 && K <= 32768 && shared_scale != 0);
     int single_chunk = (K <= chunk_cap);
     bool has_anchor = (x_last_bf16 != nullptr && y_last_bf16 != nullptr);
+
+    if (use_popc10) {
+        int ng = K >> 6;
+        unsigned int* s_ax_lo = reinterpret_cast<unsigned int*>(smem_raw);
+        unsigned int* s_ax_hi = s_ax_lo + 10 * ng;
+        float* s_xmin    = reinterpret_cast<float*>(s_ax_hi + 10 * ng);
+        float* s_xstep   = s_xmin + ng;
+        float* s_xsum_p  = s_xstep + ng;
+        float* p_tot_e   = s_xsum_p + ng;
+        float* p_step_e  = p_tot_e + 8;
+        float* p_red0    = p_step_e + 8;
+        float* p_red1    = p_red0 + 8;
+        float* p_red2    = p_red1 + 8;
+
+        float alpha = 0.0f;
+        float scar_ratio = 1.0f;
+        if (has_anchor) {
+            float l_dot = 0.0f, l_n2l = 0.0f, l_n2x = 0.0f;
+            for (int c = tid; c < K; c += blockDim.x) {
+                float xt = pm_bf16_to_f32(x_row[c]);
+                float xl = pm_bf16_to_f32(x_last_bf16[c]);
+                l_dot += xl * xt;
+                l_n2l += xl * xl;
+                l_n2x += xt * xt;
+            }
+            l_dot = warp_sum_32(l_dot);
+            l_n2l = warp_sum_32(l_n2l);
+            l_n2x = warp_sum_32(l_n2x);
+            if (lane == 0) { p_red0[warp_id] = l_dot; p_red1[warp_id] = l_n2l; p_red2[warp_id] = l_n2x; }
+            __syncthreads();
+            float t_dot = p_red0[0] + p_red0[1] + p_red0[2] + p_red0[3] + p_red0[4] + p_red0[5] + p_red0[6] + p_red0[7];
+            float t_n2l = p_red1[0] + p_red1[1] + p_red1[2] + p_red1[3] + p_red1[4] + p_red1[5] + p_red1[6] + p_red1[7];
+            float t_n2x = p_red2[0] + p_red2[1] + p_red2[2] + p_red2[3] + p_red2[4] + p_red2[5] + p_red2[6] + p_red2[7];
+            if (t_n2l > 1e-10f) {
+                alpha = t_dot / (t_n2l + 1e-8f);
+                float scar_n2 = fmaxf(0.0f, t_n2x - alpha * t_dot);
+                scar_ratio = sqrtf(scar_n2 / (t_n2x + 1e-8f));
+            } else {
+                has_anchor = false;
+            }
+            __syncthreads();
+            float zero_cut = (mirror_tol > 0.0f) ? fmaxf(1e-4f, 0.25f * mirror_tol) : 1e-4f;
+            if (has_anchor && scar_ratio < zero_cut) {
+                if (lane == 0 && valid_row) {
+                    float y_val = alpha * pm_bf16_to_f32(y_last_bf16[row]);
+                    long long idx = (long long)e * N + row;
+                    if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx] = pm_f32_to_bf16_rne(y_val);
+                    else reinterpret_cast<float*>(y_out)[idx] = y_val;
+                }
+                return;
+            }
+        }
+        pm_fwht_and_ballot_slice10(
+            x_row, x_last_bf16, has_anchor, alpha, col_scale,
+            s_ax_lo, s_ax_hi, s_xmin, s_xstep, s_xsum_p,
+            ng, warp_id, lane, warps_per_block
+        );
+        __syncthreads();
+
+        float zero_acc = 0.0f;
+        const unsigned short* s_row = valid_row ? (qscale + (long long)row * ng) : nullptr;
+        if (valid_row) {
+            const unsigned short* z_row = qzero + (long long)row * ng;
+            for (int g = lane; g < ng; g += 32) {
+                zero_acc += pm_bf16_to_f32(z_row[g]) * s_xsum_p[g];
+            }
+            zero_acc = warp_sum_32(zero_acc);
+        }
+        float y_anchor = (lane == 0 && valid_row && has_anchor) ? (alpha * pm_bf16_to_f32(y_last_bf16[row])) : 0.0f;
+        float scar_acc = (lane == 0 && valid_row) ? zero_acc : 0.0f;
+        float rs = (lane == 0 && valid_row) ? pm_bf16_to_f32(row_scale[row]) : 0.0f;
+        for (int p = 0; p < P_max; ++p) {
+            float obs_p = 0.0f;
+            if (valid_row) {
+                float p_mult = ldexpf(1.0f, -p);
+                const unsigned char* b_row = packed_lo + (long long)p * plane_byte_stride + (long long)row * k8;
+                obs_p = warp_sum_32(pm_eval_q1_plane_popc10_row(
+                    s_ax_lo, s_ax_hi, s_xmin, s_xstep, s_xsum_p, b_row, s_row, p_mult, ng, lane
+                ));
+            }
+            if (lane == 0) {
+                if (valid_row) scar_acc += obs_p;
+                float y_tot = valid_row ? (y_anchor + scar_acc * rs) : 0.0f;
+                float y_stp = valid_row ? (obs_p * rs) : 0.0f;
+                p_tot_e[warp_id] = y_tot * y_tot;
+                p_step_e[warp_id] = y_stp * y_stp;
+            }
+            __syncthreads();
+            float tile_tot_e = p_tot_e[0] + p_tot_e[1] + p_tot_e[2] + p_tot_e[3]
+                             + p_tot_e[4] + p_tot_e[5] + p_tot_e[6] + p_tot_e[7];
+            float tile_stp_e = p_step_e[0] + p_step_e[1] + p_step_e[2] + p_step_e[3]
+                             + p_step_e[4] + p_step_e[5] + p_step_e[6] + p_step_e[7];
+            float defect = (1.15470054f * sqrtf(tile_stp_e)) / (sqrtf(tile_tot_e) + 1e-8f);
+            if ((p + 1 >= P_min) && (mirror_tol > 0.0f) && (defect < mirror_tol)) break;
+            __syncthreads();
+        }
+        if (lane == 0 && valid_row) {
+            float y_val = y_anchor + scar_acc * rs;
+            long long idx = (long long)e * N + row;
+            if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx] = pm_f32_to_bf16_rne(y_val);
+            else reinterpret_cast<float*>(y_out)[idx] = y_val;
+        }
+        return;
+    }
 
     float alpha = 0.0f;
     float scar_ratio = 1.0f;
@@ -1783,6 +2268,7 @@ extern "C" __global__ void pure_mirror_carve_q1_ballot_f32(
     const float* u_row = u_in + (long long)row * K;
     float denom = 2.0f * (1.0f - ldexpf(1.0f, -root_bits));
     bool has_x = (x_rot != nullptr && delta_y_out != nullptr && y_zero_out != nullptr);
+    bool want_weight_norms = (x_rot == nullptr && delta_y_out != nullptr && y_zero_out != nullptr);
 
     float w_y0 = 0.0f;
     float w_dy[16];
@@ -1823,6 +2309,8 @@ extern "C" __global__ void pure_mirror_carve_q1_ballot_f32(
         float x1 = has_x ? x_rot[base + 32 + lane] : 0.0f;
         if (has_x) {
             w_y0 += qz * (x0 + x1);
+        } else if (want_weight_norms) {
+            w_y0 += r0 * r0 + r1 * r1;
         }
         for (int p = 0; p < P_max; ++p) {
             float sc = bs * ldexpf(1.0f, -p);
@@ -1841,11 +2329,13 @@ extern "C" __global__ void pure_mirror_carve_q1_ballot_f32(
             r1 -= b1 ? sc : -sc;
             if (has_x) {
                 w_dy[p] += sc * ((b0 ? x0 : -x0) + (b1 ? x1 : -x1));
+            } else if (want_weight_norms) {
+                w_dy[p] += r0 * r0 + r1 * r1;
             }
         }
     }
 
-    if (has_x) {
+    if (has_x || want_weight_norms) {
         w_y0 = warp_sum_32(w_y0);
         if (lane == 0) sm_red[warp_id] = w_y0;
         for (int p = 0; p < P_max; ++p) {
@@ -1854,7 +2344,7 @@ extern "C" __global__ void pure_mirror_carve_q1_ballot_f32(
         }
         __syncthreads();
         if (tid == 0) {
-            float rs = pm_bf16_to_f32(row_scale[row]);
+            float rs = has_x ? pm_bf16_to_f32(row_scale[row]) : 1.0f;
             float s0 = sm_red[0] + sm_red[1] + sm_red[2] + sm_red[3]
                      + sm_red[4] + sm_red[5] + sm_red[6] + sm_red[7];
             y_zero_out[row] = s0 * rs;
@@ -1965,6 +2455,7 @@ _PM_KERNELS = (
     b"pure_mirror_continuation_gate_f32",
     b"pure_mirror_self_collapse_f32",
     b"pure_mirror_diff_q1_gemv_f32",
+    b"pure_mirror_diff_q1_gemv_r2_f32",
     b"pure_mirror_diff_q1_moe_batch_f32",
     b"pure_mirror_carve_q1_ballot_f32",
     b"pure_mirror_sinkhorn_row_bf16",
@@ -2233,17 +2724,31 @@ def launch_pure_mirror_diff_q1_gemv(
         rs_c = row_scale if row_scale.is_contiguous() else row_scale.contiguous()
         cs_c = col_scale if col_scale.is_contiguous() else col_scale.contiguous()
 
-        chunk_cap = min(in_features, 4096)
-        smem_bytes = (chunk_cap + (chunk_cap // int(group_size)) + 40) * 4
+        use_popc10_r2 = (
+            int(group_size) == 64
+            and in_features <= 32768
+            and shared_scale == 1
+            and not return_telemetry
+        )
+        if use_popc10_r2:
+            ng = in_features >> 6
+            smem_bytes = (23 * ng + 40) * 4
+            grid_x = (out_features + 15) // 16
+            k_name = b"pure_mirror_diff_q1_gemv_r2_f32"
+        else:
+            chunk_cap = min(in_features, 4096)
+            smem_bytes = (chunk_cap + (chunk_cap // int(group_size)) + 40) * 4
+            grid_x = tiles_per_row
+            k_name = b"pure_mirror_diff_q1_gemv_f32"
 
         fast_ext = _get_fast_ext()
         if fast_ext is not None:
             fn_ptrs = _get_pm_fn_ptrs(dev)
             stream_i = int(torch.cuda.current_stream(dev).cuda_stream)
             rc = fast_ext.launch_diff_q1_gemv(
-                fn_ptrs[b"pure_mirror_diff_q1_gemv_f32"],
+                fn_ptrs[k_name],
                 stream_i,
-                tiles_per_row,
+                grid_x,
                 M,
                 smem_bytes,
                 x_bf16.data_ptr(),
@@ -2262,7 +2767,7 @@ def launch_pure_mirror_diff_q1_gemv(
                 p_max, p_min, float(mirror_tol), out_is_bf16, shared_scale,
             )
             if rc != 0:
-                raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_gemv_f32) failed: {rc}")
+                raise RuntimeError(f"cuLaunchKernel({k_name.decode()}) failed: {rc}")
         else:
             nvcuda, fns = get_pure_mirror_kernels(dev)
             stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
@@ -2295,11 +2800,11 @@ def launch_pure_mirror_diff_q1_gemv(
                 ctypes.addressof(c_ob), ctypes.addressof(c_ss),
             )
             rc = nvcuda.cuLaunchKernel(
-                fns[b"pure_mirror_diff_q1_gemv_f32"],
-                tiles_per_row, M, 1, 256, 1, 1, smem_bytes, stream, args, None,
+                fns[k_name],
+                grid_x, M, 1, 256, 1, 1, smem_bytes, stream, args, None,
             )
             if rc != 0:
-                raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_gemv_f32) failed: {rc}")
+                raise RuntimeError(f"cuLaunchKernel({k_name.decode()}) failed: {rc}")
         y_res = (y_out if y_out.dtype == x.dtype else y_out.to(dtype=x.dtype)).view(*orig_shape, out_features)
         if return_telemetry:
             return y_res, used_t, def_t
@@ -2538,6 +3043,8 @@ def launch_pure_mirror_diff_q1_moe_batch(
     tiles_per_row = (out_features + 7) // 8
     chunk_cap = min(in_features, 4096)
     smem_bytes = (chunk_cap + (chunk_cap // int(group_size)) + 40) * 4
+    if int(group_size) == 64 and in_features <= 32768:
+        smem_bytes = max(smem_bytes, (23 * (in_features >> 6) + 40) * 4)
     fn_ptrs = _get_pm_fn_ptrs(dev)
     rc = fast_ext.launch_diff_q1_moe_batch(
         fn_ptrs[b"pure_mirror_diff_q1_moe_batch_f32"],
@@ -2564,10 +3071,13 @@ def launch_pure_mirror_carve_q1_ballot(
     root_bits: int,
     max_cubes: int,
     x_rot: Optional[torch.Tensor] = None,
+    want_weight_norms: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Bit-exact single-pass CUDA ballot Q1 plane carver for `group_size == 64` (~0.076 ms).
 
     Returns `(packed_lo [P, N, K//8], qscale [1, N, K//64], qzero [N, K//64], y_zero [N]|None, delta_y [P, N]|None)`.
+    When `x_rot is None` and `want_weight_norms=True`, `y_zero` holds per-row `||u - qzero||^2` and
+    `delta_y[p]` holds per-row `||u - u_p||^2` for single-pass GPU M0 trunk convergence carving.
     """
     dev = u.device
     N, K = int(u.shape[0]), int(u.shape[1])
@@ -2581,6 +3091,10 @@ def launch_pure_mirror_carve_q1_ballot(
     qz = torch.empty((N, ng), dtype=torch.bfloat16, device=dev)
     if x_rot is not None:
         xr_c = x_rot if (x_rot.dtype == torch.float32 and x_rot.is_contiguous()) else x_rot.to(device=dev, dtype=torch.float32).contiguous()
+        y_zero = torch.empty((N,), dtype=torch.float32, device=dev)
+        delta_y = torch.empty((P, N), dtype=torch.float32, device=dev)
+    elif want_weight_norms:
+        xr_c = None
         y_zero = torch.empty((N,), dtype=torch.float32, device=dev)
         delta_y = torch.empty((P, N), dtype=torch.float32, device=dev)
     else:
@@ -2637,7 +3151,9 @@ def launch_pure_mirror_carve_q1_ballot(
 def launch_pure_mirror_sinkhorn_l2(
     w_bf16: torch.Tensor,
     iters: int = 3,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    apply: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Allocation-free CUDA L2 Sinkhorn equilibration on contiguous BF16 2D weights."""
     dev = w_bf16.device
     w_c = w_bf16 if w_bf16.is_contiguous() else w_bf16.contiguous()
@@ -2682,6 +3198,8 @@ def launch_pure_mirror_sinkhorn_l2(
     dr = (dr * norm_c).clamp_min(1e-6)
     row_scale = dr.to(torch.bfloat16)
     col_scale = dc.to(torch.bfloat16)
+    if not apply:
+        return row_scale, col_scale, None
     w_eq = torch.empty((N, K), dtype=torch.float32, device=dev)
 
     if fast_ext is not None:

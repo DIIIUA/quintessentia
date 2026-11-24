@@ -113,6 +113,19 @@ class Transpose2D(ConversionOps):
         return {target_patterns[0]: tensor}
 
 
+class SqueezeLast(ConversionOps):
+    """Squeezes a trailing singleton dimension (e.g. GGUF 2D ``[H, 1]`` ``ssm_a`` / ``ssm_d`` -> ``[H]``)."""
+
+    @torch.no_grad
+    def convert(
+        self, input_dict: dict[str, torch.Tensor], source_patterns: list[str], target_patterns: list[str], **kwargs
+    ) -> dict[str, torch.Tensor]:
+        tensor = next(iter(input_dict.values()))
+        if tensor.ndim > 1 and tensor.shape[-1] == 1:
+            return {target_patterns[0]: tensor.squeeze(-1).contiguous()}
+        return {target_patterns[0]: tensor}
+
+
 class BloomQKVPermute(ConversionOps):
     """Restores Hugging Face BLOOM head-interleaved ``query_key_value`` from GGUF stacked ``[Q; K; V]``."""
 
@@ -542,6 +555,39 @@ def build_gguf_config_dict(
         ssm_in = int(_meta_get(meta, p, "ssm.inner_size") or (val_heads * 128))
         cfg["linear_value_head_dim"] = max(1, ssm_in // max(1, val_heads))
 
+    if hf_type == "falcon_h1":
+        inner = int(_meta_get(meta, p, "ssm.inner_size") or (hidden_size * 2))
+        ssm_heads = int(_meta_get(meta, p, "ssm.time_step_rank") or max(1, inner // 64))
+        if key_len is not None:
+            cfg["head_dim"] = int(key_len)
+        cfg["mamba_d_ssm"] = inner
+        cfg["mamba_n_heads"] = ssm_heads
+        cfg["mamba_d_head"] = max(1, inner // max(1, ssm_heads))
+        cfg["mamba_n_groups"] = int(_meta_get(meta, p, "ssm.group_count") or 1)
+        cfg["mamba_d_state"] = int(_meta_get(meta, p, "ssm.state_size") or 128)
+        cfg["mamba_d_conv"] = int(_meta_get(meta, p, "ssm.conv_kernel") or 4)
+        cfg["mamba_conv_bias"] = any(n.endswith("ssm_conv1d.bias") for n in tensor_names)
+        cfg["mamba_proj_bias"] = any(n.endswith("ssm_in.bias") or n.endswith("ssm_out.bias") for n in tensor_names)
+
+    if hf_type == "granitemoehybrid":
+        inner = int(_meta_get(meta, p, "ssm.inner_size") or (hidden_size * 2))
+        ssm_heads = int(_meta_get(meta, p, "ssm.time_step_rank") or max(1, inner // 64))
+        if shared_ff is not None:
+            cfg["shared_intermediate_size"] = int(shared_ff)
+        cfg["mamba_n_heads"] = ssm_heads
+        cfg["mamba_d_head"] = max(1, inner // max(1, ssm_heads))
+        cfg["mamba_n_groups"] = int(_meta_get(meta, p, "ssm.group_count") or 1)
+        cfg["mamba_d_state"] = int(_meta_get(meta, p, "ssm.state_size") or 128)
+        cfg["mamba_d_conv"] = int(_meta_get(meta, p, "ssm.conv_kernel") or 4)
+        cfg["mamba_conv_bias"] = any(n.endswith("ssm_conv1d.bias") for n in tensor_names)
+        cfg["mamba_proj_bias"] = any(n.endswith("ssm_in.bias") or n.endswith("ssm_out.bias") for n in tensor_names)
+        raw_kv = _meta_get(meta, p, "attention.head_count_kv")
+        if isinstance(raw_kv, (list, tuple)) and len(raw_kv) == n_layers:
+            cfg["layer_types"] = ["attention" if int(x) > 0 else "mamba" for x in raw_kv]
+            pos_kv = [int(x) for x in raw_kv if int(x) > 0]
+            if pos_kv:
+                cfg["num_key_value_heads"] = max(pos_kv)
+
     # Granite scaling multipliers if present
     for gk, tk in (
         ("embedding_scale", "embedding_multiplier"),
@@ -725,7 +771,8 @@ def get_extended_gguf_mapping(
             WeightRenaming(r"\.ssm_norm\.", ".mixer.norm."),
             WeightRenaming(r"\.ssm_out\.", ".mixer.out_proj."),
             WeightConverter(r"\.mixer\.conv1d\.weight$", ".mixer.conv1d.weight", [Unsqueeze(1, expected_ndim=3)]),
-            WeightConverter(r"\.mixer\.A_log$", ".mixer.A_log", [LogNegate()]),
+            WeightConverter(r"\.mixer\.A_log$", ".mixer.A_log", [LogNegate(), SqueezeLast()]),
+            WeightConverter(r"\.mixer\.D$", ".mixer.D", [SqueezeLast()]),
         ]
 
     # 6. Gemma 1 / Gemma 2 / Gemma 3 / Gemma 4 (zero-centered RMSNorms stored as w + 1)
@@ -898,6 +945,7 @@ def get_extended_gguf_mapping(
             WeightRenaming(r"^blk\.", "model.layers."),
             WeightRenaming(r"\.attn_norm\.", ".input_layernorm."),
             WeightRenaming(r"\.ffn_norm\.", ".pre_ff_layernorm."),
+            WeightRenaming(r"\.ffn_norm$", ".pre_ff_layernorm.weight"),
             WeightRenaming(r"\.attn_q\.", ".self_attn.q_proj."),
             WeightRenaming(r"\.attn_k\.", ".self_attn.k_proj."),
             WeightRenaming(r"\.attn_v\.", ".self_attn.v_proj."),
@@ -921,7 +969,8 @@ def get_extended_gguf_mapping(
             WeightRenaming(r"\.ssm_c_norm\.", ".mamba.c_layernorm."),
             WeightRenaming(r"\.ssm_out\.", ".mamba.out_proj."),
             WeightConverter(r"\.mamba\.conv1d\.weight$", ".mamba.conv1d.weight", [Unsqueeze(1, expected_ndim=3)]),
-            WeightConverter(r"\.mamba\.A_log$", ".mamba.A_log", [LogNegate()]),
+            WeightConverter(r"\.mamba\.A_log$", ".mamba.A_log", [LogNegate(), SqueezeLast()]),
+            WeightConverter(r"\.mamba\.D$", ".mamba.D", [SqueezeLast()]),
         ]
 
     # 14. GraniteMoeHybrid / GraniteMoe
@@ -941,7 +990,8 @@ def get_extended_gguf_mapping(
             WeightRenaming(r"\.ffn_gate_exps\.weight", ".block_sparse_moe.experts.gate_proj"),
             WeightRenaming(r"\.ffn_up_exps\.weight", ".block_sparse_moe.experts.up_proj"),
             WeightRenaming(r"\.ffn_down_exps\.weight", ".block_sparse_moe.experts.down_proj"),
-            WeightRenaming(r"\.ffn_up_shexp\.", ".shared_mlp.input_linear."),
+            WeightRenaming(r"\.ffn_gate_shexp\.", ".shared_mlp._gate_proj."),
+            WeightRenaming(r"\.ffn_up_shexp\.", ".shared_mlp._up_proj."),
             WeightRenaming(r"\.ffn_down_shexp\.", ".shared_mlp.output_linear."),
             WeightRenaming(r"\.ssm_in\.", ".mamba.in_proj."),
             WeightRenaming(r"\.ssm_conv1d\.", ".mamba.conv1d."),
@@ -951,7 +1001,8 @@ def get_extended_gguf_mapping(
             WeightRenaming(r"\.ssm_norm\.", ".mamba.norm."),
             WeightRenaming(r"\.ssm_out\.", ".mamba.out_proj."),
             WeightConverter(r"\.mamba\.conv1d\.weight$", ".mamba.conv1d.weight", [Unsqueeze(1, expected_ndim=3)]),
-            WeightConverter(r"\.mamba\.A_log$", ".mamba.A_log", [LogNegate()]),
+            WeightConverter(r"\.mamba\.A_log$", ".mamba.A_log", [LogNegate(), SqueezeLast()]),
+            WeightConverter(r"\.mamba\.D$", ".mamba.D", [SqueezeLast()]),
         ]
 
     # 15. Standard Dense + MoE Decoder Families (Llama, Mistral, Mixtral, Qwen2/3, OLMo/OLMoE,

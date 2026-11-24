@@ -52,6 +52,8 @@ _NORM_WEIGHT_CANDIDATES: Tuple[str, ...] = (
     "model.norm.weight",
     "model.language_model.norm.weight",
     "language_model.model.norm.weight",
+    "model.norm_f.weight",
+    "model.final_norm.weight",
     "model.embedding_norm.weight",
     "model.final_layernorm.weight",
     "model.decoder.final_layer_norm.weight",
@@ -327,6 +329,8 @@ class QuintessentiaModel:
             self._supports_logits_to_keep = "logits_to_keep" in sig_params or has_varkw
             if "past_key_values" in sig_params:
                 self._cache_kwarg: Optional[str] = "past_key_values"
+            elif "cache" in sig_params:
+                self._cache_kwarg = "cache"
             elif "cache_params" in sig_params:
                 self._cache_kwarg = "cache_params"
             elif "state" in sig_params:
@@ -336,7 +340,7 @@ class QuintessentiaModel:
             else:
                 self._cache_kwarg = None
             self._supports_cache_position = "cache_position" in sig_params or (
-                self._cache_kwarg == "past_key_values" and has_varkw
+                self._cache_kwarg in ("past_key_values", "cache") and has_varkw
             )
             self._supports_use_cache = "use_cache" in sig_params or has_varkw
         except (TypeError, ValueError):
@@ -1234,6 +1238,17 @@ class QuintessentiaModel:
             if ple_inputs is not None:
                 extra["per_layer_inputs"] = ple_inputs
             cache_kw = getattr(self, "_cache_kwarg", "past_key_values")
+            if cache_kw == "cache" and past_key_values is None and getattr(self, "_supports_use_cache", True):
+                inner_m = getattr(self.model, "model", None)
+                if inner_m is not None and callable(getattr(inner_m, "_setup_cache", None)):
+                    from transformers.cache_utils import DynamicCache
+                    inner_m._setup_cache(
+                        self.config,
+                        inputs_embeds.shape[0],
+                        inputs_embeds.device,
+                        inputs_embeds.dtype,
+                    )
+                    past_key_values = DynamicCache(config=self.config)
             if cache_kw is not None:
                 extra[cache_kw] = past_key_values
             if getattr(self, "_supports_use_cache", True):
@@ -1268,6 +1283,14 @@ class QuintessentiaModel:
         next_cache = getattr(outputs, "past_key_values", None)
         if next_cache is None and cache_kw and cache_kw != "past_key_values":
             next_cache = getattr(outputs, cache_kw, None)
+        if next_cache is None:
+            for alt_attr in ("cache", "cache_params", "state"):
+                cand = getattr(outputs, alt_attr, None)
+                if cand is not None:
+                    next_cache = cand
+                    break
+        if next_cache is None and past_key_values is not None:
+            next_cache = past_key_values
         if warmup is not None:
             warmup.end_step(outputs.logits, next_cache)
         return (outputs.logits if return_all_logits else outputs.logits[:, -1, :]), next_cache

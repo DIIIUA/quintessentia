@@ -9,6 +9,7 @@ execution on our Ampere 1-bit Tensor Core (`b1.mma.and.popc`) and FWHT GEMV NVRT
 from __future__ import annotations
 
 import math
+import time
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -293,6 +294,7 @@ class BinaryHalvingQ1Linear(nn.Module):
         self.mirror_diff_calls: int = 0
         self._mirror_x_last: Optional[torch.Tensor] = None
         self._mirror_y_last: Optional[torch.Tensor] = None
+        self._fast_k6: Any = None
 
         self.register_buffer("packed_lo", tensors["packed_lo"])
         self.register_buffer("qscale", tensors["qscale"])
@@ -491,6 +493,54 @@ class BinaryHalvingQ1Linear(nn.Module):
         if self.use_fwht and flat.device.type == "cuda" and flat.dtype == torch.bfloat16:
             if self.mirror_diff_tol is not None and self.group_size == 64:
                 if flat.shape[0] == 1:
+                    fk = self._fast_k6
+                    if fk is None and self.in_features <= 32768 and int(self.qscale.shape[0]) == 1:
+                        from src.pure_mirror_agents_nvrtc import _get_fast_ext, _get_pm_fn_ptrs
+                        fast_ext = _get_fast_ext()
+                        if fast_ext is not None:
+                            fn_ptrs = _get_pm_fn_ptrs(flat.device)
+                            fk = (
+                                fast_ext.launch_diff_q1_gemv,
+                                fn_ptrs[b"pure_mirror_diff_q1_gemv_r2_f32"],
+                                (self.out_features + 15) // 16,
+                                (23 * (self.in_features >> 6) + 40) * 4,
+                                self.packed_lo.data_ptr(),
+                                self.qscale.data_ptr(),
+                                self.qzero.data_ptr(),
+                                self.row_scale.data_ptr(),
+                                self.col_scale.data_ptr(),
+                                0 if self.bias is None else self.bias.data_ptr(),
+                            )
+                            self._fast_k6 = fk
+                        else:
+                            self._fast_k6 = False
+                    if fk:
+                        f_in = flat if flat.is_contiguous() else flat.contiguous()
+                        y = torch.empty((1, self.out_features), dtype=torch.bfloat16, device=flat.device)
+                        xl = self._mirror_x_last
+                        yl = self._mirror_y_last
+                        rc = fk[0](
+                            fk[1],
+                            int(torch.cuda.current_stream(flat.device).cuda_stream),
+                            fk[2],
+                            1,
+                            fk[3],
+                            f_in.data_ptr(),
+                            0 if xl is None else xl.data_ptr(),
+                            0 if yl is None else yl.data_ptr(),
+                            fk[4], fk[5], fk[6], fk[7], fk[8], fk[9],
+                            y.data_ptr(),
+                            0, 0,
+                            1, self.out_features, self.in_features, 64,
+                            p_use, 1, float(self.mirror_diff_tol), 1, 1,
+                        )
+                        if rc != 0:
+                            raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_gemv_r2_f32) failed: {rc}")
+                        self.mirror_diff_calls += 1
+                        if xl is None:
+                            self._mirror_x_last = f_in[0].detach().contiguous()
+                            self._mirror_y_last = y[0].detach().contiguous()
+                        return y.view(*x.shape[:-1], self.out_features)
                     global _DIFF_Q1_GEMV_FN
                     if _DIFF_Q1_GEMV_FN is None:
                         from src.pure_mirror_agents_nvrtc import launch_pure_mirror_diff_q1_gemv
@@ -1327,7 +1377,101 @@ def carve_trunk_mirror_q1(
     use_fwht: bool = True,
     sinkhorn_iters: int = 3,
 ) -> Tuple[Dict[str, torch.Tensor], BinaryHalvingTreeMeta, int, float]:
-    """Carve a dense trunk projection under pure-math M0 Mirror Equality."""
+    """Carve a dense trunk projection under pure-math M0 Mirror Equality.
+
+    Uses the single-pass CUDA Ballot Kernel #7 (~5 ms, 200x faster than Python loop)
+    on CUDA with `group_size == 64`, preserving exact bit-faithful parity with
+    `IncrementalCubeCarver.carve_trunk_mirror`.
+    """
+    target_max = max(1, min(int(root_bits), int(max_cubes)))
+    target_min = max(1, min(target_max, int(min_cubes)))
+    if (
+        weight.is_cuda
+        and weight.ndim == 2
+        and int(group_size) == 64
+        and int(weight.shape[1]) % 64 == 0
+        and 1 <= target_max <= 16
+        and int(root_bits) in (2, 4, 8, 16)
+    ):
+        from src.pure_mirror_agents_nvrtc import launch_pure_mirror_carve_q1_ballot
+
+        dev = weight.device
+        n, k = int(weight.shape[0]), int(weight.shape[1])
+        depth = int(math.log2(int(root_bits)))
+        if use_fwht:
+            row_scale, col_scale, w_eq = sinkhorn_equilibrate(weight, iters=sinkhorn_iters)
+            u = fwht_block(w_eq, 64).to(torch.float32)
+        else:
+            row_scale = torch.ones((n,), dtype=torch.bfloat16, device=dev)
+            col_scale = torch.ones((k,), dtype=torch.bfloat16, device=dev)
+            u = weight.to(torch.float32)
+
+        pk_all, qs, qz, row_ref_sq, plane_rem_sq = launch_pure_mirror_carve_q1_ballot(
+            u,
+            row_scale,
+            root_bits=int(root_bits),
+            max_cubes=target_max,
+            x_rot=None,
+            want_weight_norms=True,
+        )
+        # Single batched GPU->CPU sync for ref_norm, qscale norm, and all P residual norms
+        stats_t = torch.cat([
+            row_ref_sq.sum().unsqueeze(0),
+            qs.float().pow(2).sum().unsqueeze(0),
+            plane_rem_sq.sum(dim=-1),
+        ])
+        vals = stats_t.tolist()
+        ref_n = math.sqrt(max(0.0, float(vals[0]))) + 1e-8
+        qs_norm = math.sqrt(max(0.0, float(vals[1])))
+
+        k_opt = target_max
+        rem_rel = 1.0
+        prev_rem_rel: Optional[float] = None
+        for p in range(target_max):
+            n_rem = math.sqrt(max(0.0, float(vals[2 + p])))
+            n_step = 8.0 * float(2.0 ** (-p)) * qs_norm
+            rem_rel = n_rem / ref_n
+            step_rel = n_step / ref_n
+            if (p + 1) >= target_min and (mirror_tol > 0.0 or (p + 1) == target_max):
+                rel_gain = (
+                    max(0.0, prev_rem_rel - rem_rel) / (prev_rem_rel + 1e-12)
+                    if prev_rem_rel is not None
+                    else 1.0
+                )
+                exact_converged = (rem_rel <= mirror_tol and step_rel <= mirror_tol)
+                plateau_converged = (
+                    prev_rem_rel is not None
+                    and rem_rel <= (2.5 * mirror_tol)
+                    and rel_gain <= 0.12
+                )
+                prev_rem_rel = rem_rel
+                if mirror_tol > 0.0 and (exact_converged or plateau_converged):
+                    k_opt = p + 1
+                    break
+
+        packed_out = pk_all if k_opt == target_max else pk_all[:k_opt].contiguous().clone()
+        tensors = {
+            "packed_lo": packed_out,
+            "qscale": qs,
+            "qzero": qz,
+            "row_scale": row_scale.contiguous(),
+            "col_scale": col_scale.contiguous(),
+        }
+        meta = BinaryHalvingTreeMeta(
+            root_bits=k_opt,
+            depth=depth,
+            law="mirror_trunk_positional_halving",
+            group_size=64,
+            use_fwht=bool(use_fwht),
+            level_node_counts=tuple(1 << d for d in range(depth + 1)),
+            leaf_paths=tuple(_binary_tree_path(p, depth) for p in range(k_opt)),
+            leaf_energy_frac=(),
+            prefix_rel_rmse=(),
+            prefix_cos=(),
+            source_root_bits=int(root_bits),
+        )
+        return tensors, meta, k_opt, rem_rel
+
     carver = IncrementalCubeCarver(
         weight,
         root_bits=root_bits,
@@ -2406,6 +2550,7 @@ class AirLLMLazyBinaryHalvingRunner:
         mirror_v4_trunk: bool = False,
         trunk_mirror_tol: float = 0.015,
         trunk_carve_tol: float = 0.045,
+        layer_tensor_keys: Optional[Callable[[int], set[str]]] = None,
     ):
         self.model = model
         self.layer_reader = layer_reader
@@ -2428,6 +2573,7 @@ class AirLLMLazyBinaryHalvingRunner:
         self.mirror_v4_trunk = bool(mirror_v4_trunk)
         self.trunk_mirror_tol = float(trunk_mirror_tol)
         self.trunk_carve_tol = float(trunk_carve_tol)
+        self.layer_tensor_keys = layer_tensor_keys
         self.trunk_projections_carved: int = 0
         self.trunk_early_stops: int = 0
         self._trunk_q1_modules: List[BinaryHalvingQ1Linear] = []
@@ -2443,6 +2589,21 @@ class AirLLMLazyBinaryHalvingRunner:
         self.relay_trace = {}
         self._relay_prepare_stream = None
         self.relay_gpu_prepares = 0
+        # Real V4 M1 + M2 Streaming Cube Breather (replaces A->B->C(0)->A conveyor when mirror_v4_trunk=True)
+        self._v4_m1 = None
+        self._v4_m2 = None
+        self._v4_prepare_stream = None
+        self._v4_pool = None
+        self._v4_futures: Dict[int, Any] = {}
+        self._v4_window_depth: int = 1
+        self._v4_plane_shed: int = 0
+        self._v4_est_layer_bytes: int = 0
+        self._v4_layer_start_ts: float = 0.0
+        self._v4_last_io_ms: float = 0.0
+        self._v4_last_wait_ms: float = 0.0
+        self._v4_reuses: int = 0
+        self._v4_stream_prepares: int = 0
+        self._v4_wait_seconds: float = 0.0
 
         self.layers = self._find_decoder_layers()
         self.num_layers = len(self.layers)
@@ -2479,7 +2640,14 @@ class AirLLMLazyBinaryHalvingRunner:
         self.peak_vram_bytes: int = 0
 
     def _find_decoder_layers(self) -> nn.ModuleList:
-        for attr in ("model", "transformer", "gpt_neox"):
+        try:
+            from quintessentia_cli.model_source import resolve_decoder_layers
+            resolved = resolve_decoder_layers(self.model)
+            if isinstance(resolved, nn.ModuleList):
+                return resolved
+        except Exception:
+            pass
+        for attr in ("model", "transformer", "gpt_neox", "backbone"):
             sub = getattr(self.model, attr, None)
             if sub is not None:
                 for l_attr in ("layers", "h", "blocks"):
@@ -2506,13 +2674,57 @@ class AirLLMLazyBinaryHalvingRunner:
         from accelerate.utils import set_module_tensor_to_device
 
         self._layer_specs.clear()
+        # Universally honor module-level `_tied_weights_keys` (e.g. Zamba2 shared_transformer blocks)
+        self._tied_target_mods: set[int] = set()
+        for root in (self.model, getattr(self.model, "model", None), getattr(self.model, "transformer", None)):
+            if root is None:
+                continue
+            tied = getattr(root, "_tied_weights_keys", None)
+            if not isinstance(tied, dict):
+                continue
+            for src_path, tgt_path in tied.items():
+                if not isinstance(src_path, str) or not isinstance(tgt_path, str) or "." not in src_path:
+                    continue
+                try:
+                    src_mod = root.get_submodule(src_path)
+                    tgt_mod = root.get_submodule(tgt_path)
+                except Exception:
+                    continue
+                if isinstance(src_mod, nn.Module) and isinstance(tgt_mod, nn.Module):
+                    self._tied_target_mods.add(id(tgt_mod))
+                    if src_mod is not tgt_mod:
+                        p_path, leaf = src_path.rsplit(".", 1)
+                        try:
+                            setattr(root.get_submodule(p_path), leaf, tgt_mod)
+                        except Exception:
+                            pass
+
         for l_idx, layer in enumerate(self.layers):
             linear_map: Dict[str, Tuple[int, int, bool, int]] = {}
+            transposed_linears: set[str] = set()
             other_params: List[Tuple[str, torch.dtype]] = []
             other_buffers: List[Tuple[str, torch.dtype]] = []
             moe_mod_name: Optional[str] = self.moe_module_paths.get(l_idx)
+            owned_keys: Optional[set[str]] = None
+            if self.layer_tensor_keys is not None:
+                try:
+                    kset = self.layer_tensor_keys(l_idx)
+                    if kset:
+                        owned_keys = set(kset)
+                except Exception:
+                    owned_keys = None
 
             for sub_name, sub_mod in list(layer.named_modules()):
+                w_key = f"{sub_name}.weight"
+                if owned_keys is not None and w_key not in owned_keys:
+                    if (
+                        moe_mod_name is None
+                        and self.moe_cache is not None
+                        and hasattr(sub_mod, "gate_up_proj")
+                        and hasattr(sub_mod, "down_proj")
+                    ):
+                        moe_mod_name = sub_name
+                    continue
                 if isinstance(sub_mod, nn.Linear):
                     if _is_router_module(f"layers.{l_idx}.{sub_name}", sub_mod):
                         continue
@@ -2523,6 +2735,16 @@ class AirLLMLazyBinaryHalvingRunner:
                             sub_mod.bias is not None,
                             self._cubes_for_sub(l_idx, sub_name),
                         )
+                elif type(sub_mod).__name__ == "Conv1D" and hasattr(sub_mod, "weight") and sub_mod.weight.ndim == 2:
+                    in_f, out_f = int(sub_mod.weight.shape[0]), int(sub_mod.weight.shape[1])
+                    if in_f % self.group_size == 0 and not _is_router_module(f"layers.{l_idx}.{sub_name}", sub_mod):
+                        linear_map[sub_name] = (
+                            in_f,
+                            out_f,
+                            getattr(sub_mod, "bias", None) is not None,
+                            self._cubes_for_sub(l_idx, sub_name),
+                        )
+                        transposed_linears.add(sub_name)
                 elif (
                     moe_mod_name is None
                     and self.moe_cache is not None
@@ -2542,6 +2764,9 @@ class AirLLMLazyBinaryHalvingRunner:
                 moe_param_names.add(f"{moe_mod_name}.down_proj")
 
             for pname, p in list(layer.named_parameters()):
+                if owned_keys is not None and pname not in owned_keys:
+                    # Shared cross-layer parameter (e.g. Zamba2 shared_transformer): keep untouched in VRAM!
+                    continue
                 if pname not in linear_param_names and pname not in moe_param_names:
                     other_params.append((pname, p.dtype))
                 if not p.is_meta:
@@ -2549,6 +2774,8 @@ class AirLLMLazyBinaryHalvingRunner:
 
             for bname, b in list(layer.named_buffers()):
                 if b is not None and not b.is_meta:
+                    if owned_keys is not None and bname not in owned_keys:
+                        continue
                     # Keep tiny constant buffers like rotary inv_freq or mark to move
                     other_buffers.append((bname, b.dtype))
 
@@ -2566,10 +2793,15 @@ class AirLLMLazyBinaryHalvingRunner:
 
                 exp_mod.forward = _make_moe_fwd(l_fixed, act_fn)
 
+            pinned_tied = tuple(
+                sn for sn, sm in layer.named_modules() if sn and id(sm) in self._tied_target_mods
+            )
             self._layer_specs.append({
                 "linear_map": linear_map,
+                "transposed_linears": transposed_linears,
                 "other_params": other_params,
                 "other_buffers": other_buffers,
+                "pinned_tied_prefixes": tuple(f"{sn}." for sn in pinned_tied),
             })
 
             h_pre = layer.register_forward_pre_hook(self._make_pre_hook(l_idx), with_kwargs=True)
@@ -2578,7 +2810,54 @@ class AirLLMLazyBinaryHalvingRunner:
 
         self._installed = True
         self.standby_bytes = 0
-        if self.relay_enabled and self.resident_layers < self.num_layers:
+        if self.mirror_v4_trunk and self.resident_layers < self.num_layers and self.device.type == "cuda":
+            from src.mirror_scales_v4 import MirrorLoadDispatcher, MirrorRegionBreathingPool
+
+            streamed_specs = self._layer_specs[self.resident_layers :]
+            est_bytes = max(
+                (
+                    sum(
+                        p * n * (k // 8) + 4 * n * (k // self.group_size) + 2 * (n + k) + (2 * n if _bias else 0)
+                        for k, n, _bias, p in spec["linear_map"].values()
+                    )
+                    + sum(
+                        int(self.layers[self.resident_layers + off].get_parameter(name).numel()) * 2
+                        for name, _dt in spec["other_params"]
+                    )
+                    for off, spec in enumerate(streamed_specs)
+                ),
+                default=64 * 1024**2,
+            )
+            self._v4_est_layer_bytes = max(1, int(est_bytes))
+            self._v4_m1 = MirrorLoadDispatcher(
+                self.device,
+                enabled=True,
+                reserve_ratio=0.10,
+                initial_batch_span=4,
+                min_batch_span=1,
+                max_batch_span=16,
+                max_in_flight=2,
+            )
+            free_b = 0
+            try:
+                free_b, _ = torch.cuda.mem_get_info(self.device)
+            except Exception:
+                free_b = self._v4_est_layer_bytes * 2
+            init_pool_b = max(
+                self._v4_est_layer_bytes * 2,
+                int(free_b - getattr(self._v4_m1, "safety_reserve_bytes", 0)),
+            )
+            streamed_count = max(1, self.num_layers - self.resident_layers)
+            init_win = max(1, min(streamed_count, init_pool_b // max(1, self._v4_est_layer_bytes)))
+            self._v4_window_depth = init_win
+            self._v4_m2 = MirrorRegionBreathingPool(
+                self.device,
+                max_pool_bytes=max(self._v4_est_layer_bytes, init_pool_b),
+                max_warm_regions=init_win,
+            )
+            self._v4_prepare_stream = torch.cuda.Stream(device=self.device)
+            self._v4_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quintessentia-v4-cube")
+        elif self.relay_enabled and self.resident_layers < self.num_layers:
             from src.q1_cube_engine import Q1RoleCycleArena
             # Only a bound: Q1RoleCycleArena does not allocate three full slots.
             max_bytes = max(
@@ -2670,6 +2949,146 @@ class AirLLMLazyBinaryHalvingRunner:
         self._relay_staged = False
         return payload
 
+    @torch.no_grad()
+    def _v4_prepare_layer(self, layer_idx: int, plane_shed: int = 0):
+        """Background worker: load from prefix-pinned Host Q1 cache OR disk + 5ms GPU ballot carve."""
+        t0 = time.perf_counter()
+        spec = self._layer_specs[layer_idx]
+        cached = self._host_cache.get(layer_idx)
+        in_cone = (self.num_layers >= 8 and layer_idx < 4)
+        with torch.cuda.device(self.device), torch.cuda.stream(self._v4_prepare_stream):
+            if cached is not None:
+                h_pkg, _ = cached
+                pkg = {"q1": {}, "other": {}, "buffers": {}}
+                for sub_name in spec["linear_map"]:
+                    he = h_pkg["q1"][sub_name]
+                    pkg["q1"][sub_name] = {
+                        "tensors": {k: v.to(self.device, non_blocking=True) for k, v in he["tensors"].items()},
+                        "bias": None if he["bias"] is None else he["bias"].to(self.device, non_blocking=True),
+                        "meta": he["meta"],
+                        "k_used": int(he.get("k_used", he["meta"].root_bits)),
+                    }
+                for pname, dt in spec["other_params"]:
+                    if pname in h_pkg["other"]:
+                        pkg["other"][pname] = h_pkg["other"][pname].to(self.device, dtype=dt, non_blocking=True)
+                for bname, bdt in spec["other_buffers"]:
+                    if bname in h_pkg.get("buffers", {}):
+                        pkg["buffers"][bname] = h_pkg["buffers"][bname].to(self.device, dtype=bdt, non_blocking=True)
+                nbytes = sum(
+                    _tensor_dict_bytes(v["tensors"])
+                    + (0 if v["bias"] is None else v["bias"].numel() * v["bias"].element_size())
+                    for v in pkg["q1"].values()
+                ) + _tensor_dict_bytes(pkg["other"])
+                ready = torch.cuda.Event(enable_timing=False)
+                ready.record(self._v4_prepare_stream)
+                return pkg, None, nbytes, ready, (time.perf_counter() - t0) * 1000.0, True, 0
+
+            raw_tensors = self.layer_reader(layer_idx)
+            pkg = {"q1": {}, "other": {}, "buffers": {}}
+            carved_cubes = 0
+            transposed_set = spec.get("transposed_linears", ())
+            for sub_name, (in_f, out_f, has_bias, n_cubes) in spec["linear_map"].items():
+                w_raw = raw_tensors[f"{sub_name}.weight"].to(device=self.device, dtype=torch.bfloat16)
+                if sub_name in transposed_set:
+                    w_raw = w_raw.t().contiguous()
+                b_raw = raw_tensors.get(f"{sub_name}.bias")
+                b_gpu = None if b_raw is None else b_raw.to(device=self.device, dtype=torch.bfloat16).contiguous()
+                eff_max = max(2, n_cubes - int(plane_shed)) if not in_cone else n_cubes
+                min_k = eff_max if in_cone else max(3, eff_max - 1)
+                t_gpu, meta, k_used, _ = carve_trunk_mirror_q1(
+                    w_raw,
+                    eff_max,
+                    min_cubes=min_k,
+                    mirror_tol=self.trunk_carve_tol,
+                    root_bits=self.root_bits,
+                    group_size=self.group_size,
+                    use_fwht=self.use_fwht,
+                    sinkhorn_iters=self.sinkhorn_iters,
+                )
+                del w_raw
+                carved_cubes += int(k_used)
+                pkg["q1"][sub_name] = {"tensors": t_gpu, "bias": b_gpu, "meta": meta, "k_used": int(k_used)}
+            for pname, dt in spec["other_params"]:
+                if pname in raw_tensors:
+                    pkg["other"][pname] = raw_tensors[pname].to(device=self.device, dtype=dt)
+            for bname, bdt in spec["other_buffers"]:
+                if bname in raw_tensors:
+                    pkg["buffers"][bname] = raw_tensors[bname].to(device=self.device, dtype=bdt)
+            del raw_tensors
+            nbytes = sum(
+                _tensor_dict_bytes(v["tensors"])
+                + (0 if v["bias"] is None else v["bias"].numel() * v["bias"].element_size())
+                for v in pkg["q1"].values()
+            ) + _tensor_dict_bytes(pkg["other"])
+            ready = torch.cuda.Event(enable_timing=False)
+            ready.record(self._v4_prepare_stream)
+            host_pkg = None
+            if (
+                self.host_cache_bytes > 0
+                and layer_idx not in self._host_cache
+                and (self._host_cached_bytes + nbytes) <= self.host_cache_bytes
+            ):
+                host_pkg = {
+                    "q1": {
+                        sn: {
+                            "tensors": {k: v.detach().cpu() for k, v in ent["tensors"].items()},
+                            "bias": None if ent["bias"] is None else ent["bias"].detach().cpu(),
+                            "meta": ent["meta"],
+                            "k_used": ent["k_used"],
+                        }
+                        for sn, ent in pkg["q1"].items()
+                    },
+                    "other": {k: v.detach().cpu() for k, v in pkg["other"].items()},
+                    "buffers": {k: v.detach().cpu() for k, v in pkg["buffers"].items()},
+                }
+        return pkg, host_pkg, nbytes, ready, (time.perf_counter() - t0) * 1000.0, False, carved_cubes
+
+    def _v4_schedule_ahead(self, cur_layer_idx: int) -> None:
+        """Use M1 physical VRAM/load decision to fill VRAM up to safe max with upcoming Q1 cubes."""
+        if self._v4_m1 is None or self._v4_m2 is None or self._v4_pool is None:
+            return
+        self._v4_m2.reap_exhaled()
+        streamed_count = max(1, self.num_layers - self.resident_layers)
+        dec = self._v4_m1.evaluate_load(
+            cached_bytes=self._v4_m2.live_bytes,
+            current_budget_bytes=self._v4_m2.max_pool_bytes,
+        )
+        new_pool_b = max(self._v4_est_layer_bytes, int(dec.target_budget_bytes))
+        self._v4_m2.max_pool_bytes = new_pool_b
+        max_fit = max(1, min(streamed_count, new_pool_b // max(1, self._v4_est_layer_bytes)))
+        if dec.dispatch_mode == "SHED_PROTECT":
+            self._v4_window_depth = 1
+            self._v4_plane_shed = 1
+        elif dec.dispatch_mode == "THROTTLE_DAMP":
+            self._v4_window_depth = max(1, max_fit // 2)
+            self._v4_plane_shed = 0
+        else:
+            self._v4_window_depth = max_fit
+            self._v4_plane_shed = 0
+        self._v4_m2.max_warm_regions = self._v4_window_depth
+
+        # Queue upcoming streamed layers ahead of the wave up to M1's live window_depth
+        cur = cur_layer_idx
+        for step in range(self._v4_window_depth):
+            nxt = cur + 1
+            if nxt >= self.num_layers:
+                nxt = self.resident_layers
+            cur = nxt
+            if nxt < self.resident_layers or nxt >= self.num_layers:
+                break
+            if nxt == cur_layer_idx:
+                break
+            if nxt in self._v4_futures:
+                continue
+            if ("trunk_layer", nxt) in getattr(self._v4_m2, "_regions", ()):
+                continue
+            if len(self._v4_futures) >= self._v4_window_depth:
+                break
+            if len(self._v4_futures) >= 1 and not self._v4_m1.can_admit_bytes(self._v4_est_layer_bytes):
+                break
+            self._v4_futures[nxt] = self._v4_pool.submit(self._v4_prepare_layer, nxt, self._v4_plane_shed)
+            self._v4_stream_prepares += 1
+
     def _make_pre_hook(self, layer_idx: int):
         from accelerate.utils import set_module_tensor_to_device
 
@@ -2679,6 +3098,8 @@ class AirLLMLazyBinaryHalvingRunner:
                 self.cancel_check()
             if layer_idx in self._resident_ready:
                 self.resident_layer_hits += 1
+                if self._v4_m2 is not None and layer_idx == self.resident_layers - 1:
+                    self._v4_schedule_ahead(layer_idx)
                 return args, kwargs
 
             spec = self._layer_specs[layer_idx]
@@ -2686,6 +3107,81 @@ class AirLLMLazyBinaryHalvingRunner:
             other_params = spec["other_params"]
             other_buffers = spec["other_buffers"]
             is_resident_target = layer_idx < self.resident_layers
+
+            # Real V4 M1 + M2 Streaming Cube Breather path (zero conveyor / zero Triple-Ring!)
+            if self._v4_m2 is not None and not is_resident_target:
+                self._active_layer = layer_idx
+                in_cone = (self.num_layers >= 8 and layer_idx < 4)
+                streamed_count = max(1, self.num_layers - self.resident_layers)
+                pkg = self._v4_m2.lookup_reuse(("trunk_layer", layer_idx))
+                t_io_ms = 0.0
+                t_wait_ms = 0.0
+                if pkg is not None:
+                    self._v4_reuses += 1
+                    nbytes = sum(
+                        _tensor_dict_bytes(v["tensors"])
+                        + (0 if v["bias"] is None else v["bias"].numel() * v["bias"].element_size())
+                        for v in pkg["q1"].values()
+                    ) + _tensor_dict_bytes(pkg["other"])
+                else:
+                    fut = self._v4_futures.pop(layer_idx, None)
+                    if fut is None:
+                        fut = self._v4_pool.submit(self._v4_prepare_layer, layer_idx, self._v4_plane_shed)
+                        self._v4_stream_prepares += 1
+                    t_w0 = time.perf_counter()
+                    pkg, host_pkg, nbytes, ready_ev, t_io_ms, from_cache, carved_cubes = fut.result()
+                    t_wait_ms = (time.perf_counter() - t_w0) * 1000.0
+                    self._v4_wait_seconds += t_wait_ms / 1000.0
+                    if from_cache:
+                        self.host_cache_hits += 1
+                    else:
+                        self.disk_layer_reads += 1
+                        self.total_cubes_carved += carved_cubes
+                        self.trunk_projections_carved += len(linear_map)
+                    if (
+                        host_pkg is not None
+                        and layer_idx not in self._host_cache
+                        and (self._host_cached_bytes + nbytes) <= self.host_cache_bytes
+                    ):
+                        # Prefix-pinned sequential Host Q1 cache: zero LRU thrashing!
+                        self._host_cache[layer_idx] = (host_pkg, nbytes)
+                        self._host_cached_bytes += nbytes
+                    if nbytes > self._v4_m2.max_pool_bytes:
+                        self._v4_m2.max_pool_bytes = nbytes
+                    self._v4_m2.admit_region(
+                        ("trunk_layer", layer_idx),
+                        pkg,
+                        gpu_bytes=nbytes,
+                        ready_event=ready_ev,
+                        recurring_hint=(self._v4_window_depth >= streamed_count),
+                    )
+                for sub_name, (in_f, out_f, has_bias, n_cubes) in linear_map.items():
+                    ent = pkg["q1"][sub_name]
+                    k_used = int(ent.get("k_used", ent["meta"].root_bits))
+                    q1_mod = BinaryHalvingQ1Linear(
+                        in_f, out_f, ent["tensors"], ent["meta"],
+                        bias=ent["bias"], layer_idx=layer_idx, proj_name=sub_name.rsplit(".", 1)[-1],
+                    )
+                    q1_mod.active_cubes = min(n_cubes, k_used)
+                    q1_mod.micro_agent_tol = self.micro_agent_tol
+                    q1_mod.mirror_diff_tol = (0.5 * self.trunk_mirror_tol) if in_cone else self.trunk_mirror_tol
+                    _set_submodule(module, sub_name, q1_mod)
+                for pname, dt in other_params:
+                    if pname in pkg["other"]:
+                        set_module_tensor_to_device(module, pname, self.device, value=pkg["other"][pname], dtype=dt, clear_cache=False)
+                for bname, bdt in other_buffers:
+                    if bname in pkg.get("buffers", {}):
+                        set_module_tensor_to_device(module, bname, self.device, value=pkg["buffers"][bname], dtype=bdt, clear_cache=False)
+                if nbytes > self.peak_active_layer_bytes:
+                    self.peak_active_layer_bytes = nbytes
+                cur_v = int(torch.cuda.memory_allocated(self.device))
+                if cur_v > self.peak_vram_bytes:
+                    self.peak_vram_bytes = cur_v
+                self._v4_last_io_ms = t_io_ms
+                self._v4_last_wait_ms = t_wait_ms
+                self._v4_layer_start_ts = time.perf_counter()
+                self._v4_schedule_ahead(layer_idx)
+                return args, kwargs
 
             # C(0) -> A transition (for streamed layers)
             if not is_resident_target:
@@ -2725,8 +3221,11 @@ class AirLLMLazyBinaryHalvingRunner:
                         in_f, out_f, t_gpu, h_entry["meta"],
                         bias=b_gpu, layer_idx=layer_idx, proj_name=sub_name.rsplit(".", 1)[-1],
                     )
-                    q1_mod.active_cubes = n_cubes
+                    q1_mod.active_cubes = min(n_cubes, int(h_entry["meta"].root_bits))
                     q1_mod.micro_agent_tol = self.micro_agent_tol
+                    if self.mirror_v4_trunk:
+                        in_cone_c = (self.num_layers >= 8 and layer_idx < 4)
+                        q1_mod.mirror_diff_tol = (0.5 * self.trunk_mirror_tol) if in_cone_c else self.trunk_mirror_tol
                     _set_submodule(module, sub_name, q1_mod)
                 for pname, dt in other_params:
                     if pname in other_host:
@@ -2740,8 +3239,11 @@ class AirLLMLazyBinaryHalvingRunner:
                 other_for_host: Dict[str, torch.Tensor] = {}
                 keep_in_host = (not is_resident_target) and (self.host_cache_bytes > 0)
 
+                transposed_set = spec.get("transposed_linears", ())
                 for sub_name, (in_f, out_f, has_bias, n_cubes) in linear_map.items():
                     w_raw = raw_tensors[f"{sub_name}.weight"].to(device=self.device, dtype=torch.bfloat16)
+                    if sub_name in transposed_set:
+                        w_raw = w_raw.t().contiguous()
                     b_raw = raw_tensors.get(f"{sub_name}.bias")
                     b_gpu = None if b_raw is None else b_raw.to(device=self.device, dtype=torch.bfloat16).contiguous()
                     in_cone = (self.num_layers >= 8 and layer_idx < 4)
@@ -2859,6 +3361,34 @@ class AirLLMLazyBinaryHalvingRunner:
             linear_map = spec["linear_map"]
             other_params = spec["other_params"]
 
+            if self._v4_m2 is not None:
+                t_gpu_ms = (time.perf_counter() - self._v4_layer_start_ts) * 1000.0
+                if self._v4_m1 is not None:
+                    self._v4_m1.observe_dispatch_timing(
+                        t_gpu_ms=t_gpu_ms,
+                        t_io_ms=self._v4_last_io_ms,
+                        t_wait_ms=self._v4_last_wait_ms,
+                        items_dispatched=1,
+                    )
+                streamed_count = max(1, self.num_layers - self.resident_layers)
+                self._v4_m2.finish_region(
+                    ("trunk_layer", layer_idx),
+                    keep_if_reusable=(self._v4_window_depth >= streamed_count),
+                )
+                pinned_tied_pfxs = spec.get("pinned_tied_prefixes", ())
+                for sub_name, (in_f, out_f, has_bias, _) in linear_map.items():
+                    if pinned_tied_pfxs and sub_name.startswith(pinned_tied_pfxs):
+                        continue
+                    shell = nn.Linear(in_f, out_f, bias=has_bias, device="meta", dtype=torch.bfloat16)
+                    _set_submodule(module, sub_name, shell)
+                for pname, _ in other_params:
+                    if pinned_tied_pfxs and pname.startswith(pinned_tied_pfxs):
+                        continue
+                    set_module_tensor_to_device(module, pname, "meta", clear_cache=False)
+                self._active_layer = None
+                self.standby_bytes = 0
+                return output
+
             if self._relay is not None:
                 # The prefill-derived selection remains the preparation basis;
                 # releasing A does not erase that retained plan.
@@ -2868,11 +3398,16 @@ class AirLLMLazyBinaryHalvingRunner:
 
             # A -> B (retire active layer) -> C(0) (zero standby bytes in VRAM)
             self.transitions["A->B"] += 1
+            pinned_tied_pfxs = spec.get("pinned_tied_prefixes", ())
             for sub_name, (in_f, out_f, has_bias, _) in linear_map.items():
+                if pinned_tied_pfxs and sub_name.startswith(pinned_tied_pfxs):
+                    continue
                 # Replace active BinaryHalvingQ1Linear with zero-byte meta nn.Linear shell
                 shell = nn.Linear(in_f, out_f, bias=has_bias, device="meta", dtype=torch.bfloat16)
                 _set_submodule(module, sub_name, shell)
             for pname, _ in other_params:
+                if pinned_tied_pfxs and pname.startswith(pinned_tied_pfxs):
+                    continue
                 set_module_tensor_to_device(module, pname, "meta", clear_cache=False)
 
             self.transitions["B->C"] += 1
@@ -2903,8 +3438,11 @@ class AirLLMLazyBinaryHalvingRunner:
         self.disk_layer_reads += 1
         raw_tensors = self.layer_reader(li)
         in_cone = (self.num_layers >= 8 and li < 4)
+        transposed_set = spec.get("transposed_linears", ())
         for sub_name, (in_f, out_f, has_bias, n_cubes) in linear_map.items():
             w_raw = raw_tensors[f"{sub_name}.weight"].to(device=self.device, dtype=torch.bfloat16)
+            if sub_name in transposed_set:
+                w_raw = w_raw.t().contiguous()
             b_raw = raw_tensors.get(f"{sub_name}.bias")
             b_gpu = None if b_raw is None else b_raw.to(device=self.device, dtype=torch.bfloat16).contiguous()
             if self.mirror_v4_trunk:
@@ -2999,6 +3537,15 @@ class AirLLMLazyBinaryHalvingRunner:
                 "early_stops": self.trunk_early_stops,
                 "diff_q1_calls": sum(int(m.mirror_diff_calls) for m in self._trunk_q1_modules),
                 "anchored_projections": sum(1 for m in self._trunk_q1_modules if m._mirror_x_last is not None),
+                "v4_trunk_breather": None if self._v4_m2 is None else {
+                    "window_depth": self._v4_window_depth,
+                    "plane_shed": self._v4_plane_shed,
+                    "stream_prepares": self._v4_stream_prepares,
+                    "m2_reuses": self._v4_reuses,
+                    "wait_seconds": round(self._v4_wait_seconds, 4),
+                    "m1": self._v4_m1.stats() if self._v4_m1 is not None else None,
+                    "m2": self._v4_m2.stats(),
+                },
             } if self.mirror_v4_trunk else None,
             "moe_cache": self.moe_cache.stats() if self.moe_cache is not None else None,
             "relay": None if self._relay is None else {
@@ -3013,6 +3560,22 @@ class AirLLMLazyBinaryHalvingRunner:
         }
 
     def close(self) -> None:
+        if self._v4_pool is not None:
+            for fut in list(self._v4_futures.values()):
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            self._v4_futures.clear()
+            self._v4_pool.shutdown(wait=True, cancel_futures=True)
+            self._v4_pool = None
+        if self._v4_m2 is not None:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            self._v4_m2.clear() if hasattr(self._v4_m2, "clear") else None
+            self._v4_m2 = None
+        self._v4_m1 = None
+        self._v4_prepare_stream = None
         if self._relay_pool is not None:
             self._relay_pool.shutdown(wait=True, cancel_futures=True)
             self._relay_pool = None
@@ -3034,6 +3597,112 @@ class AirLLMLazyBinaryHalvingRunner:
         if self.moe_cache is not None:
             self.moe_cache.close()
         self._installed = False
+
+
+@torch.no_grad()
+def _install_q1_cubes_lm_head(
+    model: nn.Module,
+    *,
+    device: torch.device,
+    cubes_per_proj: int,
+    root_bits: int,
+    group_size: int = 64,
+    min_bf16_bytes: int = 256 * 1024**2,
+) -> bool:
+    """Carve a large BF16 `lm_head` (>= 256 MiB) into chunked pure-Q1 cubes (`BinaryHalvingQ1Linear`).
+
+    Frees ~1.1-1.3 GiB VRAM on 248k-vocab models (e.g. Qwythos-9B / Qwen3.6-35B) while running
+    logit projection via the bank-conflict-free POPC10 Q1 kernel at cos >= 0.9991..0.9998.
+    """
+    if device.type != "cuda" or int(group_size) != 64 or int(root_bits) not in (2, 4, 8, 16):
+        return False
+    head_attr = None
+    head_mod = None
+    for cand in ("lm_head", "embed_out", "head", "output_projection"):
+        m = getattr(model, cand, None)
+        if isinstance(m, nn.Linear):
+            head_attr = cand
+            head_mod = m
+            break
+    if head_mod is None or head_attr is None:
+        return False
+    w_param = getattr(head_mod, "weight", None)
+    if not isinstance(w_param, torch.Tensor) or w_param.is_meta or not w_param.is_cuda or w_param.ndim != 2:
+        return False
+    V, K = int(w_param.shape[0]), int(w_param.shape[1])
+    if K % 64 != 0 or (V * K * int(w_param.element_size())) < int(min_bf16_bytes):
+        return False
+
+    from src.pure_mirror_agents_nvrtc import (
+        launch_pure_mirror_carve_q1_ballot,
+        launch_pure_mirror_sinkhorn_l2,
+    )
+
+    lm_cubes = max(1, min(int(root_bits), max(5, int(cubes_per_proj))))
+    w_bf16 = w_param.detach().to(device=device, dtype=torch.bfloat16).contiguous()
+    lm_bias = None if head_mod.bias is None else head_mod.bias.detach().to(device=device, dtype=torch.bfloat16).contiguous()
+    row_scale, col_scale, _ = launch_pure_mirror_sinkhorn_l2(w_bf16, iters=3, apply=False)
+    ng = K // 64
+    k8 = K // 8
+    packed_lo = torch.empty((lm_cubes, V, k8), dtype=torch.uint8, device=device)
+    qscale = torch.empty((1, V, ng), dtype=torch.bfloat16, device=device)
+    qzero = torch.empty((V, ng), dtype=torch.bfloat16, device=device)
+    inv_col = (1.0 / col_scale.float().clamp_min(1e-8)).unsqueeze(0)
+
+    chunk_rows = 16384
+    for r0 in range(0, V, chunk_rows):
+        r1 = min(V, r0 + chunk_rows)
+        inv_r = (1.0 / row_scale[r0:r1].float().clamp_min(1e-8)).unsqueeze(1)
+        w_eq_c = (w_bf16[r0:r1].float() * inv_r * inv_col).contiguous()
+        u_c = fwht_block(w_eq_c, 64).to(torch.float32)
+        del w_eq_c
+        pk_c, qs_c, qz_c, _, _ = launch_pure_mirror_carve_q1_ballot(
+            u_c,
+            row_scale[r0:r1],
+            root_bits=int(root_bits),
+            max_cubes=lm_cubes,
+            x_rot=None,
+        )
+        packed_lo[:, r0:r1].copy_(pk_c)
+        qscale[:, r0:r1].copy_(qs_c)
+        qzero[r0:r1].copy_(qz_c)
+        del u_c, pk_c, qs_c, qz_c
+
+    depth = int(math.log2(int(root_bits)))
+    meta = BinaryHalvingTreeMeta(
+        root_bits=lm_cubes,
+        depth=depth,
+        law="mirror_lm_head_positional_halving",
+        group_size=64,
+        use_fwht=True,
+        level_node_counts=tuple(1 << d for d in range(depth + 1)),
+        leaf_paths=tuple(_binary_tree_path(p, depth) for p in range(lm_cubes)),
+        leaf_energy_frac=(),
+        prefix_rel_rmse=(),
+        prefix_cos=(),
+        source_root_bits=int(root_bits),
+    )
+    q1_head = BinaryHalvingQ1Linear(
+        K,
+        V,
+        {
+            "packed_lo": packed_lo,
+            "qscale": qscale,
+            "qzero": qzero,
+            "row_scale": row_scale.contiguous(),
+            "col_scale": col_scale.contiguous(),
+        },
+        meta,
+        bias=lm_bias,
+        layer_idx=-1,
+        proj_name=head_attr,
+    )
+    q1_head.active_cubes = lm_cubes
+    q1_head.mirror_diff_tol = None  # Full exact depth on final logit projection via POPC10
+    setattr(model, head_attr, q1_head)
+    del w_bf16, head_mod, w_param, inv_col
+    torch.cuda.empty_cache()
+    return True
 
 
 @torch.no_grad()
@@ -3092,6 +3761,13 @@ def attach_q1_cubes_to_engine(
             except Exception:
                 pass
     eng.vram_resident_layers = 0
+    _install_q1_cubes_lm_head(
+        eng.model,
+        device=device,
+        cubes_per_proj=cubes_per_proj,
+        root_bits=root_bits,
+        group_size=group_size,
+    )
 
     src = getattr(wm, "model_source", None) if wm is not None else None
     moe_cache: Optional[LazyMoEBinaryHalvingCache] = None
@@ -3101,13 +3777,6 @@ def attach_q1_cubes_to_engine(
         base_loader = src._expert_loader
         if hasattr(base_loader, "base"):
             base_loader = base_loader.base
-        # Free the original BF16/uint8 expert arena so VRAM belongs solely to our compact Q1 expert cache
-        if getattr(base_loader, "arena", None) is not None:
-            base_loader.arena = None
-            if hasattr(base_loader, "_lru"):
-                base_loader._lru.clear()
-            if hasattr(base_loader, "num_slots"):
-                base_loader.num_slots = 0
 
         # Check shape compatibility (gated SwiGLU experts with hidden & inter dims divisible by group_size)
         compatible_layers: List[int] = []
@@ -3135,6 +3804,13 @@ def attach_q1_cubes_to_engine(
                     num_experts_max = max(num_experts_max, int(n_e))
 
         if compatible_layers and num_experts_max > 0:
+            # Free the original BF16/uint8 expert arena so VRAM belongs solely to our compact Q1 expert cache
+            if getattr(base_loader, "arena", None) is not None:
+                base_loader.arena = None
+                if hasattr(base_loader, "_lru"):
+                    base_loader._lru.clear()
+                if hasattr(base_loader, "num_slots"):
+                    base_loader.num_slots = 0
             container_map = getattr(src, "_routed_expert_container", {}) or {}
             moe_paths = {l_idx: container_map.get(l_idx, "mlp.experts") for l_idx in compatible_layers}
             num_layers_cfg = int(getattr(eng.model.config, "num_hidden_layers", max(compatible_layers) + 1))
@@ -3184,9 +3860,36 @@ def attach_q1_cubes_to_engine(
             if hasattr(base_loader, "fetch_raw_u8") and hasattr(base_loader, "dequant_raw_u8"):
                 moe_cache.raw_u8_fetcher = base_loader.fetch_raw_u8
                 moe_cache.raw_u8_dequantizer = base_loader.dequant_raw_u8
+        elif (
+            device.type == "cuda"
+            and moe_gpu_cache_bytes > 0
+            and getattr(base_loader, "arena", None) is None
+            and getattr(base_loader, "uniform_shapes", False)
+            and getattr(base_loader, "inter_dim", 0) > 0
+            and getattr(base_loader, "hidden_dim", 0) > 0
+        ):
+            # Biased / non-Q1-routed MoE (e.g. GptOss-20B-MXFP4): allocate bounded VRAM arena on base_loader!
+            n_p = int(getattr(base_loader, "n_proj", 3))
+            i_d, h_d = int(base_loader.inter_dim), int(base_loader.hidden_dim)
+            e_b = n_p * i_d * h_d * int(getattr(base_loader, "elem_size", 2))
+            tot_e = len(getattr(base_loader, "_spans", {}))
+            if e_b > 0 and tot_e > 0:
+                n_sl = min(tot_e, int(moe_gpu_cache_bytes) // e_b)
+                if n_sl >= 4:
+                    base_loader.num_slots = n_sl
+                    base_loader.arena = torch.empty((n_sl, n_p, i_d, h_d), dtype=base_loader.dtype, device=device)
 
     def _disk_layer_reader(l_idx: int) -> Dict[str, torch.Tensor]:
         return wm.read_layer_tensors(l_idx, target_device=torch.device("cpu"))
+
+    def _layer_tensor_keys(l_idx: int) -> set[str]:
+        if src is not None and hasattr(src, "layer_entries"):
+            try:
+                pref = f"model.layers.{l_idx}."
+                return {k.removeprefix(pref) for k in src.layer_entries(l_idx).keys()}
+            except Exception:
+                return set()
+        return set()
 
     def _cancel_check() -> None:
         fn = getattr(eng, "_step_cancel_check", None)
@@ -3210,6 +3913,7 @@ def attach_q1_cubes_to_engine(
         enable_relay=enable_relay,
         micro_agent_tol=micro_agent_tol,
         mirror_v4_trunk=bool(mirror_v4_trunk),
+        layer_tensor_keys=_layer_tensor_keys,
     ).install()
     if device.type == "cuda":
         torch.cuda.empty_cache()

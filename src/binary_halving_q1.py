@@ -1453,6 +1453,9 @@ class LazyMoEBinaryHalvingCache:
         self._cached_bytes: int = 0
         self._host_lru: "OrderedDict[Tuple[int, int], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int]]" = OrderedDict()
         self._host_cached_bytes: int = 0
+        self._host_eviction_sink: Optional[
+            Callable[[Tuple[int, int], Dict[str, torch.Tensor], Dict[str, torch.Tensor], int], None]
+        ] = None
         # Crisp BF16 scar-anchors `(x_gu_last, y_gu_last, x_dn_last, y_dn_last)` for V3 differential Q1 GEMV
         self._mirror_anchors: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
@@ -1573,9 +1576,14 @@ class LazyMoEBinaryHalvingCache:
             _, _, prev_b = self._host_lru.pop(key)
             self._host_cached_bytes -= prev_b
         while self._host_lru and (self._host_cached_bytes + entry_bytes > self.host_cache_bytes):
-            _, (_, _, old_b) = self._host_lru.popitem(last=False)
+            ev_key, (ev_gu, ev_dn, old_b) = self._host_lru.popitem(last=False)
             self._host_cached_bytes -= old_b
             self.host_evictions += 1
+            if self._host_eviction_sink is not None:
+                try:
+                    self._host_eviction_sink(ev_key, ev_gu, ev_dn, old_b)
+                except Exception:
+                    pass
         cpu_gu = {k: (v if v.device.type == "cpu" else v.detach().cpu()) for k, v in gu_t.items()}
         cpu_dn = {k: (v if v.device.type == "cpu" else v.detach().cpu()) for k, v in dn_t.items()}
         self._host_lru[key] = (cpu_gu, cpu_dn, entry_bytes)
@@ -2201,6 +2209,7 @@ class LazyMoEBinaryHalvingCache:
         if self._imprint_overlay is not None:
             self._imprint_overlay.close()
             self._imprint_overlay = None
+        self._host_eviction_sink = None
         if self._expert_relay_pool is not None:
             self._expert_relay_pool.shutdown(wait=True, cancel_futures=True)
             self._expert_relay_pool = None

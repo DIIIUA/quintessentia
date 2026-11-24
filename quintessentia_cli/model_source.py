@@ -860,6 +860,15 @@ def read_safetensors_header(path: str | Path) -> tuple[dict[str, Any], int]:
     return header, 8 + n
 
 
+_PREAD_FADVISE_MIN_BYTES = 262144  # 256 KiB — skip tiny header/metadata reads
+_PREAD_FADVISE_STATS: dict[str, int] = {"calls": 0, "bytes": 0}
+
+
+def pread_fadvise_stats() -> dict[str, int]:
+    """Return telemetry of POSIX_FADV_DONTNEED page-cache evictions after positioned reads."""
+    return dict(_PREAD_FADVISE_STATS)
+
+
 def _pread_or_seek_into(f: Any, abs_offset: int, view: memoryview, path: str) -> None:
     total = len(view)
     if total == 0:
@@ -873,6 +882,17 @@ def _pread_or_seek_into(f: Any, abs_offset: int, view: memoryview, path: str) ->
                 raise OSError(f"{path}: unexpected EOF at offset {abs_offset + done}")
             view[done : done + len(chunk)] = chunk
             done += len(chunk)
+        if (
+            total >= _PREAD_FADVISE_MIN_BYTES
+            and hasattr(os, "posix_fadvise")
+            and hasattr(os, "POSIX_FADV_DONTNEED")
+        ):
+            try:
+                os.posix_fadvise(fd, abs_offset, total, os.POSIX_FADV_DONTNEED)
+                _PREAD_FADVISE_STATS["calls"] += 1
+                _PREAD_FADVISE_STATS["bytes"] += total
+            except OSError:
+                pass
     else:
         f.seek(abs_offset)
         done = 0

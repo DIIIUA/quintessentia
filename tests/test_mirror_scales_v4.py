@@ -739,3 +739,244 @@ def test_m8_mirror_thought_buffer_immutable_phi0_split_leaves_and_zero_force():
     assert diff_40 > 0.0
     assert int(out_fork.argmax(dim=-1).item()) == 40
     assert anchor.initial_fingerprint() == fp0
+
+
+def test_phase5_pread_posix_fadvise_dontneed(tmp_path):
+    """Phase 5A: _pread_or_seek_into evicts large positioned reads with POSIX_FADV_DONTNEED on Linux."""
+    import os
+    from quintessentia_cli.model_source import _pread_or_seek_into, pread_fadvise_stats
+
+    blob = bytes((i * 37) & 0xFF for i in range(512 * 1024))
+    fpath = tmp_path / "chunk_512k.bin"
+    fpath.write_bytes(blob)
+
+    before = pread_fadvise_stats()
+    with open(fpath, "rb", buffering=0) as f:
+        small = bytearray(1024)
+        _pread_or_seek_into(f, 0, memoryview(small), str(fpath))
+        assert bytes(small) == blob[:1024]
+        after_small = pread_fadvise_stats()
+        assert after_small["calls"] == before["calls"]
+
+        big = bytearray(len(blob))
+        _pread_or_seek_into(f, 0, memoryview(big), str(fpath))
+        assert bytes(big) == blob
+
+    after_big = pread_fadvise_stats()
+    if hasattr(os, "pread") and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+        assert after_big["calls"] == before["calls"] + 1
+        assert after_big["bytes"] >= before["bytes"] + len(blob)
+
+
+@torch.no_grad()
+def test_phase5_q1_disk_l3_cache_overflow_spill_hit_and_cleanup(tmp_path):
+    """Phase 5B: L2 Host LRU overflow spills Q1 crystals to isolated ext4 L3 cache and restores with 0 misses."""
+    from src.binary_halving_q1 import LazyMoEBinaryHalvingCache, carve_q1_cubes_incremental
+    from src.mirror_scales_v4 import MirrorIsolatedMoEOverlayV4
+
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    def _dummy_reader(_li, _eid):
+        raise AssertionError("Should not fall back to raw disk reader when Q1 crystal is in L3!")
+
+    # Create three real Q1 crystals to measure exact byte size per expert
+    torch.manual_seed(42)
+    crystals = {}
+    for eid in (0, 1, 2):
+        w_gu = torch.randn((128, 64), dtype=torch.bfloat16, device=dev)
+        w_dn = torch.randn((64, 64), dtype=torch.bfloat16, device=dev)
+        gu_t, _ = carve_q1_cubes_incremental(w_gu, 3, root_bits=8, group_size=64, use_fwht=False, sinkhorn_iters=1)
+        dn_t, _ = carve_q1_cubes_incremental(w_dn, 3, root_bits=8, group_size=64, use_fwht=False, sinkhorn_iters=1)
+        eb = sum(t.numel() * t.element_size() for t in gu_t.values()) + sum(
+            t.numel() * t.element_size() for t in dn_t.values()
+        )
+        crystals[eid] = (gu_t, dn_t, eb)
+
+    eb0 = crystals[0][2]
+    # Budget holds exactly 1 expert in L1 and 1 expert in L2 -> storing 3 experts MUST spill expert 0 to L3!
+    cache = LazyMoEBinaryHalvingCache(
+        expert_reader=_dummy_reader,
+        num_layers=2,
+        num_experts=8,
+        device=dev,
+        store_cubes=3,
+        root_bits=8,
+        max_cache_bytes=eb0 + 1024,
+        host_cache_bytes=eb0 + 1024,
+        imprint_puzzle=False,
+    )
+    l3_root = tmp_path / "l3_ext4_cache"
+    ov = MirrorIsolatedMoEOverlayV4(
+        cache,
+        core_k=3,
+        mid_k=3,
+        rim_k=3,
+        shell_k=3,
+        min_shed_k=3,
+        l3_cache_dir=l3_root,
+        l3_cache_max_bytes=16 * 1024**2,
+        enable_l3_cache=True,
+    )
+    assert ov.l3_cache is not None
+    session_dir = ov.l3_cache.session_dir
+    assert session_dir.exists()
+
+    try:
+        ref_gu0 = {k: v.detach().cpu().clone() for k, v in crystals[0][0].items()}
+        ref_dn0 = {k: v.detach().cpu().clone() for k, v in crystals[0][1].items()}
+
+        for eid in (0, 1, 2):
+            gu_t, dn_t, eb = crystals[eid]
+            ov._store_crystal((0, eid), gu_t, dn_t, eb, protected_layer=1, protected_eids=set())
+
+        ov.l3_cache.flush()
+        assert (0, 0) not in cache._lru
+        assert (0, 0) not in cache._host_lru
+        assert ov.l3_cache.spills >= 1
+        assert ov.l3_cache.contains((0, 0))
+        assert any(p.suffix == ".safetensors" for p in session_dir.iterdir())
+
+        misses_before = cache.misses
+        restored = ov._get_hot_or_host(0, 0, protected_eids=set())
+        assert restored is not None
+        r_gu, r_dn = restored
+        assert cache.misses == misses_before
+        for k, v in ref_gu0.items():
+            assert torch.equal(r_gu[k].detach().cpu(), v)
+        for k, v in ref_dn0.items():
+            assert torch.equal(r_dn[k].detach().cpu(), v)
+
+        st = ov.stats()
+        assert st["m5_layer_execution"]["l3_enabled"] is True
+        assert st["m5_layer_execution"]["l3_spills"] >= 1
+        assert st["m5_layer_execution"]["l3_hits"] == 1
+        assert st["cross_scale_coupling"] is False
+    finally:
+        ov.close()
+
+    assert not session_dir.exists()
+    assert cache._host_eviction_sink is None
+
+
+def test_phase5_auto_v4_cli_plan_and_quint_launcher(tmp_path):
+    """Phase 5C: one-button `quint` auto-selects full V4 (M0-M8) for large MoE exceeding VRAM without touching dense/small."""
+    from pathlib import Path
+    from quintessentia_cli.cli import build_parser, resolve_auto_v4_plan
+
+    GiB = 1024**3
+    dummy_model = tmp_path / "Qwen3.6-35B-A3B"
+    dummy_model.mkdir()
+
+    # 1. Large 256-expert 24 GiB MoE on 7.5 GiB free VRAM -> auto V4 M0-M8
+    plan_large = resolve_auto_v4_plan(
+        model_dir=dummy_model,
+        weight_format="auto",
+        feedback_mode="auto",
+        q1_planes=None,
+        device="auto",
+        cuda_available=True,
+        free_vram_bytes=int(7.5 * GiB),
+        profile={"num_experts": 256, "num_experts_per_tok": 8},
+        weight_bytes=24 * GiB,
+    )
+    assert plan_large["auto_v4_selected"] is True
+    assert plan_large["weight_format"] == "q1_cubes"
+    assert plan_large["feedback_mode"] == "mirror_scales"
+    assert plan_large["q1_imprint_puzzle"] is True
+    assert plan_large["q1_planes"] == 5
+    assert plan_large["cube_root_bits"] == 8
+    assert plan_large["reason"] == "auto_large_moe_exceeds_vram"
+
+    # 2. Dense model (num_experts=0) -> keeps standard auto
+    plan_dense = resolve_auto_v4_plan(
+        model_dir=dummy_model,
+        weight_format="auto",
+        feedback_mode="auto",
+        q1_planes=None,
+        device="auto",
+        cuda_available=True,
+        free_vram_bytes=int(7.5 * GiB),
+        profile={"num_experts": 0},
+        weight_bytes=12 * GiB,
+    )
+    assert plan_dense["auto_v4_selected"] is False
+    assert plan_dense["weight_format"] == "auto"
+    assert plan_dense["feedback_mode"] == "off"
+
+    # 3. Small MoE fitting inside 1.25x VRAM -> keeps standard auto
+    plan_small_moe = resolve_auto_v4_plan(
+        model_dir=dummy_model,
+        weight_format="auto",
+        feedback_mode="auto",
+        q1_planes=None,
+        device="auto",
+        cuda_available=True,
+        free_vram_bytes=int(7.5 * GiB),
+        profile={"num_experts": 16},
+        weight_bytes=4 * GiB,
+    )
+    assert plan_small_moe["auto_v4_selected"] is False
+    assert plan_small_moe["feedback_mode"] == "off"
+
+    # 4. Explicit `--feedback-mode off` always opts out even for large MoE
+    plan_off = resolve_auto_v4_plan(
+        model_dir=dummy_model,
+        weight_format="auto",
+        feedback_mode="off",
+        q1_planes=None,
+        device="auto",
+        cuda_available=True,
+        free_vram_bytes=int(7.5 * GiB),
+        profile={"num_experts": 256},
+        weight_bytes=24 * GiB,
+    )
+    assert plan_off["auto_v4_selected"] is False
+    assert plan_off["weight_format"] == "auto"
+    assert plan_off["feedback_mode"] == "off"
+
+    # 5. Explicit `--feedback-mode v4` promotes `auto` -> `q1_cubes` + V4
+    plan_v4 = resolve_auto_v4_plan(
+        model_dir=dummy_model,
+        weight_format="auto",
+        feedback_mode="v4",
+        q1_planes=None,
+        device="auto",
+    )
+    assert plan_v4["auto_v4_selected"] is True
+    assert plan_v4["weight_format"] == "q1_cubes"
+    assert plan_v4["feedback_mode"] == "mirror_scales"
+    assert plan_v4["q1_imprint_puzzle"] is True
+    assert plan_v4["q1_planes"] == 5
+
+    # 6. Explicit `--weight-format q6` with `--feedback-mode auto` respects q6
+    plan_q6 = resolve_auto_v4_plan(
+        model_dir=dummy_model,
+        weight_format="q6",
+        feedback_mode="auto",
+        q1_planes=None,
+        device="auto",
+        cuda_available=True,
+        free_vram_bytes=int(7.5 * GiB),
+        profile={"num_experts": 256},
+        weight_bytes=24 * GiB,
+    )
+    assert plan_q6["auto_v4_selected"] is False
+    assert plan_q6["weight_format"] == "q6"
+    assert plan_q6["feedback_mode"] == "off"
+
+    # 7. CLI parser defaults & POSIX `quint` launcher sanity (LF-only shebang)
+    parser = build_parser()
+    args_ask = parser.parse_args(["ask", "--model", "1", "Hi"])
+    assert args_ask.feedback_mode == "auto"
+    assert args_ask.weight_format == "auto"
+    assert args_ask.q1_planes is None
+
+    args_doc = parser.parse_args(["doctor", "--model", "1"])
+    assert args_doc.feedback_mode == "auto"
+    assert args_doc.q1_planes is None
+
+    quint_sh = Path(__file__).resolve().parents[1] / "quint"
+    assert quint_sh.exists()
+    raw_sh = quint_sh.read_bytes()
+    assert b"\r\n" not in raw_sh
+    assert raw_sh.startswith(b"#!/usr/bin/env bash\n")

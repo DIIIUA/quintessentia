@@ -48,12 +48,18 @@ alongside the isolated warmup & layer execution scales (M3, M4, M5):
 """
 from __future__ import annotations
 
+import atexit
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
+import os
+from pathlib import Path
+import shutil
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+import uuid
 
 import torch
 import torch.nn.functional as F
@@ -1268,6 +1274,253 @@ def mirror_cube_depth_math(p_body: float, p_tail: float, min_k: int, max_k: int)
     return max(int(min_k), min(int(max_k), k))
 
 
+class Q1DiskL3Cache:
+    """Isolated physical L3 SSD cache for Q1 crystals evicted from L2 Host RAM.
+
+    Pure memory-hierarchy tier (L1 VRAM -> L2 Host RAM -> L3 native ext4 SSD):
+      - Stores compact Q1 safetensors crystals (`~0.5-1.5 MiB` vs `~6-12 MiB` raw BF16) so
+        returning experts skip both raw BF16 disk reads and Q1 re-carving.
+      - Uses native `ext4` (`~/q1_l3_cache/session_<pid>_<id>` on POSIX by default, NEVER `/tmp`
+        tmpfs!) with bounded LRU eviction (`max_bytes`, default 2 GiB).
+      - Single-thread async spill writer with in-memory `_pending` handoff (zero race conditions).
+      - Strictly physical tiering — ZERO cross-scale mirror coupling.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Optional[str | Path] = None,
+        *,
+        max_bytes: int = 2 * 1024**3,
+    ) -> None:
+        if cache_dir is not None:
+            base_dir = Path(cache_dir)
+        else:
+            env_dir = os.environ.get("QUINTESSENTIA_L3_CACHE_DIR")
+            base_dir = Path(env_dir) if env_dir else (Path.home() / "q1_l3_cache")
+        self.base_dir = base_dir
+        self.session_dir = base_dir / f"session_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max(0, int(max_bytes))
+
+        self._lock = threading.Lock()
+        self._pending: Dict[
+            Tuple[int, int], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int]
+        ] = {}
+        # key -> (safetensors_path, disk_bytes, logical_entry_bytes)
+        self._disk_lru: "OrderedDict[Tuple[int, int], Tuple[Path, int, int]]" = OrderedDict()
+        self._disk_bytes: int = 0
+        self._pool: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="quintessentia-l3-spill"
+        )
+        self._closed: bool = False
+
+        # Telemetry
+        self.spills: int = 0
+        self.hits: int = 0
+        self.evictions: int = 0
+        self.write_errors: int = 0
+
+        atexit.register(self.close)
+
+    def _entry_path(self, key: Tuple[int, int]) -> Path:
+        return self.session_dir / f"L{int(key[0]):04d}_E{int(key[1]):05d}.safetensors"
+
+    def spill_async(
+        self,
+        key: Tuple[int, int],
+        gu_t: Dict[str, torch.Tensor],
+        dn_t: Dict[str, torch.Tensor],
+        entry_bytes: int,
+    ) -> None:
+        if self._closed or self.max_bytes <= 0 or int(entry_bytes) > self.max_bytes:
+            return
+        cpu_gu = {
+            k: (v.detach().contiguous() if v.device.type == "cpu" else v.detach().cpu().contiguous())
+            for k, v in gu_t.items()
+        }
+        cpu_dn = {
+            k: (v.detach().contiguous() if v.device.type == "cpu" else v.detach().cpu().contiguous())
+            for k, v in dn_t.items()
+        }
+        old_path: Optional[Path] = None
+        with self._lock:
+            if self._closed or self._pool is None:
+                return
+            old_disk = self._disk_lru.pop(key, None)
+            if old_disk is not None:
+                old_path, old_db, _ = old_disk
+                self._disk_bytes -= old_db
+            self._pending[key] = (cpu_gu, cpu_dn, int(entry_bytes))
+            pool = self._pool
+        if old_path is not None:
+            try:
+                old_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            pool.submit(self._write_worker, key)
+        except RuntimeError:
+            with self._lock:
+                self._pending.pop(key, None)
+
+    def _write_worker(self, key: Tuple[int, int]) -> None:
+        from safetensors.torch import save_file
+
+        with self._lock:
+            if self._closed:
+                return
+            pending_ent = self._pending.get(key)
+            if pending_ent is None:
+                return
+            cpu_gu, cpu_dn, entry_bytes = pending_ent
+
+        flat: Dict[str, torch.Tensor] = {}
+        for k, v in cpu_gu.items():
+            flat[f"gu.{k}"] = v
+        for k, v in cpu_dn.items():
+            flat[f"dn.{k}"] = v
+
+        dst_path = self._entry_path(key)
+        tmp_path = self.session_dir / f"L{int(key[0]):04d}_E{int(key[1]):05d}.{uuid.uuid4().hex[:6]}.tmp"
+        try:
+            save_file(flat, str(tmp_path))
+            os.replace(str(tmp_path), str(dst_path))
+            disk_b = int(dst_path.stat().st_size)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            with self._lock:
+                if self._pending.get(key) is pending_ent:
+                    self._pending.pop(key, None)
+                self.write_errors += 1
+            return
+
+        evict_paths: List[Path] = []
+        discard_written = False
+        with self._lock:
+            if self._closed or (self._pending.get(key) is not pending_ent):
+                discard_written = True
+            else:
+                self._pending.pop(key, None)
+                prev = self._disk_lru.pop(key, None)
+                if prev is not None:
+                    self._disk_bytes -= prev[1]
+                while self._disk_lru and (self._disk_bytes + disk_b > self.max_bytes):
+                    _, (ev_path, ev_db, _ev_eb) = self._disk_lru.popitem(last=False)
+                    self._disk_bytes -= ev_db
+                    self.evictions += 1
+                    evict_paths.append(ev_path)
+                if disk_b <= self.max_bytes:
+                    self._disk_lru[key] = (dst_path, disk_b, entry_bytes)
+                    self._disk_bytes += disk_b
+                    self.spills += 1
+                else:
+                    discard_written = True
+
+        if discard_written:
+            try:
+                dst_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for ep in evict_paths:
+            try:
+                ep.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def contains(self, key: Tuple[int, int]) -> bool:
+        with self._lock:
+            return (not self._closed) and ((key in self._pending) or (key in self._disk_lru))
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._closed or self._pool is None:
+                return
+            pool = self._pool
+        try:
+            pool.submit(lambda: None).result()
+        except Exception:
+            pass
+
+    def load(
+        self, key: Tuple[int, int]
+    ) -> Optional[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int]]:
+        from safetensors.torch import load_file
+
+        with self._lock:
+            if self._closed:
+                return None
+            pend = self._pending.pop(key, None)
+            if pend is not None:
+                self.hits += 1
+                return pend
+            disk_ent = self._disk_lru.pop(key, None)
+            if disk_ent is None:
+                return None
+            path, disk_b, entry_bytes = disk_ent
+            self._disk_bytes -= disk_b
+
+        try:
+            flat = load_file(str(path), device="cpu")
+        except Exception:
+            return None
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        gu_t = {k[3:]: v for k, v in flat.items() if k.startswith("gu.")}
+        dn_t = {k[3:]: v for k, v in flat.items() if k.startswith("dn.")}
+        if not gu_t or not dn_t:
+            return None
+        with self._lock:
+            self.hits += 1
+        return gu_t, dn_t, entry_bytes
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "enabled": not self._closed,
+                "dir": str(self.session_dir),
+                "spills": self.spills,
+                "hits": self.hits,
+                "evictions": self.evictions,
+                "write_errors": self.write_errors,
+                "entries": len(self._disk_lru) + len(self._pending),
+                "disk_entries": len(self._disk_lru),
+                "pending_entries": len(self._pending),
+                "mib_used": round(self._disk_bytes / 1024**2, 2),
+                "max_mib": round(self.max_bytes / 1024**2, 2),
+            }
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._pending.clear()
+            self._disk_lru.clear()
+            self._disk_bytes = 0
+            pool = self._pool
+            self._pool = None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(self.session_dir, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            atexit.unregister(self.close)
+        except Exception:
+            pass
+
+
 class MirrorIsolatedMoEOverlayV4:
     """Version 4 (Final — Conveyor-Free) MoE Overlay running strictly isolated mirror mechanisms:
       - M1 `MirrorLoadDispatcher`      (GPU load, VRAM budget, dispatch regime, burst span, async cap)
@@ -1292,6 +1545,9 @@ class MirrorIsolatedMoEOverlayV4:
         auto_vram_adapt: bool = False,
         vram_safety_reserve_bytes: Optional[int] = None,
         sensor_fn: Optional[Callable[[], Tuple[int, int, Optional[float], Optional[float], int, str]]] = None,
+        l3_cache_dir: Optional[str | Path] = None,
+        l3_cache_max_bytes: int = 2 * 1024**3,
+        enable_l3_cache: Optional[bool] = None,
     ) -> None:
         self.cache = cache
         self.device = cache.device
@@ -1387,6 +1643,28 @@ class MirrorIsolatedMoEOverlayV4:
         self.evictions: int = 0
         self.post_prefill_bg_adoptions: int = 0
         self.last_trace: Dict[str, Any] = {}
+
+        # Physical L3 SSD Q1 Crystal Cache (ext4 on POSIX by default; NEVER /tmp tmpfs!)
+        self.l3_cache: Optional[Q1DiskL3Cache] = None
+        if enable_l3_cache is None:
+            use_l3 = (
+                (l3_cache_dir is not None)
+                or (os.name == "posix" and int(getattr(cache, "host_cache_bytes", 0)) > 0)
+            )
+        else:
+            use_l3 = bool(enable_l3_cache)
+        if use_l3 and int(l3_cache_max_bytes) > 0:
+            try:
+                self.l3_cache = Q1DiskL3Cache(
+                    cache_dir=l3_cache_dir,
+                    max_bytes=int(l3_cache_max_bytes),
+                )
+                cache._host_eviction_sink = self.l3_cache.spill_async
+            except Exception:
+                self.l3_cache = None
+
+    def _in_l3(self, layer_idx: int, eid: int) -> bool:
+        return self.l3_cache is not None and self.l3_cache.contains((int(layer_idx), int(eid)))
 
     # ------------------------------------------------------------------ M1 Physical Load Application
     def _apply_m1_load(self, protected_layer: int, protected_eids: set[int]) -> LoadDispatchDecision:
@@ -1549,6 +1827,19 @@ class MirrorIsolatedMoEOverlayV4:
             dn_t = {k: v.to(self.device, non_blocking=True) for k, v in h_dn.items()}
             self._store_crystal(key, gu_t, dn_t, eb, int(layer_idx), protected_eids)
             return gu_t, dn_t
+
+        if self.l3_cache is not None:
+            l3_hit = self.l3_cache.load(key)
+            if l3_hit is not None:
+                c.host_hits += 1
+                l3_gu, l3_dn, eb = l3_hit
+                gu_t = {k: v.to(self.device, non_blocking=True) for k, v in l3_gu.items()}
+                dn_t = {k: v.to(self.device, non_blocking=True) for k, v in l3_dn.items()}
+                self._store_crystal(key, gu_t, dn_t, eb, int(layer_idx), protected_eids)
+                self._access_tick += 1
+                self._expert_last_tick[key] = self._access_tick
+                self._expert_hits[key] += 1
+                return gu_t, dn_t
 
         return None
 
@@ -1909,7 +2200,7 @@ class MirrorIsolatedMoEOverlayV4:
         hot_eids: List[int] = []
         cold_eids: List[int] = []
         for eid in sorted_eids:
-            if ((li, eid) in c._lru) or ((li, eid) in c._host_lru):
+            if ((li, eid) in c._lru) or ((li, eid) in c._host_lru) or self._in_l3(li, eid):
                 hot_eids.append(eid)
             else:
                 cold_eids.append(eid)
@@ -2117,7 +2408,7 @@ class MirrorIsolatedMoEOverlayV4:
         tok_total_w = sum(rw for _, _, rw in valid) or 1.0
         eff_min = min(self.rest_min, max(1, len(valid) - 1)) if len(valid) > 1 else len(valid)
         for _rank, (e_int, k_pos, rw) in enumerate(valid):
-            is_hot = ((li, e_int) in c._lru) or ((li, e_int) in c._host_lru)
+            is_hot = ((li, e_int) in c._lru) or ((li, e_int) in c._host_lru) or self._in_l3(li, e_int)
             if is_hot:
                 hot_items.append((e_int, k_pos, rw))
             else:
@@ -2349,7 +2640,11 @@ class MirrorIsolatedMoEOverlayV4:
 
         # 6. M4 Post-Prefill Known-Region Warmup (background fetch without any conveyor slot!)
         def _is_resident(target_l: int, eid: int) -> bool:
-            return ((target_l, eid) in c._lru) or ((target_l, eid) in c._host_lru)
+            return (
+                ((target_l, eid) in c._lru)
+                or ((target_l, eid) in c._host_lru)
+                or self._in_l3(target_l, eid)
+            )
 
         plan = self.post_prefill_warmup_scale.observe_and_plan_next(
             li,
@@ -2425,7 +2720,13 @@ class MirrorIsolatedMoEOverlayV4:
                 "decode_norm_syncs_avoided": self.decode_norm_syncs_avoided,
                 "decode_d2h_coalesced": self.decode_d2h_coalesced,
                 "post_prefill_bg_adoptions": self.post_prefill_bg_adoptions,
+                "l3_enabled": self.l3_cache is not None,
+                "l3_spills": self.l3_cache.spills if self.l3_cache is not None else 0,
+                "l3_hits": self.l3_cache.hits if self.l3_cache is not None else 0,
+                "l3_evictions": self.l3_cache.evictions if self.l3_cache is not None else 0,
+                "l3_mib_used": self.l3_cache.stats()["mib_used"] if self.l3_cache is not None else 0.0,
             },
+            "l3_disk_cache": self.l3_cache.stats() if self.l3_cache is not None else {"enabled": False},
             "last_trace": dict(self.last_trace),
         }
 
@@ -2441,6 +2742,11 @@ class MirrorIsolatedMoEOverlayV4:
         if self._io_pool is not None:
             self._io_pool.shutdown(wait=True, cancel_futures=True)
             self._io_pool = None
+        if self.l3_cache is not None:
+            if getattr(self.cache, "_host_eviction_sink", None) == self.l3_cache.spill_async:
+                self.cache._host_eviction_sink = None
+            self.l3_cache.close()
+            self.l3_cache = None
         self._shed_scars.clear()
         self._shed_scar_bytes = 0
         self.load_dispatcher.close()

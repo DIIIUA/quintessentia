@@ -54,6 +54,187 @@ from quintessentia_cli.runtime_config import (
 
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_MODEL = 0, 1, 2, 3
 WEIGHT_FORMAT_CHOICES = ("auto", "q1_cubes", "q1", "q2", "q4", "q6", "q8", "bf16")
+FEEDBACK_MODE_CHOICES = ("auto", "off", "spiral_sphere", "pure_mirror", "mirror_scales", "v4")
+
+
+def _model_weight_bytes(folder: Path) -> int:
+    from .model_source import runtime_model_dir
+
+    target = runtime_model_dir(folder)
+    return sum(
+        f.stat().st_size
+        for f in target.iterdir()
+        if f.suffix in (".gguf", ".safetensors", ".bin") and f.is_file()
+    )
+
+
+def resolve_auto_v4_plan(
+    *,
+    model_dir: Path | None,
+    weight_format: str = "auto",
+    feedback_mode: str = "auto",
+    q1_planes: int | None = None,
+    device: str = "auto",
+    cuda_available: bool | None = None,
+    free_vram_bytes: int | None = None,
+    profile: dict | None = None,
+    weight_bytes: int | None = None,
+) -> dict:
+    """Resolve runtime weight format and V4 isolated mirror-scales activation for CLI/doctor.
+
+    Rules:
+      - Explicit `--feedback-mode off`: never forces V4 or `q1_cubes`.
+      - Explicit `--feedback-mode v4|mirror_scales|pure_mirror|spiral_sphere`: promotes
+        `weight_format=auto` -> `q1_cubes`, enables `q1_imprint_puzzle=True`, and picks
+        `q1_planes=5`, `cube_root_bits=8` unless overridden.
+      - `--feedback-mode auto` + `--weight-format q1_cubes`: enables V4 (`mirror_scales`,
+        `M0-M8`) automatically.
+      - `--feedback-mode auto` + `--weight-format auto` on CUDA: inspects model metadata and
+        live free VRAM; when a large MoE (`num_experts >= 8`) exceeds `1.25 * free_vram`,
+        automatically enables full V4 (`q1_cubes` + `mirror_scales` + `q1_imprint_puzzle=True`
+        + `q1_planes=5` + `cube_root_bits=8`). Smaller / dense models keep standard `auto`.
+    """
+    from src.stanok_contour import normalize_feedback_mode
+
+    wf = str(weight_format or "auto").strip().lower()
+    fb_raw = str(feedback_mode or "auto").strip().lower()
+
+    if fb_raw == "off":
+        return {
+            "weight_format": wf,
+            "feedback_mode": "off",
+            "q1_imprint_puzzle": False,
+            "q1_planes": q1_planes,
+            "cube_root_bits": 16,
+            "auto_v4_selected": False,
+            "reason": "explicit_off",
+        }
+
+    if fb_raw != "auto":
+        fb_norm = normalize_feedback_mode(fb_raw)
+        if wf == "auto":
+            wf = "q1_cubes"
+        eff_planes = 5 if (q1_planes is None and wf == "q1_cubes") else q1_planes
+        eff_root = 16 if (eff_planes is not None and int(eff_planes) > 8) else 8
+        return {
+            "weight_format": wf,
+            "feedback_mode": fb_norm,
+            "q1_imprint_puzzle": (wf == "q1_cubes"),
+            "q1_planes": eff_planes,
+            "cube_root_bits": eff_root if wf == "q1_cubes" else 16,
+            "auto_v4_selected": (fb_norm == "mirror_scales"),
+            "reason": f"explicit_{fb_norm}",
+        }
+
+    # feedback_mode == "auto"
+    if wf == "q1_cubes":
+        eff_planes = 5 if q1_planes is None else int(q1_planes)
+        eff_root = 16 if eff_planes > 8 else 8
+        num_exp = int((profile or {}).get("num_experts") or 0)
+        if profile is None and model_dir is not None and model_dir.exists():
+            try:
+                from .model_source import runtime_profile
+                num_exp = int((runtime_profile(model_dir) or {}).get("num_experts") or 0)
+            except Exception:
+                num_exp = 0
+        return {
+            "weight_format": "q1_cubes",
+            "feedback_mode": "mirror_scales",
+            "q1_imprint_puzzle": (num_exp >= 2 or model_dir is None),
+            "q1_planes": eff_planes,
+            "cube_root_bits": eff_root,
+            "auto_v4_selected": True,
+            "reason": "auto_q1_cubes_v4",
+        }
+
+    if wf != "auto" or device == "cpu":
+        return {
+            "weight_format": wf,
+            "feedback_mode": "off",
+            "q1_imprint_puzzle": False,
+            "q1_planes": q1_planes,
+            "cube_root_bits": 16,
+            "auto_v4_selected": False,
+            "reason": "explicit_non_q1_or_cpu",
+        }
+
+    # Check if CUDA + large MoE exceeding 1.25x free VRAM -> auto-select full V4 (M0-M8)
+    if cuda_available is None:
+        try:
+            import torch
+            cuda_available = bool(torch.cuda.is_available())
+        except Exception:
+            cuda_available = False
+    if not cuda_available or model_dir is None or not Path(model_dir).exists():
+        return {
+            "weight_format": wf,
+            "feedback_mode": "off",
+            "q1_imprint_puzzle": False,
+            "q1_planes": q1_planes,
+            "cube_root_bits": 16,
+            "auto_v4_selected": False,
+            "reason": "no_cuda_or_model",
+        }
+
+    prof = profile
+    if prof is None:
+        try:
+            from .model_source import runtime_profile
+            prof = runtime_profile(model_dir)
+        except Exception:
+            prof = {}
+    num_experts = int((prof or {}).get("num_experts") or 0)
+    if num_experts < 8:
+        return {
+            "weight_format": wf,
+            "feedback_mode": "off",
+            "q1_imprint_puzzle": False,
+            "q1_planes": q1_planes,
+            "cube_root_bits": 16,
+            "auto_v4_selected": False,
+            "reason": "dense_or_small_moe",
+        }
+
+    wb = weight_bytes
+    if wb is None:
+        try:
+            wb = _model_weight_bytes(Path(model_dir))
+        except Exception:
+            wb = 0
+
+    free_b = free_vram_bytes
+    if free_b is None:
+        try:
+            from .gpu_memory import measure_gpu_memory
+            free_b = int(measure_gpu_memory(0).get("free_bytes") or 0)
+        except Exception:
+            free_b = 0
+
+    if free_b > 0 and wb > int(1.25 * free_b):
+        eff_planes = 5 if q1_planes is None else int(q1_planes)
+        eff_root = 16 if eff_planes > 8 else 8
+        return {
+            "weight_format": "q1_cubes",
+            "feedback_mode": "mirror_scales",
+            "q1_imprint_puzzle": True,
+            "q1_planes": eff_planes,
+            "cube_root_bits": eff_root,
+            "auto_v4_selected": True,
+            "reason": "auto_large_moe_exceeds_vram",
+            "num_experts": num_experts,
+            "weight_gib": round(wb / 2**30, 2),
+            "free_vram_gib": round(free_b / 2**30, 2),
+        }
+
+    return {
+        "weight_format": wf,
+        "feedback_mode": "off",
+        "q1_imprint_puzzle": False,
+        "q1_planes": q1_planes,
+        "cube_root_bits": 16,
+        "auto_v4_selected": False,
+        "reason": "fits_vram_standard_auto",
+    }
 
 
 def _add_engine_args(p: argparse.ArgumentParser) -> None:
@@ -112,9 +293,9 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
                    help="Fraction of delta-cubes selected per dynamic slice S_t when --puzzle-overlay is enabled (0.0..1.0, default: 0.35)")
     p.add_argument(
         "--feedback-mode",
-        choices=("off", "spiral_sphere", "pure_mirror", "mirror_scales", "v4"),
-        default="off",
-        help="Q1 mirror feedback mode: off (default), spiral_sphere (V2), pure_mirror (V3), or mirror_scales/v4 (V4 isolated pure-math mirror scales)",
+        choices=FEEDBACK_MODE_CHOICES,
+        default="auto",
+        help="Q1 mirror feedback mode: auto (auto-selects V4 M0-M8 on large MoE exceeding VRAM), off, spiral_sphere (V2), pure_mirror (V3), or mirror_scales/v4 (V4 isolated pure-math mirror scales)",
     )
     p.add_argument("--max-drafts", type=int, default=2, help="Max speculative draft depth (1..3, default: 2)")
     p.add_argument(
@@ -127,12 +308,51 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
 def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
     from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     model = args.model
+    root = find_quintessentia_root(args.quintessentia_root)
     if getattr(args, "download_dir", None):
         if not model:
             raise ModelNotFoundError("--download-dir requires a Hugging Face model reference")
         from .model_hub import download_model
-        model, _, _ = download_model(model, find_quintessentia_root(args.quintessentia_root), directory=args.download_dir)
+        model, _, _ = download_model(model, root, directory=args.download_dir)
     explicit_repo = bool(model) and not Path(model).exists()
+    wf_arg = str(getattr(args, "weight_format", "auto") or "auto").strip().lower()
+    fb_arg = str(getattr(args, "feedback_mode", "auto") or "auto").strip().lower()
+    dev_arg = str(getattr(args, "device", "auto") or "auto").strip().lower()
+    is_local_ref = (
+        (model is None)
+        or Path(model).exists()
+        or (isinstance(model, str) and ("/" not in model) and ("\\" not in model))
+    )
+    needs_local_probe = (
+        is_local_ref
+        and (dev_arg != "cpu")
+        and (fb_arg != "off")
+        and (wf_arg in ("auto", "q1_cubes"))
+    )
+    resolved_dir: Path | None = None
+    if needs_local_probe:
+        try:
+            resolved_dir = resolve_model_dir(model, root, allow_download=False)
+        except (ModelNotFoundError, UnsupportedModelError, OSError, ValueError):
+            resolved_dir = None
+
+    v4_plan = resolve_auto_v4_plan(
+        model_dir=resolved_dir,
+        weight_format=wf_arg,
+        feedback_mode=fb_arg,
+        q1_planes=getattr(args, "q1_planes", None),
+        device=dev_arg,
+    )
+    if v4_plan.get("auto_v4_selected") and v4_plan.get("reason") == "auto_large_moe_exceeds_vram":
+        print(
+            f"[Quintessentia Auto-V4] Large MoE ({v4_plan.get('num_experts')} experts, "
+            f"{v4_plan.get('weight_gib')} GiB > 1.25x {v4_plan.get('free_vram_gib')} GiB free VRAM) "
+            f"-> weight_format={v4_plan['weight_format']}, feedback_mode={v4_plan['feedback_mode']} (M0-M8), "
+            f"q1_planes={v4_plan['q1_planes']}, cube_root_bits={v4_plan['cube_root_bits']}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     return QuintessentiaUnifiedEngine(
         model_dir=model,
         quintessentia_root=args.quintessentia_root,
@@ -143,7 +363,7 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         max_context_tokens=args.max_context,
         prefill_chunk_tokens=args.prefill_chunk,
         allow_download=explicit_repo,
-        weight_format=args.weight_format,
+        weight_format=v4_plan["weight_format"],
         prefill_wavefront=getattr(args, "prefill_wavefront", False),
         progressive_start=getattr(args, "progressive_start", getattr(args, "cpu_first", True)),
         device=getattr(args, "device", "auto"),
@@ -153,12 +373,14 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         prune_regions=getattr(args, "region_pruning", True),
         thought_anchor=getattr(args, "thought_anchor", False),
         max_slot_mib=getattr(args, "max_slot_mib", None),
-        q1_planes=getattr(args, "q1_planes", 4),
+        q1_planes=v4_plan["q1_planes"],
+        cube_root_bits=v4_plan["cube_root_bits"],
         cube_blueprint=getattr(args, "cube_blueprint", None),
         q1_early_stop=getattr(args, "q1_early_stop", True),
         puzzle_overlay=getattr(args, "puzzle_overlay", False),
         puzzle_slice_ratio=getattr(args, "puzzle_slice_ratio", 0.35),
-        q1_graphify_feedback=getattr(args, "feedback_mode", "off"),
+        q1_imprint_puzzle=bool(v4_plan["q1_imprint_puzzle"]),
+        q1_graphify_feedback=v4_plan["feedback_mode"],
     )
 
 
@@ -210,8 +432,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             try:
                 max_slot_mib = getattr(args, "max_slot_mib", None)
                 extra_plan = {"max_slot_bytes": int(float(max_slot_mib) * 1024**2)} if max_slot_mib is not None else {}
-                wf_doc = getattr(args, "weight_format", "auto")
-                q1_p_doc = getattr(args, "q1_planes", None) or (16 if wf_doc == "q1_cubes" else 4)
+                v4_doc = resolve_auto_v4_plan(
+                    model_dir=model_dir,
+                    weight_format=getattr(args, "weight_format", "auto"),
+                    feedback_mode=getattr(args, "feedback_mode", "auto"),
+                    q1_planes=getattr(args, "q1_planes", None),
+                    device=getattr(args, "device", "auto"),
+                    cuda_available=cuda_ok and not cpu_execution,
+                    free_vram_bytes=free_b,
+                    profile=profile,
+                )
+                report["auto_v4_plan"] = v4_doc
+                wf_doc = v4_doc["weight_format"]
+                q1_p_doc = v4_doc["q1_planes"] or (16 if wf_doc == "q1_cubes" else 4)
                 if wf_doc in ("q1", "q1_cubes") or q1_p_doc != 4:
                     extra_plan["q1_planes"] = q1_p_doc
                 profile, plan, _has_mtp = plan_for_checkpoint(
@@ -246,6 +479,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         why = "; ".join(profile.get("why_not_fast") or [])
         fast_line = "on" if profile.get("fast_qwen") else f"off ({why})" if why else "off"
         print(f"  Backend            : {profile.get('backend')} / {profile.get('weight_format')} / fast {fast_line}")
+    v4_doc = report.get("auto_v4_plan")
+    if v4_doc and v4_doc.get("auto_v4_selected"):
+        print(
+            f"  Mirror Scales V4   : ON ({v4_doc['feedback_mode']} M0-M8, "
+            f"q1_planes={v4_doc['q1_planes']}, root_bits={v4_doc['cube_root_bits']}, "
+            f"reason={v4_doc['reason']})"
+        )
     if "mtp_weights_present" in report:
         mtp_on = bool(profile.get("mtp_enabled"))
         present = "present" if report["mtp_weights_present"] else "absent"
@@ -300,7 +540,7 @@ def cmd_models(args):
         for row in rows:
             checked = f" | metadata {'OK' if row['metadata_supported'] else 'needs adapter'}" if "metadata_supported" in row else ""
             print(f"{row['index']:>3}  {row['name']}  [{row.get('format','?')}, {row.get('weight_bytes',0)/2**30:.2f} GiB]{checked}")
-        print('Select by number, folder name or full path: quintessentia ask --model 1 "Hi"')
+        print('Select by number, folder name or full path: quint ask --model 1 "Hi"')
         print('Available files and metadata checks do not certify runtime support; see MODEL_SUPPORT.md.')
     return EXIT_OK
 
@@ -585,7 +825,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--device", choices=("auto", "cpu"), default="auto")
     p_doc.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
     p_doc.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto")
-    p_doc.add_argument("--q1-planes", type=int, choices=tuple(range(1, 9)), default=4)
+    p_doc.add_argument("--feedback-mode", choices=FEEDBACK_MODE_CHOICES, default="auto")
+    p_doc.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None)
     p_doc.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True)
     p_doc.add_argument("--max-slot-mib", type=float, default=None)
     p_doc.add_argument("--json-out", type=str, default=None)

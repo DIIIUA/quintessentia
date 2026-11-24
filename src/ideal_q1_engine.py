@@ -63,7 +63,7 @@ def fwht_block(x: torch.Tensor, group_size: int) -> torch.Tensor:
     if k % group_size != 0:
         raise ValueError(f"Last dimension {k} must be divisible by group_size={group_size}")
     # Fast CUDA cuBLAS GEMM against cached [GS, GS] Hadamard matrix (1 kernel vs 24 butterfly passes)
-    if x.is_cuda and group_size <= 128 and x.numel() >= 4096:
+    if x.is_cuda and group_size <= 128 and x.numel() >= group_size:
         orig_dtype = x.dtype
         y = x if orig_dtype == torch.float32 else x.to(torch.float32)
         h_mat = _fwht_orth_matrix(group_size, x.device, torch.float32)
@@ -82,11 +82,14 @@ def sinkhorn_equilibrate(
     """Dual L2 Sinkhorn equilibration returning (row_scale bf16, col_scale bf16, w_eq fp32).
 
     Divides explicitly by BF16-rounded scales so `row_scale[:, None] * w_eq * col_scale[None, :] == w`
-    holds cleanly at BF16 precision. Uses FP32 on CUDA (consumer GPUs have 1/64 FP64 throughput while
-    output scales are BF16) and FP64 on CPU.
+    holds cleanly at BF16 precision. Uses fused allocation-free NVRTC CUDA kernels on BF16 CUDA
+    weights (with FP32 PyTorch fallback on non-BF16 CUDA and FP64 on CPU).
     """
     if w.ndim != 2:
         raise ValueError(f"Expected 2D matrix, got {tuple(w.shape)}")
+    if col_scale_fixed is None and w.is_cuda and w.dtype == torch.bfloat16 and w.shape[0] >= 32 and w.shape[1] >= 32:
+        from src.pure_mirror_agents_nvrtc import launch_pure_mirror_sinkhorn_l2
+        return launch_pure_mirror_sinkhorn_l2(w, iters=iters)
     work_dtype = torch.float32 if w.is_cuda else torch.float64
     w_d = w if w.dtype == work_dtype else w.to(work_dtype)
     n, k = w_d.shape

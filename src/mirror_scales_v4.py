@@ -66,6 +66,7 @@ import torch.nn.functional as F
 
 from src.pure_mirror_agents_nvrtc import (
     launch_pure_mirror_diff_q1_gemv,
+    launch_pure_mirror_diff_q1_moe_batch,
     launch_pure_mirror_line_step,
 )
 
@@ -212,10 +213,16 @@ class MirrorLoadDispatcher:
             from quintessentia_cli.gpu_memory import PhysicalVRAMMonitor
             self._monitor = PhysicalVRAMMonitor(self.device)
 
-        # Short hardware sensor cache (0.20s in calm headroom zone) avoids 40 NVML + memory_stats calls/token
+        # Short hardware sensor cache avoids 40 NVML + memory_stats calls/token:
+        # - NVML utilization (`gpu_util`, `mem_util`) is ALWAYS cached for 0.25s (driver updates every ~50ms).
+        # - VRAM free/total is cached 0.20s in calm headroom zone and 0.03s near reserve (fast mem_get_info only).
         self._hw_cache: Optional[Tuple[int, int, Optional[float], Optional[float], int, str]] = None
         self._hw_cache_ts: float = 0.0
         self._hw_poll_interval_s: float = 0.20
+        self._hw_tight_poll_interval_s: float = 0.03
+        self._util_cache: Tuple[Optional[float], Optional[float]] = (None, None)
+        self._util_cache_ts: float = 0.0
+        self._util_poll_interval_s: float = 0.25
         self.safety_reserve_bytes: int = 0
 
         if safety_reserve_bytes is not None:
@@ -271,16 +278,19 @@ class MirrorLoadDispatcher:
         if self.device.type != "cuda" or not torch.cuda.is_available():
             return 0, 0, None, None, 0, "cpu"
         now = time.perf_counter()
-        if (
-            not force
-            and self._hw_cache is not None
-            and (now - self._hw_cache_ts) < self._hw_poll_interval_s
-            and self._hw_cache[0] >= int(1.5 * self.safety_reserve_bytes)
-        ):
-            return self._hw_cache
+        if not force and self._hw_cache is not None:
+            age = now - self._hw_cache_ts
+            is_calm = self._hw_cache[0] >= int(1.5 * self.safety_reserve_bytes)
+            if (is_calm and age < self._hw_poll_interval_s) or (not is_calm and age < self._hw_tight_poll_interval_s):
+                return self._hw_cache
         if self._monitor is not None:
             free_b, total_b, src = self._monitor.query()
-            gpu_u, mem_u, _usrc = self._monitor.query_utilization()
+            if force or (now - self._util_cache_ts) >= self._util_poll_interval_s:
+                gpu_u, mem_u, _usrc = self._monitor.query_utilization()
+                self._util_cache = (gpu_u, mem_u)
+                self._util_cache_ts = now
+            else:
+                gpu_u, mem_u = self._util_cache
         else:
             fb, tb = torch.cuda.mem_get_info(self.device)
             free_b, total_b, src = int(fb), int(tb), "cuda"
@@ -1017,6 +1027,7 @@ class MirrorPostPrefillRegionWarmupScale:
         self._prefill_sets: Dict[int, frozenset[int]] = {}
         self._scar_weights: Dict[int, Dict[int, float]] = defaultdict(dict)
         self._scar_hits: Dict[int, Dict[int, int]] = defaultdict(dict)
+        self._recent_decode: Dict[int, Dict[int, float]] = defaultdict(dict)
 
         self._prev_cov: List[float] = [1.0] * self.num_layers
         self._prev_scar: List[float] = [0.0] * self.num_layers
@@ -1064,6 +1075,7 @@ class MirrorPostPrefillRegionWarmupScale:
             self.prefill_layers_mapped += 1
         self._scar_weights[li].clear()
         self._scar_hits[li].clear()
+        self._recent_decode[li].clear()
         if 0 <= li < self.num_layers:
             self._prev_cov[li] = 1.0
             self._prev_scar[li] = 0.0
@@ -1082,9 +1094,15 @@ class MirrorPostPrefillRegionWarmupScale:
 
         cov_w = 0.0
         scar_eids: List[Tuple[int, float]] = []
+        rec_map = self._recent_decode[li]
+        for rk in list(rec_map.keys()):
+            rec_map[rk] *= 0.72
+            if rec_map[rk] < 1e-3:
+                del rec_map[rk]
         for eid, rw in zip(actual_eids, actual_weights):
             e_int = int(eid)
             w_val = max(0.0, float(rw))
+            rec_map[e_int] = rec_map.get(e_int, 0.0) + w_val
             if e_int in prefill_set:
                 cov_w += w_val
             else:
@@ -1176,6 +1194,53 @@ class MirrorPostPrefillRegionWarmupScale:
             prefill_coverage=round(cur_cov, 4),
             scar_fraction=round(cur_scar, 4),
         )
+
+    def plan_wide_layer_candidates(
+        self,
+        target_layer: int,
+        is_physically_resident_fn: Callable[[int, int], bool],
+        *,
+        width: int = 8,
+    ) -> List[int]:
+        """Select a wide cold corridor for Linear CPU->GPU Raw Byte Injection on `target_layer`.
+
+        Priority: live recent decode trajectory -> SPLIT scars -> immutable prefill map.
+        CPU never computes or dequantizes these experts; it only streams raw bytes ahead of GPU.
+        """
+        tl = int(target_layer)
+        if tl < 0 or tl >= self.num_layers:
+            return []
+        out: List[int] = []
+        seen: set[int] = set()
+        lim = max(1, int(width))
+
+        def _try_add(eid: int) -> bool:
+            if eid in seen or is_physically_resident_fn(tl, eid):
+                return False
+            seen.add(eid)
+            out.append(eid)
+            return len(out) >= lim
+
+        rec = self._recent_decode.get(tl)
+        if rec:
+            for e_int, _w in sorted(rec.items(), key=lambda kv: (-kv[1], kv[0])):
+                if _try_add(int(e_int)):
+                    return out
+
+        sc_t = self._scar_weights.get(tl)
+        sh_t = self._scar_hits.get(tl)
+        if sc_t:
+            for e_int, _w in sorted(sc_t.items(), key=lambda kv: (-sh_t.get(kv[0], 0), -kv[1], kv[0])):
+                if _try_add(int(e_int)):
+                    return out
+
+        ranked = self._prefill_ranked.get(tl)
+        if ranked:
+            for e_int, _prio, _is_tail in ranked:
+                if _try_add(int(e_int)):
+                    return out
+
+        return out
 
     def record_warmup_outcome(self, layer_idx: int, warmed_eids: Sequence[int], actual_eids: Sequence[int]) -> None:
         if not warmed_eids:
@@ -1753,25 +1818,71 @@ class MirrorIsolatedMoEOverlayV4:
             max_pool_bytes=512 * 1024**2,
             max_warm_regions=4,
         )
-        # M4: Isolated Post-Prefill Known-Region Warmup Scale
+        # M4: Isolated Post-Prefill Known-Region Warmup Scale (expanded map for wide linear CPU->GPU injection)
         self.post_prefill_warmup_scale = MirrorPostPrefillRegionWarmupScale(
             num_layers=int(cache.num_layers),
-            max_region_experts=10,
+            max_region_experts=24,
             initial_width=1,
             max_width=2,
         )
 
-        # Async IO helper (2 dedicated CUDA transfer streams, 1 serialized GGUF/HF reader thread — NO ring!)
+        # Async IO helper (2 dedicated CUDA transfer streams, 2 concurrent IO workers so eager decode & M4 never block each other!)
         self._io_streams = (
             [torch.cuda.Stream(device=self.device), torch.cuda.Stream(device=self.device)]
             if self.device.type == "cuda"
             else [None, None]
         )
         self._stream_cursor: int = 0
-        self._io_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quintessentia-v4-io")
+        self._io_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="quintessentia-v4-io")
         self._warm_future = None
         self._warm_target_layer: Optional[int] = None
         self._warm_eids: Tuple[int, ...] = ()
+
+        # Non-blocking background Q1 crystallization stream (runs concurrently with next layer's NVMe IO; max 1 in flight!)
+        self._crystal_stream = (
+            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        )
+        self._crystal_pool = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="quintessentia-v4-cryst")
+            if self.device.type == "cuda"
+            else None
+        )
+        self._crystal_future = None
+        self._bg_crystals_completed: int = 0
+
+        # Non-blocking async line_spine mirror norm channel (zero per-layer GPU .tolist() stalls!)
+        self._async_norm_cpu = (
+            torch.zeros((3,), dtype=torch.float32, pin_memory=True)
+            if (self.device.type == "cuda" and torch.cuda.is_available())
+            else None
+        )
+        self._async_norm_ev = None
+        self._async_norm_meta: Optional[Tuple[int, float, float]] = None
+        self._layer_norm_trace: Dict[int, Tuple[float, float, float]] = {}
+
+        # Linear CPU->GPU Raw Byte Lookahead Injector (zero CPU compute / zero dequant / zero carve!):
+        # CPU linearly streams wide raw quantized GGUF byte corridors `lookahead=3` layers ahead of GPU;
+        # GPU selectively dequantizes ONLY router-matched experts and discards the rest at 0 FLOPs.
+        self._raw_injector_stream = (
+            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        )
+        self._raw_injector_pool = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="quintessentia-v4-raw-inj")
+            if self.device.type == "cuda"
+            else None
+        )
+        self._raw_lookahead: int = 1
+        self._raw_width: int = 2
+        self._raw_window: Dict[int, Tuple[Dict[int, Tuple[Any, Any, Any]], Any, int]] = {}
+        self._raw_inflight: Dict[int, Tuple[Any, Tuple[int, ...]]] = {}
+        self.raw_injector_layers_pushed: int = 0
+        self.raw_injector_experts_pushed: int = 0
+        self.raw_injector_hits: int = 0
+        self.raw_injector_misses: int = 0
+        self.raw_injector_bytes_pushed: int = 0
+        self._raw_recent_checked: int = 0
+        self._raw_recent_hits: int = 0
+        self._raw_cooldown: int = 0
 
         # M5 Layer-local MoE execution state ONLY
         self.entry_cone_layers: int = 4 if int(cache.num_layers) >= 8 else 0
@@ -2254,6 +2365,269 @@ class MirrorIsolatedMoEOverlayV4:
                 dn_exact[-1].detach().to(device=self.device, dtype=torch.bfloat16).contiguous(),
             )
 
+    def _bg_crystal_worker(
+        self,
+        layer_idx: int,
+        eid: int,
+        gu_raw: torch.Tensor,
+        dn_raw: torch.Tensor,
+        x_p: torch.Tensor,
+        gu_ex: torch.Tensor,
+        act_p: torch.Tensor,
+        dn_ex: torch.Tensor,
+        max_k: int,
+        start_ev: Any,
+    ) -> Optional[Tuple[Tuple[int, int], Dict[str, torch.Tensor], Dict[str, torch.Tensor], int, Dict[str, Any], Dict[str, Any], Tuple[torch.Tensor, ...], Any]]:
+        """Run Q1 crystal carving on dedicated `_crystal_stream` concurrently with main decode."""
+        from src.binary_halving_q1 import carve_q1_mirror_crystal
+
+        c = self.cache
+        key = (int(layer_idx), int(eid))
+        min_k = min(self.rim_k, max_k)
+        cs = self._crystal_stream
+        if cs is None:
+            return None
+        try:
+            with torch.no_grad(), torch.cuda.device(self.device), torch.cuda.stream(cs):
+                if start_ev is not None:
+                    cs.wait_event(start_ev)
+                gu_t, _, gu_scar = carve_q1_mirror_crystal(
+                    gu_raw, x_p, gu_ex, max_k,
+                    min_cubes=min_k, mirror_tol=self.mirror_carve_tol,
+                    root_bits=c.root_bits, group_size=c.group_size,
+                    use_fwht=c.use_fwht, sinkhorn_iters=c.sinkhorn_iters,
+                )
+                dn_t, _, dn_scar = carve_q1_mirror_crystal(
+                    dn_raw, act_p, dn_ex, max_k,
+                    min_cubes=min_k, mirror_tol=self.mirror_carve_tol,
+                    root_bits=c.root_bits, group_size=c.group_size,
+                    use_fwht=c.use_fwht, sinkhorn_iters=c.sinkhorn_iters,
+                )
+                entry_b = _tensor_dict_bytes(gu_t) + _tensor_dict_bytes(dn_t)
+                anc = (
+                    x_p.detach().to(device=self.device, dtype=torch.bfloat16).contiguous(),
+                    gu_ex.detach().to(device=self.device, dtype=torch.bfloat16).contiguous(),
+                    act_p.detach().to(device=self.device, dtype=torch.bfloat16).contiguous(),
+                    dn_ex.detach().to(device=self.device, dtype=torch.bfloat16).contiguous(),
+                )
+                ready_ev = torch.cuda.Event(enable_timing=False)
+                ready_ev.record(cs)
+                return (key, gu_t, dn_t, entry_b, gu_scar, dn_scar, anc, ready_ev)
+        except Exception:
+            return None
+
+    def _drain_bg_crystal(
+        self,
+        protected_layer: int,
+        protected_eids: set[int],
+        *,
+        force: bool = False,
+    ) -> None:
+        """Adopt finished background Q1 crystal on the main thread (ZERO lock contention / ZERO sync if not ready!)."""
+        fut = self._crystal_future
+        if fut is None:
+            return
+        if not force and not fut.done():
+            return
+        self._crystal_future = None
+        try:
+            res = fut.result()
+        except Exception:
+            return
+        if res is None:
+            return
+        key, gu_t, dn_t, entry_b, gu_scar, dn_scar, anc, ready_ev = res
+        if ready_ev is not None and self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).wait_event(ready_ev)
+        c = self.cache
+        if key in c._lru:
+            return
+        kg = int(gu_scar["k_opt"])
+        kd = int(dn_scar["k_opt"])
+        max_k = int(gu_scar.get("max_k", max(kg, kd)))
+        self.crystal_k_opt_sum += kg + kd
+        self.total_crystallized += 1
+        self._bg_crystals_completed += 1
+        if kg < max_k:
+            self.crystal_early_stops += 1
+        if kd < max_k:
+            self.crystal_early_stops += 1
+        c.unique_experts_carved.add(key)
+        c.total_cubes_carved += kg + kd
+        self._crystal_scars[key] = {"k_opt": max(kg, kd), "gu_scar": gu_scar, "dn_scar": dn_scar}
+        stored = self._store_crystal(key, gu_t, dn_t, entry_b, int(protected_layer), protected_eids)
+        if stored and key in c._lru:
+            c._mirror_anchors[key] = anc
+
+    def _submit_bg_crystal(
+        self,
+        layer_idx: int,
+        eid: int,
+        gu_raw: torch.Tensor,
+        dn_raw: torch.Tensor,
+        x_probe: torch.Tensor,
+        gu_exact: torch.Tensor,
+        act_probe: torch.Tensor,
+        dn_exact: torch.Tensor,
+        max_k: int,
+        protected_eids: set[int],
+    ) -> bool:
+        """Non-blocking background crystallization on CUDA; falls back to sync on CPU."""
+        if self._crystal_pool is None or self._crystal_stream is None:
+            self._crystallize_with_probe(
+                layer_idx, eid, gu_raw, dn_raw, x_probe, gu_exact, act_probe, dn_exact, max_k, protected_eids
+            )
+            return True
+        self._drain_bg_crystal(layer_idx, protected_eids, force=False)
+        if self._crystal_future is not None:
+            return False
+        start_ev = torch.cuda.Event(enable_timing=False)
+        start_ev.record(torch.cuda.current_stream(self.device))
+        # Mark raw tensors as consumed on _crystal_stream so caching allocator keeps them intact until carve ends
+        gu_raw.record_stream(self._crystal_stream)
+        dn_raw.record_stream(self._crystal_stream)
+        xp = x_probe[-1].detach().clone()
+        ge = gu_exact[-1].detach().clone()
+        ap = act_probe[-1].detach().clone()
+        de = dn_exact[-1].detach().clone()
+        xp.record_stream(self._crystal_stream)
+        ge.record_stream(self._crystal_stream)
+        ap.record_stream(self._crystal_stream)
+        de.record_stream(self._crystal_stream)
+        self._crystal_future = self._crystal_pool.submit(
+            self._bg_crystal_worker,
+            int(layer_idx), int(eid), gu_raw, dn_raw, xp, ge, ap, de, int(max_k), start_ev,
+        )
+        return True
+
+    # ------------------------------------------------------------------ Linear CPU->GPU Raw Byte Injector
+    def _has_raw_injector(self) -> bool:
+        return (
+            self._raw_injector_pool is not None
+            and self._raw_injector_stream is not None
+            and getattr(self.cache, "raw_u8_fetcher", None) is not None
+            and getattr(self.cache, "raw_u8_dequantizer", None) is not None
+        )
+
+    def _fetch_raw_u8_async(
+        self,
+        layer_idx: int,
+        eids: List[int],
+    ) -> Tuple[Dict[int, Tuple[Any, Any, Any]], Any, int]:
+        """Worker: streams raw quantized GGUF bytes directly to GPU (0 CPU compute / 0 dequant / 0 Q1 carve!)."""
+        fetcher = self.cache.raw_u8_fetcher
+        st = self._raw_injector_stream
+        with torch.no_grad(), torch.cuda.device(self.device), torch.cuda.stream(st):
+            raw_map, tot_b = fetcher(int(layer_idx), list(eids))
+            ev = torch.cuda.Event(enable_timing=False)
+            ev.record(st)
+        return raw_map, ev, int(tot_b)
+
+    def _harvest_raw_inflight(self, *, wait_layer: Optional[int] = None) -> None:
+        for tl in list(self._raw_inflight.keys()):
+            fut, _eids = self._raw_inflight[tl]
+            if tl == wait_layer or fut.done():
+                self._raw_inflight.pop(tl, None)
+                try:
+                    raw_map, ev, tot_b = fut.result()
+                    if raw_map:
+                        self._raw_window[tl] = (raw_map, ev, tot_b)
+                except Exception:
+                    pass
+
+    def _pump_raw_injector(
+        self,
+        current_layer: int,
+        is_resident_fn: Callable[[int, int], bool],
+    ) -> None:
+        """Linear CPU stream running `lookahead` layers ahead of GPU — feeds wide raw byte corridors into VRAM."""
+        if not self._has_raw_injector():
+            return
+        num_l = int(self.cache.num_layers)
+        keep_layers = {(int(current_layer) + off) % num_l for off in range(self._raw_lookahead + 1)}
+        # Discard untouched stale raw corridors behind GPU at 0 FLOPs
+        for stale_l in list(self._raw_window.keys()):
+            if stale_l not in keep_layers:
+                self._raw_window.pop(stale_l, None)
+
+        self._harvest_raw_inflight(wait_layer=None)
+
+        # Mirror self-regulation: pause speculative SSD reads when cold-tail hit-rate falls below 25%
+        # (prevents NVMe queue saturation on scattered 256-expert tails; re-probes periodically).
+        if self._raw_cooldown > 0:
+            self._raw_cooldown -= 1
+            return
+        if self._raw_recent_checked >= 16:
+            hr = self._raw_recent_hits / max(1, self._raw_recent_checked)
+            self._raw_recent_checked = 0
+            self._raw_recent_hits = 0
+            if hr < 0.25:
+                self._raw_cooldown = num_l  # rest 1 full token before re-probing
+                return
+
+        for off in range(1, self._raw_lookahead + 1):
+            if len(self._raw_window) + len(self._raw_inflight) >= self._raw_lookahead:
+                break
+            tl = (int(current_layer) + off) % num_l
+            if tl in self._raw_window or tl in self._raw_inflight:
+                continue
+            if not self.load_dispatcher.can_admit_bytes(12 * 1024**2, margin_bytes=128 * 1024**2):
+                break
+            wide_eids = self.post_prefill_warmup_scale.plan_wide_layer_candidates(
+                tl, is_resident_fn, width=self._raw_width
+            )
+            if not wide_eids:
+                continue
+            fut = self._raw_injector_pool.submit(self._fetch_raw_u8_async, tl, wide_eids)
+            self._raw_inflight[tl] = (fut, tuple(wide_eids))
+            self.raw_injector_layers_pushed += 1
+            self.raw_injector_experts_pushed += len(wide_eids)
+
+    def _consume_raw_window_for_layer(
+        self,
+        layer_idx: int,
+        want_eids: List[int],
+    ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+        """GPU selectively dequantizes ONLY router-matched experts from pre-injected raw VRAM bytes."""
+        if not want_eids or not self._has_raw_injector():
+            return {}
+        li = int(layer_idx)
+        self._harvest_raw_inflight(wait_layer=li)
+        win = self._raw_window.pop(li, None)
+        if win is None:
+            self.raw_injector_misses += len(want_eids)
+            return {}
+        raw_map, ready_ev, tot_b = win
+        self.raw_injector_bytes_pushed += int(tot_b)
+        hits = [int(e) for e in want_eids if int(e) in raw_map]
+        misses = len(want_eids) - len(hits)
+        self.raw_injector_hits += len(hits)
+        self.raw_injector_misses += misses
+        self._raw_recent_checked += len(raw_map)
+        self._raw_recent_hits += len(hits)
+        if not hits:
+            return {}
+        cur_st = torch.cuda.current_stream(self.device)
+        if ready_ev is not None:
+            cur_st.wait_event(ready_ev)
+        # Keep raw tensors alive on compute stream while GPU selectively dequantizes matched experts
+        for e in hits:
+            g_r, u_r, d_r = raw_map[e]
+            g_r.record_stream(cur_st)
+            u_r.record_stream(cur_st)
+            d_r.record_stream(cur_st)
+        deq = self.cache.raw_u8_dequantizer
+        return deq(li, raw_map, hits, torch.bfloat16)
+
+    def _clear_raw_injector(self) -> None:
+        for tl in list(self._raw_inflight.keys()):
+            fut, _eids = self._raw_inflight.pop(tl)
+            try:
+                fut.result()
+            except Exception:
+                pass
+        self._raw_window.clear()
+
     @torch.no_grad()
     def _run_proj_diff_anchored(
         self,
@@ -2285,7 +2659,7 @@ class MirrorIsolatedMoEOverlayV4:
             self.diff_q1_calls += 1
             if x_anc is not None and y_anc is not None:
                 self.diff_q1_anchored_calls += 1
-            return y_out.to(dtype=x_e.dtype)
+            return y_out if y_out.dtype == x_e.dtype else y_out.to(dtype=x_e.dtype)
         return c._run_proj(x_e, t, p_use)
 
     # ------------------------------------------------------------------ Forward Entry Point
@@ -2358,6 +2732,10 @@ class MirrorIsolatedMoEOverlayV4:
 
         if self._warm_future is not None:
             self._adopt_post_prefill_warm(li, all_eids_in_layer, force=True)
+        if self._crystal_future is not None:
+            self._drain_bg_crystal(li, all_eids_in_layer, force=True)
+        if self._raw_window or self._raw_inflight:
+            self._clear_raw_injector()
 
         load_dec = self._apply_m1_load(li, all_eids_in_layer)
 
@@ -2550,6 +2928,12 @@ class MirrorIsolatedMoEOverlayV4:
             }
             burst_i += 1
 
+        # Prime Linear CPU->GPU Raw Byte Injector right at the end of prefill so L0..L2 are ready for token #1!
+        if li == int(c.num_layers) - 1 and self._has_raw_injector():
+            def _is_res_pf(target_l: int, eid: int) -> bool:
+                return ((target_l, eid) in c._lru) or ((target_l, eid) in c._host_lru) or self._in_l3(target_l, eid)
+            self._pump_raw_injector(li, _is_res_pf)
+
         return line_spine.to(hidden_states.dtype)
 
     @torch.no_grad()
@@ -2571,7 +2955,8 @@ class MirrorIsolatedMoEOverlayV4:
         self.decode_layers_total += 1
         misses_before = int(c.misses)
 
-        # 1. Adopt background M4 post-prefill region directly via M2 (if ready for this layer)
+        # 1. Adopt background M4 post-prefill region & any finished async Q1 crystal (ZERO blocking!)
+        self._drain_bg_crystal(li, all_eids_in_layer, force=False)
         warm_layer, warm_eids = self._adopt_post_prefill_warm(li, all_eids_in_layer, force=False)
         if warm_layer == li and warm_eids:
             self.post_prefill_warmup_scale.record_warmup_outcome(
@@ -2611,17 +2996,24 @@ class MirrorIsolatedMoEOverlayV4:
         last_y_rw: float = 0.0
 
         # 2b. True GPU+NVMe Overlap: launch guaranteed-mandatory cold experts onto async O_DIRECT+DMA
-        #     BEFORE running hot_items so disk IO & H2D run concurrently with GPU Q1 GEMV compute!
+        #     BEFORE running hot_items — skipping any expert already injected into VRAM by the Linear CPU->GPU stream!
         in_entry_cone = li < self.entry_cone_layers
+        pre_injected_eids: set[int] = set()
+        if li in self._raw_window:
+            pre_injected_eids.update(self._raw_window[li][0].keys())
+        if li in self._raw_inflight:
+            pre_injected_eids.update(self._raw_inflight[li][1])
         eager_fut = None
         eager_eids: List[int] = []
-        if cold_queue and hot_items and self._warm_future is None:
+        if cold_queue and hot_items:
             sim_done_e = len(hot_items)
             sim_w_e = sum(rw for _, _, rw in hot_items)
             for e_int, _k_pos, rw in cold_queue:
                 rem_w_e = max(0.0, tok_total_w - sim_w_e)
                 if in_entry_cone or sim_done_e < eff_min or sim_w_e < rem_w_e:
-                    if not (in_entry_cone and ("cone_bf16", li, e_int) in self.region_pool._regions):
+                    if e_int not in pre_injected_eids and not (
+                        in_entry_cone and ("cone_bf16", li, e_int) in self.region_pool._regions
+                    ):
                         eager_eids.append(e_int)
                     sim_done_e += 1
                     sim_w_e += rw
@@ -2633,8 +3025,11 @@ class MirrorIsolatedMoEOverlayV4:
                 )
                 self.decode_eager_overlaps += 1
 
-        # 3. Execute resident hot experts via Kernel #6 Differential-Reversible Q1 GEMV (ZERO per-expert .item() syncs!)
+        # 3. Execute resident hot experts via Kernel #6 / Batched Kernel #6c (ZERO per-expert .item() syncs!)
         max_rw = max((rw for _, _, rw in valid), default=1.0) or 1.0
+        w_f32_row = top_k_weights if top_k_weights.dtype == torch.float32 else top_k_weights.float()
+
+        ready_hot: List[Tuple[int, int, float, Dict[str, torch.Tensor], Dict[str, torch.Tensor], int, Optional[Tuple[Any, ...]]]] = []
         for e_int, k_pos, rw in hot_items:
             pair = self._get_hot_or_host(li, e_int, all_eids_in_layer)
             if pair is None:
@@ -2658,33 +3053,95 @@ class MirrorIsolatedMoEOverlayV4:
                         c._cached_bytes += new_b - old_ent[2]
                         c._lru[key] = (gu_t, dn_t, new_b)
                     self.shed_scars_restored += 1
-
             stored_k = min(int(gu_t["packed_lo"].shape[0]), int(dn_t["packed_lo"].shape[0]))
             p_use = mirror_cube_depth_math(rw / max_rw, rw / tok_total_w, min(self.rim_k, stored_k), stored_k)
             anc = c._mirror_anchors.get(key)
-            x_gu_a, y_gu_a, x_dn_a, y_dn_a = anc if anc is not None else (None, None, None, None)
+            ready_hot.append((e_int, k_pos, rw, gu_t, dn_t, p_use, anc))
 
-            gu = self._run_proj_diff_anchored(key, hidden_states, gu_t, p_use, x_gu_a, y_gu_a)
-            g_part, u_part = gu.chunk(2, dim=-1)
-            act = act_fn(g_part) * u_part
-            y_e = self._run_proj_diff_anchored(key, act, dn_t, p_use, x_dn_a, y_dn_a)
+        batched_ok = False
+        if (
+            len(ready_hot) >= 2
+            and len(ready_hot) <= 16
+            and dev.type == "cuda"
+            and c.use_fwht
+            and int(c.group_size) == 64
+        ):
+            gu_entries = []
+            dn_entries = []
+            kpos_list: List[int] = []
+            for _e_int, k_pos, _rw, gu_t, dn_t, p_use, anc in ready_hot:
+                x_gu_a, y_gu_a, x_dn_a, y_dn_a = anc if anc is not None else (None, None, None, None)
+                gu_entries.append((gu_t, p_use, x_gu_a, y_gu_a))
+                dn_entries.append((dn_t, p_use, x_dn_a, y_dn_a))
+                kpos_list.append(k_pos)
+            gu_all = launch_pure_mirror_diff_q1_moe_batch(
+                hidden_states,
+                gu_entries,
+                shared_x=True,
+                group_size=64,
+                min_planes=1,
+                mirror_tol=self.mirror_diff_tol,
+            )
+            if gu_all is not None:
+                g_all, u_all = gu_all.chunk(2, dim=-1)
+                act_all = act_fn(g_all) * u_all
+                y_all = launch_pure_mirror_diff_q1_moe_batch(
+                    act_all,
+                    dn_entries,
+                    shared_x=False,
+                    group_size=64,
+                    min_planes=1,
+                    mirror_tol=self.mirror_diff_tol,
+                )
+                if y_all is not None:
+                    w_vec = w_f32_row[0, kpos_list]
+                    line_spine.add_((y_all.float() * w_vec.unsqueeze(-1)).sum(dim=0, keepdim=True))
+                    batched_ok = True
+                    h_cnt = len(ready_hot)
+                    self.diff_q1_calls += 2 * h_cnt
+                    for _e_int, _kp, rw, gu_t, dn_t, p_use, anc in ready_hot:
+                        if anc is not None:
+                            if anc[0] is not None and anc[1] is not None:
+                                self.diff_q1_anchored_calls += 1
+                            if anc[2] is not None and anc[3] is not None:
+                                self.diff_q1_anchored_calls += 1
+                        self.decode_norm_syncs_avoided += 1
+                        done_count += 1
+                        w_done += rw
+                        c.routed_slots_executed += 1
+                        c.expert_calls += 1
+                        c.expert_cubes_executed += (
+                            min(p_use, gu_t["packed_lo"].shape[0]) + min(p_use, dn_t["packed_lo"].shape[0])
+                        ) / 2
+                    prev_y_ref, prev_y_rw = y_all[-2:-1], ready_hot[-2][2]
+                    last_y_ref, last_y_rw = y_all[-1:], ready_hot[-1][2]
 
-            w_t = top_k_weights[0:1, k_pos]
-            _, used_cuda = launch_pure_mirror_line_step(line_spine, y_e, tok_t, w_t, out_metrics=line_metrics)
-            if used_cuda:
-                self.line_cuda_launches += 1
+        if not batched_ok:
+            for e_int, k_pos, rw, gu_t, dn_t, p_use, anc in ready_hot:
+                key = (li, e_int)
+                x_gu_a, y_gu_a, x_dn_a, y_dn_a = anc if anc is not None else (None, None, None, None)
 
-            # Defer norm evaluation: keep only last two GPU tensor refs; avoid per-expert CPU-GPU sync!
-            prev_y_ref, prev_y_rw = last_y_ref, last_y_rw
-            last_y_ref, last_y_rw = y_e, rw
-            self.decode_norm_syncs_avoided += 1
-            done_count += 1
-            w_done += rw
-            c.routed_slots_executed += 1
-            c.expert_calls += 1
-            c.expert_cubes_executed += (
-                min(p_use, gu_t["packed_lo"].shape[0]) + min(p_use, dn_t["packed_lo"].shape[0])
-            ) / 2
+                gu = self._run_proj_diff_anchored(key, hidden_states, gu_t, p_use, x_gu_a, y_gu_a)
+                g_part, u_part = gu.chunk(2, dim=-1)
+                act = act_fn(g_part) * u_part
+                y_e = self._run_proj_diff_anchored(key, act, dn_t, p_use, x_dn_a, y_dn_a)
+
+                w_t = w_f32_row[0:1, k_pos]
+                _, used_cuda = launch_pure_mirror_line_step(line_spine, y_e, tok_t, w_t, out_metrics=line_metrics)
+                if used_cuda:
+                    self.line_cuda_launches += 1
+
+                # Defer norm evaluation: keep only last two GPU tensor refs; avoid per-expert CPU-GPU sync!
+                prev_y_ref, prev_y_rw = last_y_ref, last_y_rw
+                last_y_ref, last_y_rw = y_e, rw
+                self.decode_norm_syncs_avoided += 1
+                done_count += 1
+                w_done += rw
+                c.routed_slots_executed += 1
+                c.expert_calls += 1
+                c.expert_cubes_executed += (
+                    min(p_use, gu_t["packed_lo"].shape[0]) + min(p_use, dn_t["packed_lo"].shape[0])
+                ) / 2
 
         # 4. Local M5 Mirror Equality on line_spine for remaining cold experts (strict `and` -> crisp spelling!)
         cold_to_run: List[Tuple[int, int, float, bool]] = []
@@ -2706,18 +3163,48 @@ class MirrorIsolatedMoEOverlayV4:
                     break
 
         if needs_mirror_norms:
-            norm_tensors = [line_spine.norm()]
-            if last_y_ref is not None:
-                norm_tensors.append(last_y_ref.float().norm())
-            if prev_y_ref is not None:
-                norm_tensors.append(prev_y_ref.float().norm())
-            norm_vals = torch.stack(norm_tensors).tolist()
-            self.decode_norm_syncs_performed += 1
-            line_norm = float(norm_vals[0])
-            if last_y_ref is not None:
-                last_delta_norm = float(norm_vals[1]) * last_y_rw
-            if prev_y_ref is not None:
-                prev_delta_norm = float(norm_vals[2 if last_y_ref is not None else 1]) * prev_y_rw
+            if self._async_norm_cpu is not None and dev.type == "cuda":
+                # Non-blocking async mirror-norm harvesting: NEVER stall the GPU stream with `.tolist()`!
+                # First harvest any previously completed async norm copy from an earlier layer/token.
+                if self._async_norm_ev is not None and self._async_norm_meta is not None and self._async_norm_ev.query():
+                    p_li, p_lrw, p_prw = self._async_norm_meta
+                    self._layer_norm_trace[p_li] = (
+                        float(self._async_norm_cpu[0]),
+                        float(self._async_norm_cpu[1]) * p_lrw,
+                        float(self._async_norm_cpu[2]) * p_prw,
+                    )
+                    self._async_norm_ev = None
+                    self._async_norm_meta = None
+                # Queue a fresh non-blocking copy if slot is free
+                if self._async_norm_ev is None:
+                    z0 = line_spine.new_zeros(())
+                    norm_vec = torch.stack([
+                        line_spine.norm(),
+                        last_y_ref.float().norm() if last_y_ref is not None else z0,
+                        prev_y_ref.float().norm() if prev_y_ref is not None else z0,
+                    ])
+                    self._async_norm_cpu.copy_(norm_vec, non_blocking=True)
+                    ev = torch.cuda.Event(enable_timing=False)
+                    ev.record(torch.cuda.current_stream(dev))
+                    self._async_norm_ev = ev
+                    self._async_norm_meta = (li, last_y_rw, prev_y_rw)
+                prev_trace = self._layer_norm_trace.get(li)
+                if prev_trace is not None:
+                    line_norm, last_delta_norm, prev_delta_norm = prev_trace
+                self.decode_norm_syncs_avoided += 1
+            else:
+                norm_tensors = [line_spine.norm()]
+                if last_y_ref is not None:
+                    norm_tensors.append(last_y_ref.float().norm())
+                if prev_y_ref is not None:
+                    norm_tensors.append(prev_y_ref.float().norm())
+                norm_vals = torch.stack(norm_tensors).tolist()
+                self.decode_norm_syncs_performed += 1
+                line_norm = float(norm_vals[0])
+                if last_y_ref is not None:
+                    last_delta_norm = float(norm_vals[1]) * last_y_rw
+                if prev_y_ref is not None:
+                    prev_delta_norm = float(norm_vals[2 if last_y_ref is not None else 1]) * prev_y_rw
         else:
             self.decode_norm_syncs_avoided += 1
         prev_y_ref = None
@@ -2766,7 +3253,7 @@ class MirrorIsolatedMoEOverlayV4:
         # 5. Execute woken cold experts directly through M2 MirrorRegionBreathingPool (NO conveyor!)
         #    Recurring entry-cone experts (`L0..L3`) stay warm in M2 (`HOLD_WARM_REGION -> PIN_REUSE`)!
         if cold_to_run:
-            if self._warm_future is not None:
+            if self._warm_future is not None and self._warm_target_layer == li:
                 self._adopt_post_prefill_warm(li, all_eids_in_layer, force=True)
 
             cone_reused: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
@@ -2799,6 +3286,13 @@ class MirrorIsolatedMoEOverlayV4:
                 reg_keys_to_finish.append(e_reg_key)
                 fetched_cnt += len(eager_eids)
 
+            if need_fetch and self._has_raw_injector():
+                want_raw = [e for e, _, _, _ in need_fetch if e not in raw_map]
+                if want_raw:
+                    pre_deq = self._consume_raw_window_for_layer(li, want_raw)
+                    if pre_deq:
+                        raw_map.update(pre_deq)
+
             if need_fetch:
                 extra_eids = [e for e, _, _, _ in need_fetch if e not in raw_map]
                 if extra_eids:
@@ -2829,7 +3323,7 @@ class MirrorIsolatedMoEOverlayV4:
                 g_part, u_part = gu_out.chunk(2, dim=-1)
                 act = act_fn(g_part) * u_part
                 y_e = F.linear(act, dn_raw)
-                w_t = top_k_weights[0:1, k_pos]
+                w_t = w_f32_row[0:1, k_pos]
                 _, used_cuda = launch_pure_mirror_line_step(line_spine, y_e, tok_t, w_t, out_metrics=line_metrics)
                 if used_cuda:
                     self.line_cuda_launches += 1
@@ -2849,7 +3343,7 @@ class MirrorIsolatedMoEOverlayV4:
                         self.region_pool.admit_region(ckey, (gu_raw, dn_raw), gpu_bytes=eb, recurring_hint=True)
                         self.region_pool.finish_region(ckey, keep_if_reusable=True)
                 elif (not is_unclosed) and (key in self._decode_seen_cold):
-                    self._crystallize_with_probe(
+                    self._submit_bg_crystal(
                         li, e_int, gu_raw, dn_raw, x_e, gu_out, act, y_e, self.mid_k, all_eids_in_layer
                     )
                 else:
@@ -2887,7 +3381,11 @@ class MirrorIsolatedMoEOverlayV4:
             [rw for _, _, rw in valid],
             _is_resident,
         )
-        if plan.eids_to_warm and self._warm_future is None:
+        if self._has_raw_injector():
+            # Linear CPU->GPU Raw Byte Injector replaces legacy narrow M4 Q1-carve warmup:
+            # CPU streams wide raw quantized byte corridors ahead of GPU without computing/carving!
+            self._pump_raw_injector(li, _is_resident)
+        elif plan.eids_to_warm and self._warm_future is None:
             self._warm_target_layer = int(plan.target_layer)
             self._warm_eids = tuple(plan.eids_to_warm)
             self._warm_future = self._io_pool.submit(
@@ -2956,6 +3454,14 @@ class MirrorIsolatedMoEOverlayV4:
                 "decode_norm_syncs_avoided": self.decode_norm_syncs_avoided,
                 "decode_d2h_coalesced": self.decode_d2h_coalesced,
                 "decode_eager_overlaps": self.decode_eager_overlaps,
+                "bg_crystals_completed": self._bg_crystals_completed,
+                "raw_injector_layers_pushed": self.raw_injector_layers_pushed,
+                "raw_injector_experts_pushed": self.raw_injector_experts_pushed,
+                "raw_injector_hits": self.raw_injector_hits,
+                "raw_injector_misses": self.raw_injector_misses,
+                "raw_injector_hit_rate_pct": round(
+                    100.0 * self.raw_injector_hits / max(1, self.raw_injector_hits + self.raw_injector_misses), 1
+                ),
                 "post_prefill_bg_adoptions": self.post_prefill_bg_adoptions,
                 "l3_enabled": self.l3_cache is not None,
                 "l3_spills": self.l3_cache.spills if self.l3_cache is not None else 0,
@@ -2969,6 +3475,18 @@ class MirrorIsolatedMoEOverlayV4:
         }
 
     def close(self) -> None:
+        self._clear_raw_injector()
+        if self._raw_injector_pool is not None:
+            self._raw_injector_pool.shutdown(wait=True, cancel_futures=True)
+            self._raw_injector_pool = None
+        if self._crystal_future is not None:
+            try:
+                self._drain_bg_crystal(-1, set(), force=True)
+            except Exception:
+                self._crystal_future = None
+        if self._crystal_pool is not None:
+            self._crystal_pool.shutdown(wait=True, cancel_futures=True)
+            self._crystal_pool = None
         if self._warm_future is not None:
             try:
                 self._warm_future.result()

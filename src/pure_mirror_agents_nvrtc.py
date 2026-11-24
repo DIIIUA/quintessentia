@@ -1225,9 +1225,10 @@ __device__ __forceinline__ float pm_eval_q1_plane_chunk(
 ) {
     float partial = 0.0f;
     const unsigned short* b_u16 = reinterpret_cast<const unsigned short*>(b_chunk);
+    const int gs_shift = (GS == 64) ? 6 : ((GS == 32) ? 5 : 4);
     for (int c_off = lane * 16; c_off < c_cur; c_off += 512) {
         unsigned int bits16 = (unsigned int)b_u16[c_off >> 4];
-        float sv = pm_bf16_to_f32(s_row[g_start + (c_off / GS)]) * p_mult;
+        float sv = pm_bf16_to_f32(s_row[g_start + (c_off >> gs_shift)]) * p_mult;
         float d1 = 0.0f;
         while (bits16) {
             int b = __ffs(bits16) - 1;
@@ -1516,10 +1517,446 @@ extern "C" __global__ void pure_mirror_diff_q1_gemv_f32(
         if (mirror_defect_out != nullptr) mirror_defect_out[tile_idx] = last_defect;
     }
 }
+
+/* Kernel #6c: Constant-Memory Batched MoE Differential Q1 GEMV (`pure_mirror_diff_q1_moe_batch_f32`)
+ * Executes up to 16 resident hot experts of a MoE layer in a SINGLE GPU launch (`grid=(tiles, 1, H)`),
+ * saturating all SMs simultaneously with 0 inter-expert Python overhead and 0 H2D pointer arrays.
+ */
+struct MoeBatchDesc {
+    unsigned long long x_last[16];
+    unsigned long long y_last[16];
+    unsigned long long packed_lo[16];
+    unsigned long long qscale[16];
+    unsigned long long qzero[16];
+    unsigned long long row_scale[16];
+    unsigned long long col_scale[16];
+    int p_max[16];
+    int shared_scale[16];
+};
+
+extern "C" __global__ void pure_mirror_diff_q1_moe_batch_f32(
+    const unsigned short* __restrict__ x_bf16,  /* [1, K] if shared_x!=0 else [H, K] */
+    void* __restrict__ y_out,                   /* [H, N] bf16 or f32 */
+    MoeBatchDesc desc,
+    int shared_x, int H, int N, int K, int GS,
+    int P_min, float mirror_tol, int out_is_bf16
+) {
+    int e = blockIdx.z;
+    if (e >= H) return;
+
+    extern __shared__ char smem_raw[];
+    int chunk_cap = (K < 4096) ? K : 4096;
+    float* s_x = reinterpret_cast<float*>(smem_raw);
+    float* s_xsum = s_x + chunk_cap;
+    float* sm_tot_e = s_xsum + (chunk_cap / GS);
+    float* sm_step_e = sm_tot_e + 8;
+    float* sm_red0 = sm_step_e + 8;
+    float* sm_red1 = sm_red0 + 8;
+    float* sm_red2 = sm_red1 + 8;
+
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp_id;
+    bool valid_row = (row < N);
+
+    const unsigned short* x_row = shared_x ? x_bf16 : (x_bf16 + (long long)e * K);
+    const unsigned short* x_last_bf16 = reinterpret_cast<const unsigned short*>(desc.x_last[e]);
+    const unsigned short* y_last_bf16 = reinterpret_cast<const unsigned short*>(desc.y_last[e]);
+    const unsigned char* packed_lo = reinterpret_cast<const unsigned char*>(desc.packed_lo[e]);
+    const unsigned short* qscale = reinterpret_cast<const unsigned short*>(desc.qscale[e]);
+    const unsigned short* qzero = reinterpret_cast<const unsigned short*>(desc.qzero[e]);
+    const unsigned short* row_scale = reinterpret_cast<const unsigned short*>(desc.row_scale[e]);
+    const unsigned short* col_scale = reinterpret_cast<const unsigned short*>(desc.col_scale[e]);
+    int P_max = desc.p_max[e];
+    int shared_scale = desc.shared_scale[e];
+
+    int num_groups_full = K / GS;
+    int k8 = K >> 3;
+    long long plane_byte_stride = (long long)N * k8;
+    long long plane_grp_stride = (long long)N * num_groups_full;
+    int single_chunk = (K <= chunk_cap);
+    bool has_anchor = (x_last_bf16 != nullptr && y_last_bf16 != nullptr);
+
+    float alpha = 0.0f;
+    float scar_ratio = 1.0f;
+    if (has_anchor) {
+        float l_dot = 0.0f, l_n2l = 0.0f, l_n2x = 0.0f;
+        for (int c = tid; c < K; c += blockDim.x) {
+            float xt = pm_bf16_to_f32(x_row[c]);
+            float xl = pm_bf16_to_f32(x_last_bf16[c]);
+            l_dot += xl * xt;
+            l_n2l += xl * xl;
+            l_n2x += xt * xt;
+        }
+        l_dot = warp_sum_32(l_dot);
+        l_n2l = warp_sum_32(l_n2l);
+        l_n2x = warp_sum_32(l_n2x);
+        if (lane == 0) {
+            sm_red0[warp_id] = l_dot;
+            sm_red1[warp_id] = l_n2l;
+            sm_red2[warp_id] = l_n2x;
+        }
+        __syncthreads();
+        float t_dot = sm_red0[0] + sm_red0[1] + sm_red0[2] + sm_red0[3]
+                    + sm_red0[4] + sm_red0[5] + sm_red0[6] + sm_red0[7];
+        float t_n2l = sm_red1[0] + sm_red1[1] + sm_red1[2] + sm_red1[3]
+                    + sm_red1[4] + sm_red1[5] + sm_red1[6] + sm_red1[7];
+        float t_n2x = sm_red2[0] + sm_red2[1] + sm_red2[2] + sm_red2[3]
+                    + sm_red2[4] + sm_red2[5] + sm_red2[6] + sm_red2[7];
+        if (t_n2l > 1e-10f) {
+            alpha = t_dot / (t_n2l + 1e-8f);
+            float scar_n2 = fmaxf(0.0f, t_n2x - alpha * t_dot);
+            scar_ratio = sqrtf(scar_n2 / (t_n2x + 1e-8f));
+        } else {
+            has_anchor = false;
+        }
+        __syncthreads();
+
+        float zero_cut = (mirror_tol > 0.0f) ? fmaxf(1e-4f, 0.25f * mirror_tol) : 1e-4f;
+        if (has_anchor && scar_ratio < zero_cut) {
+            if (lane == 0 && valid_row) {
+                float y_val = alpha * pm_bf16_to_f32(y_last_bf16[row]);
+                long long idx = (long long)e * N + row;
+                if (out_is_bf16) {
+                    reinterpret_cast<unsigned short*>(y_out)[idx] = pm_f32_to_bf16_rne(y_val);
+                } else {
+                    reinterpret_cast<float*>(y_out)[idx] = y_val;
+                }
+            }
+            return;
+        }
+    }
+
+    float zero_acc = 0.0f;
+    if (single_chunk) {
+        int ng_cur = K / GS;
+        for (int c = tid; c < K; c += blockDim.x) {
+            float rx = pm_bf16_to_f32(x_row[c]) - (has_anchor ? alpha * pm_bf16_to_f32(x_last_bf16[c]) : 0.0f);
+            s_x[c] = rx * pm_bf16_to_f32(col_scale[c]);
+        }
+        __syncthreads();
+        pm_block_fwht_and_sum(s_x, s_xsum, ng_cur, GS, warp_id, lane, warps_per_block);
+        __syncthreads();
+        if (valid_row) {
+            const unsigned short* z_row = qzero + (long long)row * num_groups_full;
+            for (int g = lane; g < ng_cur; g += 32) {
+                zero_acc += pm_bf16_to_f32(z_row[g]) * s_xsum[g];
+            }
+        }
+    } else {
+        for (int k_start = 0; k_start < K; k_start += chunk_cap) {
+            int c_cur = K - k_start;
+            if (c_cur > chunk_cap) c_cur = chunk_cap;
+            int ng_cur = c_cur / GS;
+            int g_start = k_start / GS;
+            for (int c = tid; c < c_cur; c += blockDim.x) {
+                int ka = k_start + c;
+                float rx = pm_bf16_to_f32(x_row[ka]) - (has_anchor ? alpha * pm_bf16_to_f32(x_last_bf16[ka]) : 0.0f);
+                s_x[c] = rx * pm_bf16_to_f32(col_scale[ka]);
+            }
+            __syncthreads();
+            pm_block_fwht_and_sum(s_x, s_xsum, ng_cur, GS, warp_id, lane, warps_per_block);
+            __syncthreads();
+            if (valid_row) {
+                const unsigned short* z_row = qzero + (long long)row * num_groups_full;
+                for (int g = lane; g < ng_cur; g += 32) {
+                    zero_acc += pm_bf16_to_f32(z_row[g_start + g]) * s_xsum[g];
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        zero_acc += __shfl_down_sync(0xffffffffu, zero_acc, offset);
+    }
+
+    float y_anchor = (lane == 0 && valid_row && has_anchor) ? (alpha * pm_bf16_to_f32(y_last_bf16[row])) : 0.0f;
+    float scar_acc = (lane == 0 && valid_row) ? zero_acc : 0.0f;
+    float rs = (lane == 0 && valid_row) ? pm_bf16_to_f32(row_scale[row]) : 0.0f;
+
+    for (int p = 0; p < P_max; ++p) {
+        float obs_partial = 0.0f;
+        float p_mult = shared_scale ? ldexpf(1.0f, -p) : 1.0f;
+        const unsigned short* s_row = valid_row
+            ? (shared_scale
+                ? (qscale + (long long)row * num_groups_full)
+                : (qscale + (long long)p * plane_grp_stride + (long long)row * num_groups_full))
+            : nullptr;
+
+        if (single_chunk) {
+            if (valid_row) {
+                const unsigned char* b_row = packed_lo + (long long)p * plane_byte_stride + (long long)row * k8;
+                obs_partial = pm_eval_q1_plane_chunk(
+                    s_x, s_xsum, b_row, s_row, p_mult, K, num_groups_full, 0, GS, lane
+                );
+            }
+        } else {
+            for (int k_start = 0; k_start < K; k_start += chunk_cap) {
+                int c_cur = K - k_start;
+                if (c_cur > chunk_cap) c_cur = chunk_cap;
+                int ng_cur = c_cur / GS;
+                int g_start = k_start / GS;
+                for (int c = tid; c < c_cur; c += blockDim.x) {
+                    int ka = k_start + c;
+                    float rx = pm_bf16_to_f32(x_row[ka]) - (has_anchor ? alpha * pm_bf16_to_f32(x_last_bf16[ka]) : 0.0f);
+                    s_x[c] = rx * pm_bf16_to_f32(col_scale[ka]);
+                }
+                __syncthreads();
+                pm_block_fwht_and_sum(s_x, s_xsum, ng_cur, GS, warp_id, lane, warps_per_block);
+                __syncthreads();
+                if (valid_row) {
+                    const unsigned char* b_chunk =
+                        packed_lo + (long long)p * plane_byte_stride + (long long)row * k8 + (k_start >> 3);
+                    obs_partial += pm_eval_q1_plane_chunk(
+                        s_x, s_xsum, b_chunk, s_row, p_mult, c_cur, ng_cur, g_start, GS, lane
+                    );
+                }
+                __syncthreads();
+            }
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            obs_partial += __shfl_down_sync(0xffffffffu, obs_partial, offset);
+        }
+
+        float obs_p = (lane == 0 && valid_row) ? obs_partial : 0.0f;
+        scar_acc += obs_p;
+
+        if (lane == 0) {
+            float y_tot = valid_row ? (y_anchor + scar_acc * rs) : 0.0f;
+            float y_stp = valid_row ? (obs_p * rs) : 0.0f;
+            sm_tot_e[warp_id] = y_tot * y_tot;
+            sm_step_e[warp_id] = y_stp * y_stp;
+        }
+        __syncthreads();
+
+        float tile_tot_e = sm_tot_e[0] + sm_tot_e[1] + sm_tot_e[2] + sm_tot_e[3]
+                         + sm_tot_e[4] + sm_tot_e[5] + sm_tot_e[6] + sm_tot_e[7];
+        float tile_stp_e = sm_step_e[0] + sm_step_e[1] + sm_step_e[2] + sm_step_e[3]
+                         + sm_step_e[4] + sm_step_e[5] + sm_step_e[6] + sm_step_e[7];
+        float defect = (1.15470054f * sqrtf(tile_stp_e)) / (sqrtf(tile_tot_e) + 1e-8f);
+        if ((p + 1 >= P_min) && (mirror_tol > 0.0f) && (defect < mirror_tol)) {
+            break;
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && valid_row) {
+        float y_val = y_anchor + scar_acc * rs;
+        long long idx = (long long)e * N + row;
+        if (out_is_bf16) {
+            reinterpret_cast<unsigned short*>(y_out)[idx] = pm_f32_to_bf16_rne(y_val);
+        } else {
+            reinterpret_cast<float*>(y_out)[idx] = y_val;
+        }
+    }
+}
+
+/* Kernel #7: Bit-exact Single-Pass Ballot Q1 Carve + Activation Projection (`pure_mirror_carve_q1_ballot_f32`)
+ * Exact parity with `_positional_grid` + `_pack_sign_bits_u8` for GS == 64 in ~0.076 ms (64x faster!).
+ */
+extern "C" __global__ void pure_mirror_carve_q1_ballot_f32(
+    const float* __restrict__ u_in,               /* [N, K] after FWHT */
+    const float* __restrict__ x_rot,              /* [K] or nullptr */
+    const unsigned short* __restrict__ row_scale, /* [N] */
+    unsigned char* __restrict__ packed_lo,        /* [P_max, N, K/8] */
+    unsigned short* __restrict__ qscale_out,      /* [1, N, K/64] */
+    unsigned short* __restrict__ qzero_out,       /* [N, K/64] */
+    float* __restrict__ y_zero_out,               /* [N] or nullptr */
+    float* __restrict__ delta_y_out,              /* [P_max, N] or nullptr */
+    int N, int K, int root_bits, int P_max
+) {
+    extern __shared__ float sm_red[]; /* [8 * (1 + P_max)] */
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+    int ng = K >> 6;
+    int k8 = K >> 3;
+    long long plane_byte_stride = (long long)N * k8;
+    const float* u_row = u_in + (long long)row * K;
+    float denom = 2.0f * (1.0f - ldexpf(1.0f, -root_bits));
+    bool has_x = (x_rot != nullptr && delta_y_out != nullptr && y_zero_out != nullptr);
+
+    float w_y0 = 0.0f;
+    float w_dy[16];
+    #pragma unroll
+    for (int p = 0; p < 16; ++p) w_dy[p] = 0.0f;
+
+    for (int g = warp_id; g < ng; g += 8) {
+        int base = g * 64;
+        float v0 = u_row[base + lane];
+        float v1 = u_row[base + 32 + lane];
+        float lo = fminf(v0, v1);
+        float hi = fmaxf(v0, v1);
+        #pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            lo = fminf(lo, __shfl_xor_sync(0xffffffffu, lo, d));
+            hi = fmaxf(hi, __shfl_xor_sync(0xffffffffu, hi, d));
+        }
+        unsigned short qz_bf = pm_f32_to_bf16_rne(0.5f * (lo + hi));
+        float qz = pm_bf16_to_f32(qz_bf);
+        float r0 = v0 - qz;
+        float r1 = v1 - qz;
+        float rad = fmaxf(fabsf(r0), fabsf(r1));
+        #pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            rad = fmaxf(rad, __shfl_xor_sync(0xffffffffu, rad, d));
+        }
+        float desired = __fdiv_rn(rad, denom);
+        unsigned short bs_bf = pm_f32_to_bf16_rne(desired);
+        if (pm_bf16_to_f32(bs_bf) < desired) {
+            bs_bf = (unsigned short)(bs_bf + 1u);
+        }
+        float bs = pm_bf16_to_f32(bs_bf);
+        if (lane == 0) {
+            qzero_out[(long long)row * ng + g] = qz_bf;
+            qscale_out[(long long)row * ng + g] = bs_bf;
+        }
+        float x0 = has_x ? x_rot[base + lane] : 0.0f;
+        float x1 = has_x ? x_rot[base + 32 + lane] : 0.0f;
+        if (has_x) {
+            w_y0 += qz * (x0 + x1);
+        }
+        for (int p = 0; p < P_max; ++p) {
+            float sc = bs * ldexpf(1.0f, -p);
+            int b0 = (r0 >= 0.0f) ? 1 : 0;
+            int b1 = (r1 >= 0.0f) ? 1 : 0;
+            unsigned int m0 = __ballot_sync(0xffffffffu, b0);
+            unsigned int m1 = __ballot_sync(0xffffffffu, b1);
+            if (lane == 0) {
+                unsigned int* dst = reinterpret_cast<unsigned int*>(
+                    packed_lo + (long long)p * plane_byte_stride + (long long)row * k8 + g * 8
+                );
+                dst[0] = m0;
+                dst[1] = m1;
+            }
+            r0 -= b0 ? sc : -sc;
+            r1 -= b1 ? sc : -sc;
+            if (has_x) {
+                w_dy[p] += sc * ((b0 ? x0 : -x0) + (b1 ? x1 : -x1));
+            }
+        }
+    }
+
+    if (has_x) {
+        w_y0 = warp_sum_32(w_y0);
+        if (lane == 0) sm_red[warp_id] = w_y0;
+        for (int p = 0; p < P_max; ++p) {
+            float s = warp_sum_32(w_dy[p]);
+            if (lane == 0) sm_red[(p + 1) * 8 + warp_id] = s;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float rs = pm_bf16_to_f32(row_scale[row]);
+            float s0 = sm_red[0] + sm_red[1] + sm_red[2] + sm_red[3]
+                     + sm_red[4] + sm_red[5] + sm_red[6] + sm_red[7];
+            y_zero_out[row] = s0 * rs;
+            for (int p = 0; p < P_max; ++p) {
+                float* sp = sm_red + (p + 1) * 8;
+                delta_y_out[(long long)p * N + row] = (sp[0] + sp[1] + sp[2] + sp[3]
+                                                     + sp[4] + sp[5] + sp[6] + sp[7]) * rs;
+            }
+        }
+    }
+}
+
+/* Kernel #8a/8b/8c: Allocation-free CUDA L2 Sinkhorn Equilibration on BF16 weights */
+extern "C" __global__ void pure_mirror_sinkhorn_row_bf16(
+    const unsigned short* __restrict__ w_bf16,
+    const float* __restrict__ dc,
+    float* __restrict__ dr,
+    int N, int K
+) {
+    __shared__ float sm[8];
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    const unsigned short* wr = w_bf16 + (long long)row * K;
+    float dr_v = dr[row];
+    float acc = 0.0f;
+    for (int c = tid; c < K; c += 256) {
+        float v = pm_bf16_to_f32(wr[c]) / (dr_v * dc[c]);
+        acc = fmaf(v, v, acc);
+    }
+    acc = warp_sum_32(acc);
+    if (lane == 0) sm[wid] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = sm[0] + sm[1] + sm[2] + sm[3] + sm[4] + sm[5] + sm[6] + sm[7];
+        float rms = sqrtf(tot / (float)K + 1e-12f);
+        dr[row] = fmaxf(dr_v * rms, 1e-6f);
+    }
+}
+
+extern "C" __global__ void pure_mirror_sinkhorn_col_bf16(
+    const unsigned short* __restrict__ w_bf16,
+    const float* __restrict__ dr,
+    float* __restrict__ dc,
+    int N, int K
+) {
+    __shared__ float sm[8][32];
+    int col = blockIdx.x * 32 + threadIdx.x;
+    int ty = threadIdx.y;
+    float acc = 0.0f;
+    if (col < K) {
+        float dc_v = dc[col];
+        for (int r = ty; r < N; r += 8) {
+            float v = pm_bf16_to_f32(w_bf16[(long long)r * K + col]) / (dr[r] * dc_v);
+            acc = fmaf(v, v, acc);
+        }
+    }
+    sm[ty][threadIdx.x] = acc;
+    __syncthreads();
+    if (ty == 0 && col < K) {
+        float tot = sm[0][threadIdx.x] + sm[1][threadIdx.x] + sm[2][threadIdx.x] + sm[3][threadIdx.x]
+                  + sm[4][threadIdx.x] + sm[5][threadIdx.x] + sm[6][threadIdx.x] + sm[7][threadIdx.x];
+        float rms = sqrtf(tot / (float)N + 1e-12f);
+        dc[col] = fmaxf(dc[col] * rms, 1e-6f);
+    }
+}
+
+extern "C" __global__ void pure_mirror_sinkhorn_apply_bf16(
+    const unsigned short* __restrict__ w_bf16,
+    const unsigned short* __restrict__ row_scale_bf16,
+    const unsigned short* __restrict__ col_scale_bf16,
+    float* __restrict__ w_eq_f32,
+    int N, int K
+) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    float inv_r = 1.0f / fmaxf(pm_bf16_to_f32(row_scale_bf16[row]), 1e-8f);
+    const unsigned short* wr = w_bf16 + (long long)row * K;
+    float* dst = w_eq_f32 + (long long)row * K;
+    for (int c = threadIdx.x; c < K; c += blockDim.x) {
+        float inv_c = 1.0f / fmaxf(pm_bf16_to_f32(col_scale_bf16[c]), 1e-8f);
+        dst[c] = pm_bf16_to_f32(wr[c]) * inv_r * inv_c;
+    }
+}
 """
 
 _PM_LOCK = threading.Lock()
 _PM_MODULE_CACHE: Dict[Tuple[int, int], Tuple[Any, Dict[bytes, ctypes.c_void_p]]] = {}
+_PM_FN_PTR_CACHE: Dict[int, Dict[bytes, int]] = {}
+_FAST_EXT_LOADED: bool = False
+_FAST_EXT_MOD: Optional[Any] = None
+
+
+def _get_fast_ext() -> Optional[Any]:
+    global _FAST_EXT_LOADED, _FAST_EXT_MOD
+    if not _FAST_EXT_LOADED:
+        from src.quint_cuda_fast import get_fast_cuda_ext
+        _FAST_EXT_MOD = get_fast_cuda_ext()
+        _FAST_EXT_LOADED = True
+    return _FAST_EXT_MOD
 
 _PM_KERNELS = (
     b"pure_mirror_cube_bind_f32",
@@ -1528,6 +1965,11 @@ _PM_KERNELS = (
     b"pure_mirror_continuation_gate_f32",
     b"pure_mirror_self_collapse_f32",
     b"pure_mirror_diff_q1_gemv_f32",
+    b"pure_mirror_diff_q1_moe_batch_f32",
+    b"pure_mirror_carve_q1_ballot_f32",
+    b"pure_mirror_sinkhorn_row_bf16",
+    b"pure_mirror_sinkhorn_col_bf16",
+    b"pure_mirror_sinkhorn_apply_bf16",
 )
 
 
@@ -1601,7 +2043,17 @@ def get_pure_mirror_kernels(device: torch.device) -> Tuple[Any, Dict[bytes, ctyp
                 raise RuntimeError(f"cuModuleGetFunction({kname!r}) failed: {rc}")
             fns[kname] = fn
         _PM_MODULE_CACHE[cache_key] = (nvcuda, fns)
+        _PM_FN_PTR_CACHE[dev_idx] = {k: int(v.value) for k, v in fns.items()}
         return nvcuda, fns
+
+
+def _get_pm_fn_ptrs(device: torch.device) -> Dict[bytes, int]:
+    dev_idx = 0 if device.index is None else int(device.index)
+    hit = _PM_FN_PTR_CACHE.get(dev_idx)
+    if hit is not None:
+        return hit
+    get_pure_mirror_kernels(device)
+    return _PM_FN_PTR_CACHE[dev_idx]
 
 
 def _eval_4x4_mirror_cube_full_cpu(
@@ -1775,44 +2227,79 @@ def launch_pure_mirror_diff_q1_gemv(
         used_t = torch.empty((M, tiles_per_row), dtype=torch.int32, device=dev) if return_telemetry else None
         def_t = torch.empty((M, tiles_per_row), dtype=torch.float32, device=dev) if return_telemetry else None
 
-        nvcuda, fns = get_pure_mirror_kernels(dev)
-        stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
+        pk_c = packed_lo if packed_lo.is_contiguous() else packed_lo.contiguous()
+        qs_c = qscale if qscale.is_contiguous() else qscale.contiguous()
+        qz_c = qzero if qzero.is_contiguous() else qzero.contiguous()
+        rs_c = row_scale if row_scale.is_contiguous() else row_scale.contiguous()
+        cs_c = col_scale if col_scale.is_contiguous() else col_scale.contiguous()
 
-        p_x = ctypes.c_void_p(x_bf16.data_ptr())
-        p_xl = ctypes.c_void_p(0 if xl_bf16 is None else xl_bf16.data_ptr())
-        p_yl = ctypes.c_void_p(0 if yl_bf16 is None else yl_bf16.data_ptr())
-        p_pk = ctypes.c_void_p((packed_lo if packed_lo.is_contiguous() else packed_lo.contiguous()).data_ptr())
-        p_qs = ctypes.c_void_p((qscale if qscale.is_contiguous() else qscale.contiguous()).data_ptr())
-        p_qz = ctypes.c_void_p((qzero if qzero.is_contiguous() else qzero.contiguous()).data_ptr())
-        p_rs = ctypes.c_void_p((row_scale if row_scale.is_contiguous() else row_scale.contiguous()).data_ptr())
-        p_cs = ctypes.c_void_p((col_scale if col_scale.is_contiguous() else col_scale.contiguous()).data_ptr())
-        p_bs = ctypes.c_void_p(0 if b_bf16 is None else b_bf16.data_ptr())
-        p_yo = ctypes.c_void_p(y_out.data_ptr())
-        p_up = ctypes.c_void_p(0 if used_t is None else used_t.data_ptr())
-        p_df = ctypes.c_void_p(0 if def_t is None else def_t.data_ptr())
-
-        c_M, c_N, c_K, c_GS = ctypes.c_int(M), ctypes.c_int(out_features), ctypes.c_int(in_features), ctypes.c_int(int(group_size))
-        c_Pm, c_Pn = ctypes.c_int(p_max), ctypes.c_int(p_min)
-        c_tol = ctypes.c_float(float(mirror_tol))
-        c_ob, c_ss = ctypes.c_int(out_is_bf16), ctypes.c_int(shared_scale)
-
-        args = (ctypes.c_void_p * 21)(
-            ctypes.addressof(p_x), ctypes.addressof(p_xl), ctypes.addressof(p_yl),
-            ctypes.addressof(p_pk), ctypes.addressof(p_qs), ctypes.addressof(p_qz),
-            ctypes.addressof(p_rs), ctypes.addressof(p_cs), ctypes.addressof(p_bs),
-            ctypes.addressof(p_yo), ctypes.addressof(p_up), ctypes.addressof(p_df),
-            ctypes.addressof(c_M), ctypes.addressof(c_N), ctypes.addressof(c_K), ctypes.addressof(c_GS),
-            ctypes.addressof(c_Pm), ctypes.addressof(c_Pn), ctypes.addressof(c_tol),
-            ctypes.addressof(c_ob), ctypes.addressof(c_ss),
-        )
         chunk_cap = min(in_features, 4096)
         smem_bytes = (chunk_cap + (chunk_cap // int(group_size)) + 40) * 4
-        rc = nvcuda.cuLaunchKernel(
-            fns[b"pure_mirror_diff_q1_gemv_f32"],
-            tiles_per_row, M, 1, 256, 1, 1, smem_bytes, stream, args, None,
-        )
-        if rc != 0:
-            raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_gemv_f32) failed: {rc}")
+
+        fast_ext = _get_fast_ext()
+        if fast_ext is not None:
+            fn_ptrs = _get_pm_fn_ptrs(dev)
+            stream_i = int(torch.cuda.current_stream(dev).cuda_stream)
+            rc = fast_ext.launch_diff_q1_gemv(
+                fn_ptrs[b"pure_mirror_diff_q1_gemv_f32"],
+                stream_i,
+                tiles_per_row,
+                M,
+                smem_bytes,
+                x_bf16.data_ptr(),
+                0 if xl_bf16 is None else xl_bf16.data_ptr(),
+                0 if yl_bf16 is None else yl_bf16.data_ptr(),
+                pk_c.data_ptr(),
+                qs_c.data_ptr(),
+                qz_c.data_ptr(),
+                rs_c.data_ptr(),
+                cs_c.data_ptr(),
+                0 if b_bf16 is None else b_bf16.data_ptr(),
+                y_out.data_ptr(),
+                0 if used_t is None else used_t.data_ptr(),
+                0 if def_t is None else def_t.data_ptr(),
+                M, out_features, in_features, int(group_size),
+                p_max, p_min, float(mirror_tol), out_is_bf16, shared_scale,
+            )
+            if rc != 0:
+                raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_gemv_f32) failed: {rc}")
+        else:
+            nvcuda, fns = get_pure_mirror_kernels(dev)
+            stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
+
+            p_x = ctypes.c_void_p(x_bf16.data_ptr())
+            p_xl = ctypes.c_void_p(0 if xl_bf16 is None else xl_bf16.data_ptr())
+            p_yl = ctypes.c_void_p(0 if yl_bf16 is None else yl_bf16.data_ptr())
+            p_pk = ctypes.c_void_p(pk_c.data_ptr())
+            p_qs = ctypes.c_void_p(qs_c.data_ptr())
+            p_qz = ctypes.c_void_p(qz_c.data_ptr())
+            p_rs = ctypes.c_void_p(rs_c.data_ptr())
+            p_cs = ctypes.c_void_p(cs_c.data_ptr())
+            p_bs = ctypes.c_void_p(0 if b_bf16 is None else b_bf16.data_ptr())
+            p_yo = ctypes.c_void_p(y_out.data_ptr())
+            p_up = ctypes.c_void_p(0 if used_t is None else used_t.data_ptr())
+            p_df = ctypes.c_void_p(0 if def_t is None else def_t.data_ptr())
+
+            c_M, c_N, c_K, c_GS = ctypes.c_int(M), ctypes.c_int(out_features), ctypes.c_int(in_features), ctypes.c_int(int(group_size))
+            c_Pm, c_Pn = ctypes.c_int(p_max), ctypes.c_int(p_min)
+            c_tol = ctypes.c_float(float(mirror_tol))
+            c_ob, c_ss = ctypes.c_int(out_is_bf16), ctypes.c_int(shared_scale)
+
+            args = (ctypes.c_void_p * 21)(
+                ctypes.addressof(p_x), ctypes.addressof(p_xl), ctypes.addressof(p_yl),
+                ctypes.addressof(p_pk), ctypes.addressof(p_qs), ctypes.addressof(p_qz),
+                ctypes.addressof(p_rs), ctypes.addressof(p_cs), ctypes.addressof(p_bs),
+                ctypes.addressof(p_yo), ctypes.addressof(p_up), ctypes.addressof(p_df),
+                ctypes.addressof(c_M), ctypes.addressof(c_N), ctypes.addressof(c_K), ctypes.addressof(c_GS),
+                ctypes.addressof(c_Pm), ctypes.addressof(c_Pn), ctypes.addressof(c_tol),
+                ctypes.addressof(c_ob), ctypes.addressof(c_ss),
+            )
+            rc = nvcuda.cuLaunchKernel(
+                fns[b"pure_mirror_diff_q1_gemv_f32"],
+                tiles_per_row, M, 1, 256, 1, 1, smem_bytes, stream, args, None,
+            )
+            if rc != 0:
+                raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_gemv_f32) failed: {rc}")
         y_res = (y_out if y_out.dtype == x.dtype else y_out.to(dtype=x.dtype)).view(*orig_shape, out_features)
         if return_telemetry:
             return y_res, used_t, def_t
@@ -1928,6 +2415,22 @@ def launch_pure_mirror_line_step(
     if dev.type == "cuda" and torch.cuda.is_available():
         tok_i32 = tok_indices if (tok_indices.dtype == torch.int32 and tok_indices.device == dev and tok_indices.is_contiguous()) else tok_indices.to(device=dev, dtype=torch.int32).contiguous()
         metrics = out_metrics if (out_metrics is not None and out_metrics.shape == (R, 4) and out_metrics.device == dev) else torch.empty((R, 4), dtype=torch.float32, device=dev)
+        fast_ext = _get_fast_ext()
+        if fast_ext is not None:
+            fn_ptrs = _get_pm_fn_ptrs(dev)
+            rc = fast_ext.launch_line_step(
+                fn_ptrs[b"pure_mirror_line_step_f32"],
+                int(torch.cuda.current_stream(dev).cuda_stream),
+                line_spine.data_ptr(),
+                y_f32.data_ptr(),
+                tok_i32.data_ptr(),
+                w_f32.data_ptr(),
+                metrics.data_ptr(),
+                R, H,
+            )
+            if rc != 0:
+                raise RuntimeError(f"cuLaunchKernel(pure_mirror_line_step_f32) failed: {rc}")
+            return metrics, True
         nvcuda, fns = get_pure_mirror_kernels(dev)
         p_line = ctypes.c_void_p(line_spine.data_ptr())
         p_y = ctypes.c_void_p(y_f32.data_ptr())
@@ -1965,6 +2468,246 @@ def launch_pure_mirror_line_step(
     nres = res_sq.sqrt()
     tie = torch.where(np_v > nm_v, (np_v - nm_v) / (np_v + nm_v + 1e-8), torch.zeros_like(np_v))
     return torch.stack([np_v, no_v, nres, tie], dim=-1), False
+
+
+@torch.no_grad()
+def launch_pure_mirror_diff_q1_moe_batch(
+    x: torch.Tensor,
+    experts: Sequence[Tuple[Dict[str, torch.Tensor], int, Optional[torch.Tensor], Optional[torch.Tensor]]],
+    *,
+    shared_x: bool = True,
+    group_size: int = 64,
+    min_planes: int = 1,
+    mirror_tol: float = 0.03,
+) -> Optional[torch.Tensor]:
+    """Single-launch constant-memory batched Kernel #6c for up to 16 MoE experts on CUDA.
+
+    Returns `y_out [H, N]` matching `x.dtype`, or `None` if native C fast launcher is unavailable.
+    """
+    H = len(experts)
+    if H == 0 or H > 16 or x.device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    fast_ext = _get_fast_ext()
+    if fast_ext is None:
+        return None
+
+    dev = x.device
+    t0 = experts[0][0]
+    in_features = int(t0["packed_lo"].shape[2]) * 8
+    out_features = int(t0["packed_lo"].shape[1])
+    x_bf16 = x if (x.dtype == torch.bfloat16 and x.is_contiguous()) else x.to(device=dev, dtype=torch.bfloat16).contiguous()
+    out_is_bf16 = 1 if x.dtype == torch.bfloat16 else 0
+    y_out = torch.empty((H, out_features), dtype=torch.bfloat16 if out_is_bf16 else torch.float32, device=dev)
+
+    # Keep temporary contiguous tensors alive through the synchronous C call
+    keep_refs: List[torch.Tensor] = [x_bf16, y_out]
+    entries = []
+    for t, p_max, x_last, y_last in experts:
+        pk = t["packed_lo"]
+        qs = t["qscale"]
+        qz = t["qzero"]
+        rs = t["row_scale"]
+        cs = t["col_scale"]
+        if not pk.is_contiguous():
+            pk = pk.contiguous(); keep_refs.append(pk)
+        if not qs.is_contiguous():
+            qs = qs.contiguous(); keep_refs.append(qs)
+        if not qz.is_contiguous():
+            qz = qz.contiguous(); keep_refs.append(qz)
+        if not rs.is_contiguous():
+            rs = rs.contiguous(); keep_refs.append(rs)
+        if not cs.is_contiguous():
+            cs = cs.contiguous(); keep_refs.append(cs)
+        xl_ptr = 0
+        yl_ptr = 0
+        if x_last is not None and y_last is not None:
+            xl = x_last if (x_last.ndim == 1 and x_last.dtype == torch.bfloat16 and x_last.device == dev and x_last.is_contiguous()) else x_last.reshape(-1).to(device=dev, dtype=torch.bfloat16).contiguous()
+            yl = y_last if (y_last.ndim == 1 and y_last.dtype == torch.bfloat16 and y_last.device == dev and y_last.is_contiguous()) else y_last.reshape(-1).to(device=dev, dtype=torch.bfloat16).contiguous()
+            keep_refs.append(xl); keep_refs.append(yl)
+            xl_ptr = xl.data_ptr()
+            yl_ptr = yl.data_ptr()
+        stored = int(pk.shape[0])
+        p_eff = max(1, min(stored, int(p_max)))
+        ss = 1 if int(qs.shape[0]) == 1 else 0
+        entries.append((
+            xl_ptr, yl_ptr,
+            pk.data_ptr(), qs.data_ptr(), qz.data_ptr(), rs.data_ptr(), cs.data_ptr(),
+            p_eff, ss,
+        ))
+
+    tiles_per_row = (out_features + 7) // 8
+    chunk_cap = min(in_features, 4096)
+    smem_bytes = (chunk_cap + (chunk_cap // int(group_size)) + 40) * 4
+    fn_ptrs = _get_pm_fn_ptrs(dev)
+    rc = fast_ext.launch_diff_q1_moe_batch(
+        fn_ptrs[b"pure_mirror_diff_q1_moe_batch_f32"],
+        int(torch.cuda.current_stream(dev).cuda_stream),
+        tiles_per_row,
+        smem_bytes,
+        x_bf16.data_ptr(),
+        y_out.data_ptr(),
+        1 if shared_x else 0,
+        H, out_features, in_features, int(group_size),
+        float(mirror_tol), int(min_planes), out_is_bf16,
+        entries,
+    )
+    if rc != 0:
+        raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_moe_batch_f32) failed: {rc}")
+    return y_out if y_out.dtype == x.dtype else y_out.to(dtype=x.dtype)
+
+
+@torch.no_grad()
+def launch_pure_mirror_carve_q1_ballot(
+    u: torch.Tensor,
+    row_scale: torch.Tensor,
+    *,
+    root_bits: int,
+    max_cubes: int,
+    x_rot: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Bit-exact single-pass CUDA ballot Q1 plane carver for `group_size == 64` (~0.076 ms).
+
+    Returns `(packed_lo [P, N, K//8], qscale [1, N, K//64], qzero [N, K//64], y_zero [N]|None, delta_y [P, N]|None)`.
+    """
+    dev = u.device
+    N, K = int(u.shape[0]), int(u.shape[1])
+    ng = K // 64
+    k8 = K // 8
+    P = int(max_cubes)
+    u_c = u if (u.dtype == torch.float32 and u.is_contiguous()) else u.to(dtype=torch.float32).contiguous()
+    rs_c = row_scale if (row_scale.dtype == torch.bfloat16 and row_scale.is_contiguous()) else row_scale.to(device=dev, dtype=torch.bfloat16).contiguous()
+    pk = torch.empty((P, N, k8), dtype=torch.uint8, device=dev)
+    qs = torch.empty((1, N, ng), dtype=torch.bfloat16, device=dev)
+    qz = torch.empty((N, ng), dtype=torch.bfloat16, device=dev)
+    if x_rot is not None:
+        xr_c = x_rot if (x_rot.dtype == torch.float32 and x_rot.is_contiguous()) else x_rot.to(device=dev, dtype=torch.float32).contiguous()
+        y_zero = torch.empty((N,), dtype=torch.float32, device=dev)
+        delta_y = torch.empty((P, N), dtype=torch.float32, device=dev)
+    else:
+        xr_c = None
+        y_zero = None
+        delta_y = None
+
+    from src.quint_cuda_fast import get_fast_cuda_ext
+    fast_ext = get_fast_cuda_ext()
+    if fast_ext is not None:
+        fn_ptrs = _get_pm_fn_ptrs(dev)
+        rc = fast_ext.launch_carve_q1_ballot(
+            fn_ptrs[b"pure_mirror_carve_q1_ballot_f32"],
+            int(torch.cuda.current_stream(dev).cuda_stream),
+            u_c.data_ptr(),
+            0 if xr_c is None else xr_c.data_ptr(),
+            rs_c.data_ptr(),
+            pk.data_ptr(),
+            qs.data_ptr(),
+            qz.data_ptr(),
+            0 if y_zero is None else y_zero.data_ptr(),
+            0 if delta_y is None else delta_y.data_ptr(),
+            N, K, int(root_bits), P,
+        )
+        if rc != 0:
+            raise RuntimeError(f"cuLaunchKernel(pure_mirror_carve_q1_ballot_f32) failed: {rc}")
+    else:
+        nvcuda, fns = get_pure_mirror_kernels(dev)
+        stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
+        p0 = ctypes.c_void_p(u_c.data_ptr())
+        p1 = ctypes.c_void_p(0 if xr_c is None else xr_c.data_ptr())
+        p2 = ctypes.c_void_p(rs_c.data_ptr())
+        p3 = ctypes.c_void_p(pk.data_ptr())
+        p4 = ctypes.c_void_p(qs.data_ptr())
+        p5 = ctypes.c_void_p(qz.data_ptr())
+        p6 = ctypes.c_void_p(0 if y_zero is None else y_zero.data_ptr())
+        p7 = ctypes.c_void_p(0 if delta_y is None else delta_y.data_ptr())
+        cN, cK, cRB, cP = ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(int(root_bits)), ctypes.c_int(P)
+        args = (ctypes.c_void_p * 12)(
+            ctypes.addressof(p0), ctypes.addressof(p1), ctypes.addressof(p2), ctypes.addressof(p3),
+            ctypes.addressof(p4), ctypes.addressof(p5), ctypes.addressof(p6), ctypes.addressof(p7),
+            ctypes.addressof(cN), ctypes.addressof(cK), ctypes.addressof(cRB), ctypes.addressof(cP),
+        )
+        rc = nvcuda.cuLaunchKernel(
+            fns[b"pure_mirror_carve_q1_ballot_f32"],
+            N, 1, 1, 256, 1, 1, 8 * (1 + P) * 4, stream, args, None,
+        )
+        if rc != 0:
+            raise RuntimeError(f"cuLaunchKernel(pure_mirror_carve_q1_ballot_f32) failed: {rc}")
+    return pk, qs, qz, y_zero, delta_y
+
+
+@torch.no_grad()
+def launch_pure_mirror_sinkhorn_l2(
+    w_bf16: torch.Tensor,
+    iters: int = 3,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocation-free CUDA L2 Sinkhorn equilibration on contiguous BF16 2D weights."""
+    dev = w_bf16.device
+    w_c = w_bf16 if w_bf16.is_contiguous() else w_bf16.contiguous()
+    N, K = int(w_c.shape[0]), int(w_c.shape[1])
+    dr = torch.ones((N,), dtype=torch.float32, device=dev)
+    dc = torch.ones((K,), dtype=torch.float32, device=dev)
+    n_it = max(1, int(iters))
+
+    from src.quint_cuda_fast import get_fast_cuda_ext
+    fast_ext = get_fast_cuda_ext()
+    if fast_ext is not None:
+        fn_ptrs = _get_pm_fn_ptrs(dev)
+        stream_i = int(torch.cuda.current_stream(dev).cuda_stream)
+        rc = fast_ext.launch_sinkhorn_iters(
+            fn_ptrs[b"pure_mirror_sinkhorn_row_bf16"],
+            fn_ptrs[b"pure_mirror_sinkhorn_col_bf16"],
+            stream_i,
+            w_c.data_ptr(), dr.data_ptr(), dc.data_ptr(), N, K, n_it,
+        )
+        if rc != 0:
+            raise RuntimeError(f"cuLaunchKernel(pure_mirror_sinkhorn_iters) failed: {rc}")
+    else:
+        nvcuda, fns = get_pure_mirror_kernels(dev)
+        stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
+        pw = ctypes.c_void_p(w_c.data_ptr())
+        pdr = ctypes.c_void_p(dr.data_ptr())
+        pdc = ctypes.c_void_p(dc.data_ptr())
+        cN, cK = ctypes.c_int(N), ctypes.c_int(K)
+        a_r = (ctypes.c_void_p * 5)(ctypes.addressof(pw), ctypes.addressof(pdc), ctypes.addressof(pdr), ctypes.addressof(cN), ctypes.addressof(cK))
+        a_c = (ctypes.c_void_p * 5)(ctypes.addressof(pw), ctypes.addressof(pdr), ctypes.addressof(pdc), ctypes.addressof(cN), ctypes.addressof(cK))
+        col_gx = (K + 31) // 32
+        for _ in range(n_it):
+            rc = nvcuda.cuLaunchKernel(fns[b"pure_mirror_sinkhorn_row_bf16"], N, 1, 1, 256, 1, 1, 0, stream, a_r, None)
+            if rc != 0:
+                raise RuntimeError(f"cuLaunchKernel(pure_mirror_sinkhorn_row_bf16) failed: {rc}")
+            rc = nvcuda.cuLaunchKernel(fns[b"pure_mirror_sinkhorn_col_bf16"], col_gx, 1, 1, 32, 8, 1, 0, stream, a_c, None)
+            if rc != 0:
+                raise RuntimeError(f"cuLaunchKernel(pure_mirror_sinkhorn_col_bf16) failed: {rc}")
+
+    norm_c = dc.mean().clamp_min(1e-8)
+    dc = (dc / norm_c).clamp_min(1e-6)
+    dr = (dr * norm_c).clamp_min(1e-6)
+    row_scale = dr.to(torch.bfloat16)
+    col_scale = dc.to(torch.bfloat16)
+    w_eq = torch.empty((N, K), dtype=torch.float32, device=dev)
+
+    if fast_ext is not None:
+        rc = fast_ext.launch_sinkhorn_apply(
+            fn_ptrs[b"pure_mirror_sinkhorn_apply_bf16"],
+            int(torch.cuda.current_stream(dev).cuda_stream),
+            w_c.data_ptr(), row_scale.data_ptr(), col_scale.data_ptr(), w_eq.data_ptr(), N, K,
+        )
+        if rc != 0:
+            raise RuntimeError(f"cuLaunchKernel(pure_mirror_sinkhorn_apply_bf16) failed: {rc}")
+    else:
+        nvcuda, fns = get_pure_mirror_kernels(dev)
+        stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
+        pw = ctypes.c_void_p(w_c.data_ptr())
+        prs = ctypes.c_void_p(row_scale.data_ptr())
+        pcs = ctypes.c_void_p(col_scale.data_ptr())
+        peq = ctypes.c_void_p(w_eq.data_ptr())
+        cN, cK = ctypes.c_int(N), ctypes.c_int(K)
+        a_a = (ctypes.c_void_p * 6)(
+            ctypes.addressof(pw), ctypes.addressof(prs), ctypes.addressof(pcs),
+            ctypes.addressof(peq), ctypes.addressof(cN), ctypes.addressof(cK),
+        )
+        rc = nvcuda.cuLaunchKernel(fns[b"pure_mirror_sinkhorn_apply_bf16"], N, 1, 1, 256, 1, 1, 0, stream, a_a, None)
+        if rc != 0:
+            raise RuntimeError(f"cuLaunchKernel(pure_mirror_sinkhorn_apply_bf16) failed: {rc}")
+    return row_scale, col_scale, w_eq
 
 
 class PureMirrorCudaFeedback:

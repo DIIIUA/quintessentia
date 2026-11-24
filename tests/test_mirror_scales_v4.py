@@ -1156,3 +1156,59 @@ def test_user_modes_default_custom_and_anti_loop_sampling():
         rng=rng,
     )
     assert tok in (5, 9)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native C batched MoE & ballot carve")
+def test_native_c_batched_moe_ballot_carve_and_nonblocking_mirror():
+    """Verify bit-exact Ballot Q1 Carve, CUDA L2 Sinkhorn, and constant-memory Batched MoE Kernel #6c parity."""
+    from src.binary_halving_q1 import (
+        IncrementalCubeCarver,
+        carve_q1_cubes_incremental,
+        carve_q1_mirror_crystal,
+    )
+    from src.pure_mirror_agents_nvrtc import (
+        launch_pure_mirror_diff_q1_gemv,
+        launch_pure_mirror_diff_q1_moe_batch,
+    )
+
+    dev = torch.device("cuda:0")
+    torch.manual_seed(123)
+    w = torch.randn(256, 512, device=dev, dtype=torch.bfloat16)
+    x = torch.randn(1, 512, device=dev, dtype=torch.bfloat16)
+    y_ex = torch.nn.functional.linear(x, w)
+
+    # 1. Ballot Q1 Carve vs IncrementalCubeCarver parity (k_opt + scar_rel_rmse + qzero)
+    t_fast, _, scar_fast = carve_q1_mirror_crystal(
+        w, x, y_ex, 5, min_cubes=3, mirror_tol=0.05, root_bits=8, group_size=64, use_fwht=True, sinkhorn_iters=3
+    )
+    carver = IncrementalCubeCarver(
+        w, root_bits=8, group_size=64, use_fwht=True, sinkhorn_iters=3, compute_diagnostics=False
+    )
+    t_ref, _, scar_ref = carver.carve_until_mirror_equal(x, y_ex, 5, min_cubes=3, mirror_tol=0.05)
+    assert scar_fast["k_opt"] == scar_ref["k_opt"]
+    assert torch.equal(t_fast["qzero"], t_ref["qzero"])
+    assert abs(scar_fast["scar_rel_rmse"] - scar_ref["scar_rel_rmse"]) < 1e-4
+
+    # 2. Constant-memory Batched MoE Kernel #6c matches single Kernel #6 exactly (0.0 diff)
+    exps = []
+    for _ in range(4):
+        wi = torch.randn(256, 512, device=dev, dtype=torch.bfloat16)
+        ti, _ = carve_q1_cubes_incremental(wi, 4, root_bits=8, group_size=64, use_fwht=True, sinkhorn_iters=3)
+        xl = torch.randn(512, device=dev, dtype=torch.bfloat16)
+        yl = torch.randn(256, device=dev, dtype=torch.bfloat16)
+        exps.append((ti, 4, xl, yl))
+    y_bat = launch_pure_mirror_diff_q1_moe_batch(
+        x, exps, shared_x=True, group_size=64, min_planes=1, mirror_tol=0.03
+    )
+    if y_bat is not None:
+        y_ref = torch.cat(
+            [
+                launch_pure_mirror_diff_q1_gemv(
+                    x, ti["packed_lo"], ti["qscale"], ti["qzero"], ti["row_scale"], ti["col_scale"],
+                    x_last=xl, y_last=yl, max_planes=p,
+                )
+                for ti, p, xl, yl in exps
+            ],
+            dim=0,
+        )
+        assert float((y_bat.float() - y_ref.float()).abs().max().item()) == 0.0

@@ -1111,6 +1111,8 @@ class _ParallelSliceStagingPool:
         self._views = [memoryview(s.numpy()) for s in self._slots]
         self._events = [torch.cuda.Event() if self.use_cuda else None for _ in self._slots]
         self._in_flight = [False] * len(self._slots)
+        self._slot_locks = [threading.Lock() for _ in self._slots]
+        self._cursor_lock = threading.Lock()
         self._cursor = 0
 
         self._lock = threading.Lock()
@@ -1289,30 +1291,42 @@ class _ParallelSliceStagingPool:
         if total_bytes <= 0 or not tasks:
             return torch.empty(0, dtype=torch.uint8, device=self.device)
         tasks = self._coalesce_tasks(tasks)
-        self._ensure_capacity(total_bytes)
-        idx = self._cursor
-        self._cursor = (self._cursor + 1) % len(self._slots)
+        with self._cursor_lock:
+            if total_bytes > self.slot_bytes:
+                for sl in self._slot_locks:
+                    sl.acquire()
+                try:
+                    self._ensure_capacity(total_bytes)
+                finally:
+                    for sl in self._slot_locks:
+                        sl.release()
+            idx = self._cursor
+            self._cursor = (self._cursor + 1) % len(self._slots)
+            slot_lock = self._slot_locks[idx]
 
-        if self.use_cuda and self._in_flight[idx] and self._events[idx] is not None:
-            self._events[idx].synchronize()
-            self._in_flight[idx] = False
+        with slot_lock:
+            if self.use_cuda and self._in_flight[idx] and self._events[idx] is not None:
+                self._events[idx].synchronize()
+                self._in_flight[idx] = False
 
-        view = self._views[idx]
-        if len(tasks) == 1 or self.workers == 1:
-            for t in tasks:
-                self._read_one(t, view)
-        else:
-            if self._pool is None:
-                self._pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="quintessentia-moe-io")
-            list(self._pool.map(lambda t: self._read_one(t, view), tasks))
+            view = self._views[idx]
+            if len(tasks) == 1 or self.workers == 1:
+                for t in tasks:
+                    self._read_one(t, view)
+            else:
+                with self._lock:
+                    if self._pool is None:
+                        self._pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="quintessentia-moe-io")
+                    pool = self._pool
+                list(pool.map(lambda t: self._read_one(t, view), tasks))
 
-        src_u8 = self._slots[idx][:total_bytes]
-        if self.use_cuda:
-            dst_u8 = src_u8.to(device=self.device, non_blocking=True)
-            self._events[idx].record(torch.cuda.current_stream(self.device))
-            self._in_flight[idx] = True
-            return dst_u8
-        return src_u8.clone()
+            src_u8 = self._slots[idx][:total_bytes]
+            if self.use_cuda:
+                dst_u8 = src_u8.to(device=self.device, non_blocking=True)
+                self._events[idx].record(torch.cuda.current_stream(self.device))
+                self._in_flight[idx] = True
+                return dst_u8
+            return src_u8.clone()
 
     def close(self) -> None:
         if self.use_cuda:
@@ -2783,6 +2797,43 @@ class _GGUFExpertCacheAndLoader:
         u_raw = packed_u8[:, bg : bg + bu].contiguous().reshape(-1)
         d_raw = packed_u8[:, bg + bu : bg + bu + bd].contiguous().reshape(-1)
         return self._dequant_split(g_raw, u_raw, d_raw, k, meta, dtype)
+
+    def fetch_raw_u8(self, layer_idx: int, exp_ids: list[int]) -> tuple[dict[int, tuple[Any, Any, Any]], int]:
+        """Linear CPU->GPU raw-byte injection: streams quantized GGUF bytes directly to GPU (0 CPU compute / 0 dequant!)."""
+        if not exp_ids:
+            return {}, 0
+        meta = self._layer_meta[int(layer_idx)]
+        g2, u2, d2 = self._fetch_grouped_u8(meta, list(exp_ids))
+        raw_map = {int(eid): (g2[i], u2[i], d2[i]) for i, eid in enumerate(exp_ids)}
+        return raw_map, int(len(exp_ids) * meta["tot"])
+
+    def dequant_raw_u8(
+        self,
+        layer_idx: int,
+        raw_map: dict[int, tuple[Any, Any, Any]],
+        exp_ids: list[int],
+        dtype: Any,
+    ) -> dict[int, tuple[Any, Any]]:
+        """GPU-side selective dequantization: dequantizes ONLY router-selected experts from pre-injected VRAM raw bytes."""
+        import torch
+
+        if not exp_ids:
+            return {}
+        meta = self._layer_meta[int(layer_idx)]
+        k = len(exp_ids)
+        if k == 1:
+            e0 = int(exp_ids[0])
+            g_r, u_r, d_r = raw_map[e0]
+            g_w, u_w, d_w = self._dequant_split(g_r.reshape(-1), u_r.reshape(-1), d_r.reshape(-1), 1, meta, dtype)
+            return {e0: (torch.cat([g_w[0], u_w[0]], dim=0).contiguous(), d_w[0].contiguous())}
+        g_cat = torch.cat([raw_map[int(e)][0] for e in exp_ids], dim=0).reshape(-1)
+        u_cat = torch.cat([raw_map[int(e)][1] for e in exp_ids], dim=0).reshape(-1)
+        d_cat = torch.cat([raw_map[int(e)][2] for e in exp_ids], dim=0).reshape(-1)
+        g_w, u_w, d_w = self._dequant_split(g_cat, u_cat, d_cat, k, meta, dtype)
+        return {
+            int(eid): (torch.cat([g_w[j], u_w[j]], dim=0).contiguous(), d_w[j].contiguous())
+            for j, eid in enumerate(exp_ids)
+        }
 
     def load_batch(self, layer_idx: int, batch_ids: list[int], dev: Any, comp_dtype: Any, allow_evict: bool):
         import torch

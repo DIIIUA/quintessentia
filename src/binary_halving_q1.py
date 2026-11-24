@@ -259,6 +259,9 @@ def halve_weight_to_q1_tree(
     return tensors, meta
 
 
+_DIFF_Q1_GEMV_FN: Optional[Callable[..., Any]] = None
+
+
 class BinaryHalvingQ1Linear(nn.Module):
     """Linear operator backed by a Binary Halving Q1 Tree (`root_bits` coarse Q1 cubes)."""
 
@@ -488,9 +491,12 @@ class BinaryHalvingQ1Linear(nn.Module):
         if self.use_fwht and flat.device.type == "cuda" and flat.dtype == torch.bfloat16:
             if self.mirror_diff_tol is not None and self.group_size == 64:
                 if flat.shape[0] == 1:
-                    from src.pure_mirror_agents_nvrtc import launch_pure_mirror_diff_q1_gemv
-                    y = launch_pure_mirror_diff_q1_gemv(
-                        flat.contiguous(),
+                    global _DIFF_Q1_GEMV_FN
+                    if _DIFF_Q1_GEMV_FN is None:
+                        from src.pure_mirror_agents_nvrtc import launch_pure_mirror_diff_q1_gemv
+                        _DIFF_Q1_GEMV_FN = launch_pure_mirror_diff_q1_gemv
+                    y = _DIFF_Q1_GEMV_FN(
+                        flat if flat.is_contiguous() else flat.contiguous(),
                         self.packed_lo,
                         self.qscale,
                         self.qzero,
@@ -1348,6 +1354,90 @@ def carve_q1_mirror_crystal(
     sinkhorn_iters: int = 3,
 ) -> Tuple[Dict[str, torch.Tensor], BinaryHalvingTreeMeta, Dict[str, Any]]:
     """Carve a Q1 crystal on the Left x Right intersection, stopping at activation-verified `k_opt`."""
+    target_max = max(1, min(int(root_bits), int(max_cubes)))
+    if (
+        weight.is_cuda
+        and weight.ndim == 2
+        and int(group_size) == 64
+        and int(weight.shape[1]) % 64 == 0
+        and 1 <= target_max <= 16
+        and int(root_bits) in (2, 4, 8, 16)
+    ):
+        from src.pure_mirror_agents_nvrtc import launch_pure_mirror_carve_q1_ballot
+
+        dev = weight.device
+        n, k = int(weight.shape[0]), int(weight.shape[1])
+        depth = int(math.log2(int(root_bits)))
+        target_min = max(1, min(target_max, int(min_cubes)))
+        if use_fwht:
+            row_scale, col_scale, w_eq = sinkhorn_equilibrate(weight, iters=sinkhorn_iters)
+            u = fwht_block(w_eq, 64).to(torch.float32)
+        else:
+            row_scale = torch.ones((n,), dtype=torch.bfloat16, device=dev)
+            col_scale = torch.ones((k,), dtype=torch.bfloat16, device=dev)
+            u = weight.to(torch.float32)
+
+        x_1d = (x_probe[-1] if x_probe.ndim > 1 else x_probe).detach().to(device=dev, dtype=torch.float32)
+        y_ref = (y_exact[-1] if y_exact.ndim > 1 else y_exact).detach().to(device=dev, dtype=torch.float32)
+        x_sc = x_1d * col_scale.float()
+        x_rot = fwht_block(x_sc.unsqueeze(0), 64).squeeze(0).to(torch.float32) if use_fwht else x_sc
+
+        pk_all, qs, qz, y_zero, delta_y = launch_pure_mirror_carve_q1_ballot(
+            u, row_scale, root_bits=int(root_bits), max_cubes=target_max, x_rot=x_rot
+        )
+        y_cum = y_zero.unsqueeze(0) + delta_y.cumsum(dim=0)
+        n_cur_all = y_cum.norm(dim=-1)
+        n_step_all = delta_y.norm(dim=-1)
+        n_scar_all = (y_ref.unsqueeze(0) - y_cum).norm(dim=-1)
+        vals = torch.cat([n_cur_all, n_step_all, n_scar_all, y_ref.norm().unsqueeze(0)]).tolist()
+        y_ref_norm = float(vals[3 * target_max]) + 1e-8
+
+        k_opt = target_max
+        step_rel = 1.0
+        scar_rel = 1.0
+        closed_equal = False
+        for p in range(target_min - 1, target_max):
+            n_cur = float(vals[p])
+            n_step = float(vals[target_max + p])
+            n_scar = float(vals[2 * target_max + p])
+            step_rel = n_step / (n_cur + 1e-8)
+            scar_rel = n_scar / y_ref_norm
+            if mirror_tol > 0.0 and step_rel < mirror_tol and scar_rel < mirror_tol:
+                k_opt = p + 1
+                closed_equal = True
+                break
+
+        packed_out = pk_all if k_opt == target_max else pk_all[:k_opt].contiguous().clone()
+        tensors = {
+            "packed_lo": packed_out,
+            "qscale": qs,
+            "qzero": qz,
+            "row_scale": row_scale.contiguous(),
+            "col_scale": col_scale.contiguous(),
+        }
+        leaf_paths = tuple(_binary_tree_path(p, depth) for p in range(k_opt))
+        meta = BinaryHalvingTreeMeta(
+            root_bits=k_opt,
+            depth=depth,
+            law="mirror_crystal_positional_halving",
+            group_size=64,
+            use_fwht=bool(use_fwht),
+            level_node_counts=tuple(1 << d for d in range(depth + 1)),
+            leaf_paths=leaf_paths,
+            leaf_energy_frac=(),
+            prefix_rel_rmse=(),
+            prefix_cos=(),
+            source_root_bits=int(root_bits),
+        )
+        crystal_scar = {
+            "k_opt": k_opt,
+            "max_k": target_max,
+            "scar_rel_rmse": round(scar_rel, 6),
+            "step_rel_delta": round(step_rel, 6),
+            "closed_equal": closed_equal,
+        }
+        return tensors, meta, crystal_scar
+
     carver = IncrementalCubeCarver(
         weight,
         root_bits=root_bits,
@@ -1376,6 +1466,52 @@ def carve_q1_cubes_incremental(
     sinkhorn_iters: int = 3,
 ) -> Tuple[Dict[str, torch.Tensor], BinaryHalvingTreeMeta]:
     """Carve only the leading `num_cubes` Q1 cubes cube-by-cube without materializing lower branches."""
+    target = max(1, min(int(root_bits), int(num_cubes)))
+    if (
+        weight.is_cuda
+        and weight.ndim == 2
+        and int(group_size) == 64
+        and int(weight.shape[1]) % 64 == 0
+        and 1 <= target <= 16
+        and int(root_bits) in (2, 4, 8, 16)
+    ):
+        from src.pure_mirror_agents_nvrtc import launch_pure_mirror_carve_q1_ballot
+
+        dev = weight.device
+        n, k = int(weight.shape[0]), int(weight.shape[1])
+        depth = int(math.log2(int(root_bits)))
+        if use_fwht:
+            row_scale, col_scale, w_eq = sinkhorn_equilibrate(weight, iters=sinkhorn_iters)
+            u = fwht_block(w_eq, 64).to(torch.float32)
+        else:
+            row_scale = torch.ones((n,), dtype=torch.bfloat16, device=dev)
+            col_scale = torch.ones((k,), dtype=torch.bfloat16, device=dev)
+            u = weight.to(torch.float32)
+        pk, qs, qz, _, _ = launch_pure_mirror_carve_q1_ballot(
+            u, row_scale, root_bits=int(root_bits), max_cubes=target, x_rot=None
+        )
+        tensors = {
+            "packed_lo": pk,
+            "qscale": qs,
+            "qzero": qz,
+            "row_scale": row_scale.contiguous(),
+            "col_scale": col_scale.contiguous(),
+        }
+        meta = BinaryHalvingTreeMeta(
+            root_bits=target,
+            depth=depth,
+            law="incremental_positional_halving",
+            group_size=64,
+            use_fwht=bool(use_fwht),
+            level_node_counts=tuple(1 << d for d in range(depth + 1)),
+            leaf_paths=tuple(_binary_tree_path(p, depth) for p in range(target)),
+            leaf_energy_frac=(),
+            prefix_rel_rmse=(),
+            prefix_cos=(),
+            source_root_bits=int(root_bits),
+        )
+        return tensors, meta
+
     carver = IncrementalCubeCarver(
         weight,
         root_bits=root_bits,
@@ -3045,6 +3181,9 @@ def attach_q1_cubes_to_engine(
             )
             moe_cache.micro_agent_tol = micro_agent_tol
             moe_cache.moe_fabric = bool(moe_fabric)
+            if hasattr(base_loader, "fetch_raw_u8") and hasattr(base_loader, "dequant_raw_u8"):
+                moe_cache.raw_u8_fetcher = base_loader.fetch_raw_u8
+                moe_cache.raw_u8_dequantizer = base_loader.dequant_raw_u8
 
     def _disk_layer_reader(l_idx: int) -> Dict[str, torch.Tensor]:
         return wm.read_layer_tensors(l_idx, target_device=torch.device("cpu"))

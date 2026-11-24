@@ -1,5 +1,5 @@
-"""AirColibri Integrated Inference Engine:
-Соединение математического графа HuggingFace / Transformers с ярусным менеджером памяти Colibri
+"""Quintessentia Integrated Inference Engine:
+Соединение математического графа HuggingFace / Transformers с ярусным менеджером памяти Quintessentia
 и кольцевым конвейером GPU Ring Pipeline («Лесенка»).
 
 Ключевые свойства:
@@ -31,7 +31,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from src.bounded_memory_manager import StableWeightManager, BoundedRAMCache, BoundedPinnedBufferPool
 from src.gpu_ring_pipeline import GPURingPipeline, SlotState
 from src.quantization_q4 import (
-    ColibriQ4Linear,
+    QuintessentiaQ4Linear,
     Q4_GROUP_SIZE,
     Q4_SCRATCH_ELEMS,
     q4_subkey_names,
@@ -121,8 +121,8 @@ class _NoStreamingPipeline:
         return None
 
 
-class AirColibriModel:
-    """Интегрированная модель AirColibri с поддержкой GPU Ring Pipeline и Tail-to-Head Prefetch."""
+class QuintessentiaModel:
+    """Интегрированная модель Quintessentia с поддержкой GPU Ring Pipeline и Tail-to-Head Prefetch."""
 
     @_cleanup_failed_init
     def __init__(
@@ -211,7 +211,7 @@ class AirColibriModel:
         self.use_fused_q4_gemv = bool(use_fused_q4_gemv and self.is_q4)
         self.fused_q4_gemv_calls = 0
         self.tiled_q4_fallback_calls = 0
-        self._q4_wrapped_modules: List[Tuple[ColibriQ4Linear, Any]] = []
+        self._q4_wrapped_modules: List[Tuple[QuintessentiaQ4Linear, Any]] = []
         self._q4_scratch: Optional[torch.Tensor] = None
         self.embed_tokens_weight: Optional[torch.Tensor] = None
         self._step_cancel_check = None
@@ -228,7 +228,7 @@ class AirColibriModel:
 
         # 1. Загрузка конфигурации и токенизатора
         if model_source is not None:
-            from aircolibri_cli.model_source import load_runtime_config
+            from quintessentia_cli.model_source import load_runtime_config
             self.config = load_runtime_config(model_dir)
         else:
             self.config = AutoConfig.from_pretrained(model_dir, config_file="config.hf.json")
@@ -240,7 +240,7 @@ class AirColibriModel:
             raise ValueError("Resident layer count outside model")
         # Preserve the checkpoint tokenizer without ever calling mmap on GGUF files.
         if getattr(model_source, "gguf_file", None):
-            from aircolibri_cli.model_source import load_runtime_tokenizer
+            from quintessentia_cli.model_source import load_runtime_tokenizer
             self.tokenizer = load_runtime_tokenizer(model_dir, config=self.config)
         else:
             tok_kwargs: Dict[str, Any] = {"fix_mistral_regex": False, "local_files_only": True}
@@ -277,7 +277,7 @@ class AirColibriModel:
         quantized_projections = None
         if self.quant_bits:
             from pathlib import Path
-            from aircolibri_cli.unified_runtime import _model_shape_inventory
+            from quintessentia_cli.unified_runtime import _model_shape_inventory
             from src.quantized_projection import projection_map
             layer_shapes, _, _ = _model_shape_inventory(Path(model_dir), model_source, num_hidden_layers)
             quantized_projections = projection_map(self.model, layer_shapes, self.quant_bits, self.q4_group_size, replace=True, q1_planes=self.q1_planes)
@@ -314,7 +314,7 @@ class AirColibriModel:
             if self.quant_bits == 1 and hasattr(expert_loader, "set_q1_planes"):
                 expert_loader.set_q1_planes(self.q1_planes)
         if self.device.type == "cuda" or cpu_first_plan is not None:
-            from src.colibri_deltanet_nvrtc import install_deltanet_nvrtc_kernels
+            from src.quintessentia_deltanet_nvrtc import install_deltanet_nvrtc_kernels
 
             install_deltanet_nvrtc_kernels(
                 self.model,
@@ -434,18 +434,18 @@ class AirColibriModel:
         return self._q4_scratch
 
     def _install_fused_q4_gemv_wrappers(self) -> int:
-        """Оборачивает ColibriQ4Linear.forward для прямого запуска NVRTC W4A16 GEMV без распаковки."""
-        from src.colibri_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4
+        """Оборачивает QuintessentiaQ4Linear.forward для прямого запуска NVRTC W4A16 GEMV без распаковки."""
+        from src.quintessentia_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4
 
         wrapped_count = 0
         engine_ref = self
         for submod in self.model.modules():
-            if isinstance(submod, ColibriQ4Linear):
+            if isinstance(submod, QuintessentiaQ4Linear):
                 orig_forward = submod.forward
 
                 def _fused_or_tiled_forward(
                     x: torch.Tensor,
-                    _m: ColibriQ4Linear = submod,
+                    _m: QuintessentiaQ4Linear = submod,
                     _orig=orig_forward,
                 ) -> torch.Tensor:
                     qweight = _m._buffers["qweight"]
@@ -475,10 +475,10 @@ class AirColibriModel:
         return wrapped_count
 
     @staticmethod
-    def _collect_layer_bindings(layer_module: torch.nn.Module) -> Tuple[List[Tuple[ColibriQ4Linear, str, str, str]], List[str]]:
-        q4_bindings: List[Tuple[ColibriQ4Linear, str, str, str]] = []
+    def _collect_layer_bindings(layer_module: torch.nn.Module) -> Tuple[List[Tuple[QuintessentiaQ4Linear, str, str, str]], List[str]]:
+        q4_bindings: List[Tuple[QuintessentiaQ4Linear, str, str, str]] = []
         for mod_name, submod in layer_module.named_modules():
-            if isinstance(submod, ColibriQ4Linear):
+            if isinstance(submod, QuintessentiaQ4Linear):
                 q_k, s_k, z_k = q4_subkey_names(f"{mod_name}.weight")
                 q4_bindings.append((submod, q_k, s_k, z_k))
         raw_params = [k for k, _ in layer_module.named_parameters()]
@@ -499,7 +499,7 @@ class AirColibriModel:
         layers = getattr(inner, "layers", None) if inner is not None else None
         if layers is not None:
             return layers
-        from aircolibri_cli.model_source import resolve_decoder_layers
+        from quintessentia_cli.model_source import resolve_decoder_layers
 
         layers = resolve_decoder_layers(self.model)
         if layers is None:
@@ -631,7 +631,7 @@ class AirColibriModel:
                 if hasattr(self.model, "get_output_embeddings")
                 else getattr(self.model, "lm_head", None)
             )
-            if self.quantize_lm_head and isinstance(out_emb, ColibriQ4Linear):
+            if self.quantize_lm_head and isinstance(out_emb, QuintessentiaQ4Linear):
                 self._quantize_lm_head_from_slice(out_emb)
             else:
                 self._load_bf16_lm_head_from_slice(lm_w_path)
@@ -966,7 +966,7 @@ class AirColibriModel:
                         proj_weights[f"{mod_name}.weight"] = unpack_weight(packed_sub, submod.group_size, self.dtype)
                     if f"{mod_name}.bias" in tensors:
                         proj_weights[f"{mod_name}.bias"] = tensors.pop(f"{mod_name}.bias")
-                elif isinstance(submod, ColibriQ4Linear):
+                elif isinstance(submod, QuintessentiaQ4Linear):
                     q_k, s_k, z_k = q4_subkey_names(f"{mod_name}.weight")
                     if q_k in tensors and s_k in tensors and z_k in tensors:
                         proj_weights[f"{mod_name}.weight"] = dequantize_q4_tensor(
@@ -1040,7 +1040,7 @@ class AirColibriModel:
         self._hook_handles: List[Any] = []
 
         # Собираем привязки Q4-подмодулей, параметров и опциональных буферов для каждого слоя
-        layer_q4_bindings: List[List[Tuple[ColibriQ4Linear, str, str, str]]] = []
+        layer_q4_bindings: List[List[Tuple[QuintessentiaQ4Linear, str, str, str]]] = []
         layer_param_names: List[List[str]] = []
         layer_buffer_dtypes: List[Dict[str, torch.dtype]] = []
         for layer_mod in self._decoder_layers():
@@ -1364,8 +1364,8 @@ class AirColibriModel:
         generated_ids = input_ids[0].tolist()
         step_times = []
 
-        print(f"\n[AirColibri Integrated] Starting genuine generation for prompt: '{prompt}'")
-        print(f"[AirColibri Integrated] Input tokens: {len(generated_ids)} | Target new tokens: {max_new_tokens} | Mode: {self.pipeline_mode}")
+        print(f"\n[Quintessentia Integrated] Starting genuine generation for prompt: '{prompt}'")
+        print(f"[Quintessentia Integrated] Input tokens: {len(generated_ids)} | Target new tokens: {max_new_tokens} | Mode: {self.pipeline_mode}")
 
         past_key_values = None
 
@@ -1455,7 +1455,7 @@ class AirColibriModel:
         if getattr(self, "device", torch.device("cpu")).type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def __enter__(self) -> "AirColibriModel":
+    def __enter__(self) -> "QuintessentiaModel":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from src.binary_halving_q1 import BinaryHalvingQ1Linear, halve_weight_to_q1_tree
-from src.colibri_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
+from src.quintessentia_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
 from src.ideal_q1_engine import fwht_block
 
 CONTACT_DEPTH = 0

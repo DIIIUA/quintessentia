@@ -122,7 +122,7 @@ def test_moe_expert_relay_abc_invariants_and_parity_cuda():
         assert st["standby_bytes"] == 0
         assert st["gpu_prepares"] == n_exp
         assert len(threads_seen) == n_exp
-        assert all(t.startswith("aircolibri-moe-B") for t in threads_seen)
+        assert all(t.startswith("quintessentia-moe-B") for t in threads_seen)
     finally:
         c_ref.close()
         c_rel.close()

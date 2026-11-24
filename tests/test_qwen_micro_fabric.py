@@ -72,11 +72,11 @@ def test_lazy_moe_cache_reaches_fabric_and_reuses_real_expert_weights():
 
 @torch.no_grad()
 def test_unified_engine_fabric_generates_tokens(tmp_path):
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     from test_ideal_q1_and_modes import _make_tiny_olmoe
     folder=tmp_path/'moe_fabric';folder.mkdir()
     _make_tiny_olmoe(folder,hidden_size=128,intermediate_size=128,num_layers=2,num_experts=4)
-    with AirColibriUnifiedEngine(folder,weight_format='q1_cubes',cube_root_bits=8,q1_planes=8,
+    with QuintessentiaUnifiedEngine(folder,weight_format='q1_cubes',cube_root_bits=8,q1_planes=8,
             q1_moe_fabric=True,enable_mtp=False,speculation='off',progressive_start=False,
             max_context_tokens=128,prefill_chunk_tokens=8,verbose=False) as engine:
         done=list(engine.stream_chat([{'role':'user','content':'1 2 3'}],max_new_tokens=4,

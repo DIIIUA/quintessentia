@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aircolibri_cli.model_source import hf_snapshot, ModelNotFoundError
+from quintessentia_cli.model_source import hf_snapshot, ModelNotFoundError
 
 
 def hub(monkeypatch, cached, downloaded, files):
@@ -21,7 +21,7 @@ def hub(monkeypatch, cached, downloaded, files):
 
 def test_partial_hf_cache_downloads_then_automatically_packs_and_generates(tmp_path, monkeypatch):
     from test_cpu_independence import tiny_checkpoint
-    from aircolibri_cli import cli
+    from quintessentia_cli import cli
     partial, full = tmp_path/"partial", tmp_path/"full"
     partial.mkdir(); full.mkdir()
     (partial/"config.json").write_text("{}")
@@ -79,7 +79,7 @@ def test_gguf_selector_cannot_escape_or_fetch_all_variants(filename):
 
 
 def test_doctor_explicit_repo_downloads_but_default_stays_offline(tmp_path, monkeypatch, capsys):
-    from aircolibri_cli import cli
+    from quintessentia_cli import cli
     calls = []
     def resolve(model, root, allow_download):
         calls.append(allow_download)

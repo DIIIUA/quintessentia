@@ -850,7 +850,7 @@ class Q1PuzzleLinear(nn.Module):
         """Accumulate a staged batch of Q8 delta cubes into y_acc_f32."""
         dq, ds, dz, coords = payload
         if flat_x.device.type == "cuda" and flat_x.dtype == torch.bfloat16:
-            from src.colibri_q1_cube_nvrtc import launch_puzzle_overlay_delta_cubes
+            from src.quintessentia_q1_cube_nvrtc import launch_puzzle_overlay_delta_cubes
 
             launch_puzzle_overlay_delta_cubes(
                 flat_x,
@@ -1032,7 +1032,7 @@ def _extract_module_weight_and_bias(
             bias = b_attr.detach() if isinstance(b_attr, torch.Tensor) and b_attr.device.type != "meta" else None
             return w, bias, in_f, out_f
 
-    # 3) ColibriQ4Linear
+    # 3) QuintessentiaQ4Linear
     if hasattr(mod, "qweight") and hasattr(mod, "scales") and hasattr(mod, "zeros"):
         qw, sc, zr = mod.qweight, mod.scales, mod.zeros
         if (

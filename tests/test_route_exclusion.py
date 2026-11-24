@@ -11,7 +11,7 @@ from src.route_exclusion import RouteExclusion
 @pytest.mark.parametrize("rows", [1, 3])
 @torch.no_grad()
 def test_exact_zero_routes_do_not_request_weights_and_next_scope_can_read_them(rows):
-    from aircolibri_cli.model_source import _fast_moe_dispatch
+    from quintessentia_cli.model_source import _fast_moe_dispatch
     torch.manual_seed(321)
     bank = torch.randn(4, 3, 16, 16)*.05
     calls = []

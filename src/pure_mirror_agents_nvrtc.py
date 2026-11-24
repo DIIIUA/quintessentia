@@ -1,6 +1,6 @@
 """Irreducible Mirror Equality 4x4 + D15 Logic<->Strategy CUDA Kernels (`src/pure_mirror_agents_nvrtc.py`).
 
-Version 3 of Air-Colibri's decentralized agent-connection engine built STRICTLY and
+Version 3 of Quintessentia's decentralized agent-connection engine built STRICTLY and
 EXCLUSIVELY from the irreducible Mirror Equality law and its full application topology
 (`F00`–`F14`, `L00`–`L02`, `C03`, `L04`, `D15`, `KA-F01`–`KA-F07`, `KA-B08`–`KA-B09`):
 
@@ -57,7 +57,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from src.colibri_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
+from src.quintessentia_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
 
 # Exact role slot indices inside `[L, E, 6, 32]` (NEVER collapsed!)
 SLOT_LEFT_OUTER = 0   # Outcome_(t-1)

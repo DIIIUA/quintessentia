@@ -2031,7 +2031,7 @@
       "engine_lf_sha256": "d6a2a11cf36bbe0f3a1060f6c4c5be58dcf76293200a1ad2dc3fee0679c86ad7",
       "source_files_unchanged": true,
       "weight_format": "q6",
-      "error": "UnsupportedModelError: [project]\\models\\35_hf_RWKV4-169m-bin: no Colibri container, Hugging Face safetensors checkpoint, or GGUF file found"
+      "error": "UnsupportedModelError: [project]\\models\\35_hf_RWKV4-169m-bin: no Quintessentia container, Hugging Face safetensors checkpoint, or GGUF file found"
     },
     {
       "model": "36_hf_OpenELM-270M-Instruct",

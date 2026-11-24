@@ -118,7 +118,7 @@ class ProgressiveExecution:
             self.stopped.clear()
             self.start_event.clear()
             self.started_at = time.perf_counter()
-            self.worker = threading.Thread(target=self._prepare, name="aircolibri-gpu-prepare", daemon=True)
+            self.worker = threading.Thread(target=self._prepare, name="quintessentia-gpu-prepare", daemon=True)
             self.worker.start()
             self.start_event.set()
 
@@ -131,19 +131,19 @@ class ProgressiveExecution:
                     self.plan = self.plan_factory(self.engine) if params else self.plan_factory()
                 if self.stopped.is_set():
                     return
-                # Compile/load the original Colibri patch modules off the
+                # Compile/load the original Quintessentia patch modules off the
                 # inference thread. A weight payload alone is not GPU readiness.
                 if self.engine.quant_bits in (4, 6):
-                    from src.colibri_nvrtc import get_kernels
+                    from src.quintessentia_nvrtc import get_kernels
                     get_kernels(self.gpu)
                 elif self.engine.quant_bits in (1, 2, 8):
-                    from src.colibri_q1_cube_nvrtc import get_q1_kernels
+                    from src.quintessentia_q1_cube_nvrtc import get_q1_kernels
                     get_q1_kernels(self.gpu)
-                if any(getattr(m, "_colibri_nvrtc_norm", False) for m in self.engine.model.modules()):
-                    from src.colibri_deltanet_nvrtc import get_deltanet_kernels
+                if any(getattr(m, "_quintessentia_nvrtc_norm", False) for m in self.engine.model.modules()):
+                    from src.quintessentia_deltanet_nvrtc import get_deltanet_kernels
                     get_deltanet_kernels(self.gpu)
                 if getattr(self.engine.model_source, "kind", None) == "gguf" and getattr(self.engine.model_source, "_expert_loader", None) is not None:
-                    from aircolibri_cli.model_source import _get_nvrtc_gguf_kernels
+                    from quintessentia_cli.model_source import _get_nvrtc_gguf_kernels
                     _get_nvrtc_gguf_kernels(self.gpu)
                 self.kernels_ready = True
                 while not self.globals_ready.wait(0.05):
@@ -151,7 +151,7 @@ class ProgressiveExecution:
                         return
                 stream = torch.cuda.Stream(device=self.gpu)
                 if self.global_payload is None:
-                    from src.aircolibri_integrated import _LM_HEAD_WEIGHT_CANDIDATES
+                    from src.quintessentia_integrated import _LM_HEAD_WEIGHT_CANDIDATES
                     skip_head = bool(getattr(self.plan, 'streamed_lm_head', False))
                     globals_src = (
                         {k: v for k, v in self._globals.items() if k not in _LM_HEAD_WEIGHT_CANDIDATES}
@@ -170,7 +170,7 @@ class ProgressiveExecution:
                     if getattr(self.engine, "puzzle_overlay", False) or len(self.ready) == self.plan.resident_layers:
                         from src.bounded_memory_manager import BoundedPinnedBufferPool
                         from src.gpu_ring_pipeline import GPURingPipeline
-                        from src.aircolibri_integrated import _NoStreamingPipeline
+                        from src.quintessentia_integrated import _NoStreamingPipeline
                         if (
                             self.plan.full_residency
                             or getattr(self.plan, 'sub_layer_cubes', False)
@@ -426,7 +426,7 @@ class ProgressiveExecution:
                 new_cache.set_q1_planes(getattr(eng, "q1_planes", 1))
             if seeds is not None and hasattr(new_cache, "adopt_cpu_packed"):
                 new_cache.adopt_cpu_packed(seeds)
-        from src.colibri_deltanet_nvrtc import install_deltanet_nvrtc_kernels
+        from src.quintessentia_deltanet_nvrtc import install_deltanet_nvrtc_kernels
         install_deltanet_nvrtc_kernels(eng.model, patch_norms=True, patch_zero_centered_norm=True)
         sub_cubes = bool(getattr(self.plan, 'sub_layer_cubes', False)) and not is_puzzle
         sub_head = bool(getattr(self.plan, 'streamed_lm_head', False))

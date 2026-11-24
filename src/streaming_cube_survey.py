@@ -161,7 +161,7 @@ class StreamingCubeSurvey:
         self._moe_inputs.clear()
 
     def blueprint(self, tomography, *, relative_error=0.01, selection_policy='measured_prefix_convergence'):
-        """Choose the first stable adequate prefix, with Colibri sensitivity or pure-math Mirror Equality.
+        """Choose the first stable adequate prefix, with Quintessentia sensitivity or pure-math Mirror Equality.
 
         When `selection_policy='mirror'`, selects `k_opt` purely from bracketless Mirror Equality
         on the measured error sequence `(e_{p-1}, e_p, e_{p+1})`:

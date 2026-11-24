@@ -144,8 +144,8 @@ def make_model(folder,kind):
 @torch.no_grad()
 def test_predictive_region_ring_logits_kv_and_cancel(tmp_path,kind,bits):
     if not torch.cuda.is_available():pytest.skip('CUDA required')
-    from src.aircolibri_integrated import AirColibriModel
-    from aircolibri_cli.model_source import open_model_source
+    from src.quintessentia_integrated import QuintessentiaModel
+    from quintessentia_cli.model_source import open_model_source
     make_model(tmp_path,kind)
     # Exactly eight cache slots force experts out between layers.
     expert_bytes=int(3*128*128*(bits/8+4/64))
@@ -154,13 +154,13 @@ def test_predictive_region_ring_logits_kv_and_cancel(tmp_path,kind,bits):
                 vram_resident_layers=1,num_slots=3,expert_cache_bytes=budget)
     expected=[]
     steps=([1,4,6,8],[7],[9],[11],[13])
-    with AirColibriModel(str(tmp_path),model_source=open_model_source(tmp_path),**kwargs) as base:
+    with QuintessentiaModel(str(tmp_path),model_source=open_model_source(tmp_path),**kwargs) as base:
         past=None
         for tokens in steps:
             logits,past=base._forward_step(torch.tensor([tokens]),past_key_values=past)
             expected.append((logits.cpu(),[(l.keys.cpu(),l.values.cpu()) for l in past.layers]))
     del past,logits
-    with AirColibriModel(str(tmp_path),model_source=open_model_source(tmp_path),**kwargs) as engine:
+    with QuintessentiaModel(str(tmp_path),model_source=open_model_source(tmp_path),**kwargs) as engine:
         warm=engine.enable_probability_warmup(region_experts=4,gpu_budget_bytes=2**20,host_cache_bytes=2**20)
         counts={'head':0,'attention':0}
         def head(*args):counts['head']+=1
@@ -198,14 +198,14 @@ def test_predictive_region_ring_logits_kv_and_cancel(tmp_path,kind,bits):
 def test_unified_cancel_and_session_reset_clear_pending_predictions(tmp_path,monkeypatch):
     if not torch.cuda.is_available():pytest.skip('CUDA required')
     from dataclasses import replace
-    from aircolibri_cli import unified_runtime as runtime
+    from quintessentia_cli import unified_runtime as runtime
     make_model(tmp_path,'olmoe')
     original=runtime.plan_for_checkpoint
     def ring(*args,**kwargs):
         profile,plan,mtp=original(*args,**kwargs)
         return profile,replace(plan,full_residency=False,resident_layers=1,ring_slots=3),mtp
     monkeypatch.setattr(runtime,'plan_for_checkpoint',ring)
-    with runtime.AirColibriUnifiedEngine(cpu_first=False, model_dir=tmp_path,weight_format='q6',enable_mtp=False,
+    with runtime.QuintessentiaUnifiedEngine(cpu_first=False, model_dir=tmp_path,weight_format='q6',enable_mtp=False,
                                         verbose=False,max_context_tokens=128,prefill_chunk_tokens=8) as engine:
         warm=engine.engine.enable_probability_warmup(region_experts=4,gpu_budget_bytes=2**20)
         engine.engine._forward_step(torch.tensor([[1,2,3]]))
@@ -366,14 +366,14 @@ def test_three_independent_maps_do_not_supersede_each_other(bits):
 
 def test_chunked_prefill_including_one_token_tail_builds_one_initial_map(tmp_path):
     if not torch.cuda.is_available():pytest.skip('CUDA required')
-    from src.aircolibri_integrated import AirColibriModel
-    from aircolibri_cli.model_source import open_model_source,PreadSafetensorsReader
+    from src.quintessentia_integrated import QuintessentiaModel
+    from quintessentia_cli.model_source import open_model_source,PreadSafetensorsReader
     make_model(tmp_path,'olmoe')
     expert_bytes=int(3*128*128*(6/8+4/64))
     budget=8*6*128*128+32*1024**2+8*expert_bytes
     reader=PreadSafetensorsReader()
     try:
-        with AirColibriModel(str(tmp_path),model_source=open_model_source(tmp_path),weight_reader=reader,
+        with QuintessentiaModel(str(tmp_path),model_source=open_model_source(tmp_path),weight_reader=reader,
                             weight_format='q6',universal_quantization=True,vram_resident_layers=1,
                             num_slots=3,expert_cache_bytes=budget) as engine:
             warm=engine.enable_probability_warmup(region_experts=4,gpu_budget_bytes=2**20)
@@ -392,14 +392,14 @@ def test_chunked_prefill_including_one_token_tail_builds_one_initial_map(tmp_pat
 
 def test_map_can_be_prepared_later_without_rebuilding_unchanged_area(tmp_path):
     if not torch.cuda.is_available():pytest.skip('CUDA required')
-    from src.aircolibri_integrated import AirColibriModel
-    from aircolibri_cli.model_source import open_model_source,PreadSafetensorsReader
+    from src.quintessentia_integrated import QuintessentiaModel
+    from quintessentia_cli.model_source import open_model_source,PreadSafetensorsReader
     make_model(tmp_path,'granitemoe')
     expert_bytes=int(3*128*128*(4/8+4/64))
     budget=8*6*128*128+32*1024**2+8*expert_bytes
     reader=PreadSafetensorsReader()
     try:
-        with AirColibriModel(str(tmp_path),model_source=open_model_source(tmp_path),weight_reader=reader,
+        with QuintessentiaModel(str(tmp_path),model_source=open_model_source(tmp_path),weight_reader=reader,
                             weight_format='q4',universal_quantization=True,vram_resident_layers=1,
                             num_slots=3,expert_cache_bytes=budget) as engine:
             warm=engine.enable_probability_warmup(region_experts=4,gpu_budget_bytes=2**20)

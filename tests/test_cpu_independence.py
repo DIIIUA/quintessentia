@@ -53,11 +53,11 @@ def forbid_cuda(monkeypatch):
 @pytest.mark.parametrize("fmt", ["bf16", "q4", "q6"])
 @torch.no_grad()
 def test_no_gpu_streams_every_layer_and_preserves_logits_cache_and_session(tmp_path, monkeypatch, fmt):
-    import aircolibri_cli.unified_runtime as runtime
+    import quintessentia_cli.unified_runtime as runtime
     reference = tiny_checkpoint(tmp_path)
     forbid_cuda(monkeypatch)
     monkeypatch.setattr(runtime, "_streaming_ram_budget_bytes", lambda: 48*1024)
-    with runtime.AirColibriUnifiedEngine(tmp_path, weight_format=fmt, verbose=False,
+    with runtime.QuintessentiaUnifiedEngine(tmp_path, weight_format=fmt, verbose=False,
                                          max_context_tokens=128, prefill_chunk_tokens=4) as u:
         reference_weights(reference, u)
         p = u.engine.progressive
@@ -122,7 +122,7 @@ def test_deferred_staging_allocates_only_on_actual_copy_and_stays_closed():
 
 @torch.no_grad()
 def test_gpu_planning_failure_keeps_cpu_state_and_does_not_retry(tmp_path, monkeypatch):
-    import aircolibri_cli.unified_runtime as runtime
+    import quintessentia_cli.unified_runtime as runtime
     reference = tiny_checkpoint(tmp_path)
     calls = []
     def rejected(*args, **kwargs):
@@ -133,7 +133,7 @@ def test_gpu_planning_failure_keeps_cpu_state_and_does_not_retry(tmp_path, monke
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args: (1024, 1024))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args: SimpleNamespace(uuid=None))
     monkeypatch.setattr(runtime, "plan_for_checkpoint", rejected)
-    with runtime.AirColibriUnifiedEngine(tmp_path, weight_format="q6", verbose=False) as u:
+    with runtime.QuintessentiaUnifiedEngine(tmp_path, weight_format="q6", verbose=False) as u:
         reference_weights(reference, u)
         u.engine.progressive.worker.join(10)
         cache = ref_cache = None
@@ -151,8 +151,8 @@ def test_gpu_planning_failure_keeps_cpu_state_and_does_not_retry(tmp_path, monke
 
 def test_explicit_cpu_choice_never_starts_gpu_and_doctor_accepts_it(tmp_path, monkeypatch):
     import json
-    from aircolibri_cli.cli import build_parser, cmd_doctor
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+    from quintessentia_cli.cli import build_parser, cmd_doctor
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     tiny_checkpoint(tmp_path)
     forbid_cuda(monkeypatch)
     # A CPU choice must stay independent even on a machine that has CUDA.
@@ -160,7 +160,7 @@ def test_explicit_cpu_choice_never_starts_gpu_and_doctor_accepts_it(tmp_path, mo
     def no_pin(*args, **kwargs):
         raise AssertionError("CPU session tried to allocate CUDA-pinned memory")
     monkeypatch.setattr(torch.Tensor, "pin_memory", no_pin)
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", progressive_start=False, verbose=False) as u:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", progressive_start=False, verbose=False) as u:
         assert u.engine.progressive.worker is None
         assert u.status_snapshot()["progressive_execution"]["gpu_state"] == "disabled"
         assert list(u.stream_chat([{"role": "user", "content": "Hi"}],
@@ -177,8 +177,8 @@ def test_explicit_cpu_choice_never_starts_gpu_and_doctor_accepts_it(tmp_path, mo
 
 def test_doctor_reports_gpu_plan_rejection_without_rejecting_cpu(tmp_path, monkeypatch):
     import json
-    import aircolibri_cli.unified_runtime as runtime
-    from aircolibri_cli.cli import build_parser, cmd_doctor
+    import quintessentia_cli.unified_runtime as runtime
+    from quintessentia_cli.cli import build_parser, cmd_doctor
     tiny_checkpoint(tmp_path)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args: "test GPU")
@@ -198,11 +198,11 @@ def test_doctor_reports_gpu_plan_rejection_without_rejecting_cpu(tmp_path, monke
 @torch.no_grad()
 def test_cpu_prefill_map_and_original_probabilities_survive_decode(tmp_path, monkeypatch, bits):
     from test_probability_warmup import make_model
-    from aircolibri_cli.thought_buffer import InitialProbabilityAnchor
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+    from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     make_model(tmp_path, "granitemoe")
     forbid_cuda(monkeypatch)
-    with AirColibriUnifiedEngine(tmp_path, weight_format=f"q{bits}", device="cpu", verbose=False) as u:
+    with QuintessentiaUnifiedEngine(tmp_path, weight_format=f"q{bits}", device="cpu", verbose=False) as u:
         pending = u.enable_unified_memory(region_experts=2, host_cache_bytes=2**20)
         anchor = InitialProbabilityAnchor()
         logits, past = u.engine._forward_step(torch.tensor([[3, 7, 4]]), prefill=True)
@@ -226,7 +226,7 @@ def test_cpu_prefill_map_and_original_probabilities_survive_decode(tmp_path, mon
 @pytest.mark.parametrize("verification", [False, True])
 @torch.no_grad()
 def test_failed_helper_returns_adopted_layer_and_live_cache_to_cpu(tmp_path, monkeypatch, verification):
-    import aircolibri_cli.unified_runtime as runtime
+    import quintessentia_cli.unified_runtime as runtime
     from src.progressive_execution import ProgressiveExecution
     reference = tiny_checkpoint(tmp_path)
     second_copy, reject = threading.Event(), threading.Event()
@@ -241,7 +241,7 @@ def test_failed_helper_returns_adopted_layer_and_live_cache_to_cpu(tmp_path, mon
             raise RuntimeError("injected GPU transfer failure")
         return original(self, tensors)
     monkeypatch.setattr(ProgressiveExecution, "_copy_payload", interrupted)
-    with runtime.AirColibriUnifiedEngine(tmp_path, weight_format="q6", verbose=False) as u:
+    with runtime.QuintessentiaUnifiedEngine(tmp_path, weight_format="q6", verbose=False) as u:
         reference_weights(reference, u)
         p = u.engine.progressive
         ids = torch.tensor([[3, 7]])

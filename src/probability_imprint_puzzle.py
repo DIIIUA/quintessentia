@@ -632,7 +632,7 @@ class ImprintPuzzleMoEOverlay:
         # Strict A -> B -> C(0) -> A relay arena for puzzle chunk/piece delivery
         self.relay = Q1RoleCycleArena(512 * 1024**2, self.device)
         self._stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
-        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aircolibri-puzzle-B")
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quintessentia-puzzle-B")
         self._future = None
         self._pending_tag: Optional[Tuple[int, Tuple[int, ...]]] = None
 

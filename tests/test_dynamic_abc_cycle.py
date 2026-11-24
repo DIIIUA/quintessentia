@@ -207,8 +207,8 @@ def test_retiring_pages_isolate_live_cuda_readers_and_strict_abc_gpu():
 @pytest.mark.parametrize("kind", ["granitemoe", "olmoe"])
 @torch.no_grad()
 def test_granite_olmoe_dynamic_abc_parity_and_invariants_gpu(tmp_path, kind):
-    from aircolibri_cli.model_source import open_model_source
-    from src.aircolibri_integrated import AirColibriModel
+    from quintessentia_cli.model_source import open_model_source
+    from src.quintessentia_integrated import QuintessentiaModel
     from test_probability_warmup import make_model
 
     make_model(tmp_path, kind)
@@ -223,13 +223,13 @@ def test_granite_olmoe_dynamic_abc_parity_and_invariants_gpu(tmp_path, kind):
     )
     steps = ([1, 4, 6, 8], [7], [9], [11], [13], [15], [17], [19])
     expected = []
-    with AirColibriModel(str(tmp_path), model_source=open_model_source(tmp_path), **kwargs) as base:
+    with QuintessentiaModel(str(tmp_path), model_source=open_model_source(tmp_path), **kwargs) as base:
         past = None
         for tokens in steps:
             logits, past = base._forward_step(torch.tensor([tokens]), past_key_values=past)
             expected.append((logits.cpu(), [(l.keys.cpu(), l.values.cpu()) for l in past.layers]))
 
-    with AirColibriModel(str(tmp_path), model_source=open_model_source(tmp_path), **kwargs) as engine:
+    with QuintessentiaModel(str(tmp_path), model_source=open_model_source(tmp_path), **kwargs) as engine:
         warm = engine.enable_probability_warmup(
             region_experts=4,
             gpu_budget_bytes=2**20,

@@ -102,7 +102,7 @@ def test_coupled_reader_runs_through_resident_and_streamed_relay(monkeypatch):
     import copy
     import src.mirror_micro_agents_nvrtc as micro
     from src.binary_halving_q1 import AirLLMLazyBinaryHalvingRunner
-    from test_colibri_cube_blueprint import _ToyCausalLM
+    from test_quintessentia_cube_blueprint import _ToyCausalLM
     torch.manual_seed(722)
     base=_ToyCausalLM(n_layers=3,h=1024,vocab=64).bfloat16().eval()
     raw=[{k:v.clone() for k,v in layer.state_dict().items()} for layer in base.model.layers]

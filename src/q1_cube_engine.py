@@ -630,7 +630,7 @@ def q1_linear_streamed(
     use_cuda_nvrtc = use_nvrtc and device.type == "cuda" and flat_x.dtype == torch.bfloat16
 
     if use_cuda_nvrtc:
-        from src.colibri_q1_cube_nvrtc import launch_q1_plane_gemv
+        from src.quintessentia_q1_cube_nvrtc import launch_q1_plane_gemv
 
         x_c = flat_x.contiguous()
         for cube in selected_cubes:
@@ -762,7 +762,7 @@ def q1_radar_linear(
     m, _ = flat_x.shape
     n, _ = radar_pack.shape
     if x.device.type == "cuda" and flat_x.dtype == torch.bfloat16:
-        from src.colibri_q1_cube_nvrtc import launch_q1_adaptive_radar_gemv
+        from src.quintessentia_q1_cube_nvrtc import launch_q1_adaptive_radar_gemv
 
         y_out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
         launch_q1_adaptive_radar_gemv(
@@ -912,7 +912,7 @@ def q1_cubes_from_packed(
     c_tile: int = 128,
     device: Optional[torch.device | str] = None,
 ) -> Q1CubeMatrix:
-    """Bitwise-convert Colibri Q4/Q6/Q8 packed tensors to 2D Q1CubeMatrix without float round-trip."""
+    """Bitwise-convert Quintessentia Q4/Q6/Q8 packed tensors to 2D Q1CubeMatrix without float round-trip."""
     if bits not in (4, 6, 8):
         raise ValueError(f"bits must be 4, 6, or 8, got {bits}")
     if group_size not in (16, 32, 64):
@@ -1000,7 +1000,7 @@ def radar_pack_from_packed(
     c_tile: int = 64,
     device: Optional[torch.device | str] = None,
 ) -> Q1RadarPack:
-    """Bitwise-convert Colibri Q4/Q6 packed tensors directly into contiguous Q1RadarPack."""
+    """Bitwise-convert Quintessentia Q4/Q6 packed tensors directly into contiguous Q1RadarPack."""
     lo = packed["packed_lo"]
     n = int(lo.shape[0])
     k = int(lo.shape[1]) if bits == 8 else int(lo.shape[1]) * 2
@@ -1228,7 +1228,7 @@ def _execute_q1_batches_on_arena(
     )
 
     if use_cuda_nvrtc:
-        from src.colibri_q1_cube_nvrtc import launch_q1_multiplane_gemv
+        from src.quintessentia_q1_cube_nvrtc import launch_q1_multiplane_gemv
 
     arena.stage_batch_into_B(batches[0], p_act)
     n_batches = len(batches)

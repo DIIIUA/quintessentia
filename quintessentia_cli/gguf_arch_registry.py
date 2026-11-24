@@ -1,7 +1,7 @@
 """Extended zero-mmap GGUF architecture, config, weight-conversion, and tokenizer registry.
 
 ``transformers 5.22.2`` natively ships zero-gguf-package GGUF converters for only three
-architectures (``qwen35``, ``qwen35moe``, ``lfm2``). This module extends AirColibri's pure
+architectures (``qwen35``, ``qwen35moe``, ``lfm2``). This module extends Quintessentia's pure
 positioned-read GGUF pipeline (zero ``mmap``, zero external ``gguf`` PyPI package, zero sidecar
 files) across 35+ dense, MoE, and SSM/hybrid CausalLM families.
 """

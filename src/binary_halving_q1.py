@@ -351,7 +351,7 @@ class BinaryHalvingQ1Linear(nn.Module):
         return w.to(dtype)
 
     def _forward_cuda_fast(self, flat: torch.Tensor, p_use: int) -> torch.Tensor:
-        from src.colibri_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
+        from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
         y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=flat.device)
         if flat.shape[0] == 0:
             return y_out
@@ -403,7 +403,7 @@ class BinaryHalvingQ1Linear(nn.Module):
             return torch.empty((0, self.out_features), dtype=flat.dtype, device=dev)
 
         if self.use_fwht and dev.type == "cuda" and flat.dtype == torch.bfloat16:
-            from src.colibri_q1_cube_nvrtc import launch_ideal_q1_fwht_gemv
+            from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_fwht_gemv
             y_acc = torch.zeros((m, self.out_features), dtype=torch.float32, device=dev)
             y_delta = torch.empty((m, self.out_features), dtype=torch.float32, device=dev)
             used = 0
@@ -580,7 +580,7 @@ class BinaryHalvingMoEExperts(nn.Module):
         if flat.shape[0] == 0:
             return torch.empty((*x.shape[:-1], self.out_features), dtype=x.dtype, device=x.device)
         if self.use_fwht and flat.device.type == "cuda" and flat.dtype == torch.bfloat16:
-            from src.colibri_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
+            from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
             y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=flat.device)
             if flat.shape[0] >= 8:
                 launch_ideal_q1_b1_mma(
@@ -1457,7 +1457,7 @@ class LazyMoEBinaryHalvingCache:
             self._expert_relay = Q1RoleCycleArena(256 * 1024**2, self.device)
             if self.device.type == "cuda":
                 self._expert_relay_stream = torch.cuda.Stream(device=self.device)
-            self._expert_relay_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aircolibri-moe-B")
+            self._expert_relay_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quintessentia-moe-B")
 
         # Telemetry
         self.hits: int = 0
@@ -1643,7 +1643,7 @@ class LazyMoEBinaryHalvingCache:
         if flat.shape[0] == 0:
             return torch.empty((*x.shape[:-1], out_features), dtype=x.dtype, device=x.device)
         if self.use_fwht and flat.device.type == "cuda" and flat.dtype == torch.bfloat16:
-            from src.colibri_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
+            from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
             y_out = torch.empty((flat.shape[0], out_features), dtype=torch.bfloat16, device=flat.device)
             if (self.micro_agent_tol is not None and flat.shape[0] == 1 and self.group_size == 64
                     and in_features >= 1024 and out_features >= 512):
@@ -2409,7 +2409,7 @@ class AirLLMLazyBinaryHalvingRunner:
             self._relay = Q1RoleCycleArena(max(1, max_bytes), self.device)
             if self.device.type == "cuda":
                 self._relay_prepare_stream = torch.cuda.Stream(device=self.device)
-            self._relay_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aircolibri-cube-B")
+            self._relay_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quintessentia-cube-B")
         return self
 
     def _prepare_relay(self, layer_idx: int) -> None:
@@ -2879,10 +2879,10 @@ def attach_q1_cubes_to_engine(
     mirror_v4_trunk: bool = False,
 ) -> AirLLMLazyBinaryHalvingRunner:
     """Attach the unified Binary Halving Q1 Cube runner (resident head + AirLLM streamed tail + L1/L2 MoE)
-    onto an existing `AirColibriModel` instance without altering disk streaming invariants.
+    onto an existing `QuintessentiaModel` instance without altering disk streaming invariants.
     """
     device = torch.device(getattr(eng, "device", "cuda:0"))
-    # Detach existing AirColibriModel pipeline hooks & release unused BF16 ring arena
+    # Detach existing QuintessentiaModel pipeline hooks & release unused BF16 ring arena
     for attr in ("_hook_handles", "_pipeline_hooks"):
         handles = getattr(eng, attr, None)
         if handles:
@@ -2895,7 +2895,7 @@ def attach_q1_cubes_to_engine(
             pipe.close()
         except Exception:
             pass
-        from src.aircolibri_integrated import _NoStreamingPipeline
+        from src.quintessentia_integrated import _NoStreamingPipeline
         eng.pipeline = _NoStreamingPipeline()
     wm = getattr(eng, "weight_manager", None)
     if wm is not None:

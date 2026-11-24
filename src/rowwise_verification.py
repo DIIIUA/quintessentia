@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
-from aircolibri_cli.thought_buffer import capture_cache_snapshot
+from quintessentia_cli.thought_buffer import capture_cache_snapshot
 
 
 class RowwiseVerification:

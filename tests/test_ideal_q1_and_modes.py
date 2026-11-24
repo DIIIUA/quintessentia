@@ -6,10 +6,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from aircolibri_cli.cli import build_parser
-from aircolibri_cli.unified_runtime import (
-    AirColibriUnifiedEngine,
-    ColibriSpecGate,
+from quintessentia_cli.cli import build_parser
+from quintessentia_cli.unified_runtime import (
+    QuintessentiaUnifiedEngine,
+    QuintessentiaSpecGate,
     GiB,
     MiB,
     plan_for_checkpoint,
@@ -178,7 +178,7 @@ def test_ideal_q1_math_beats_naive_q1_and_preserves_q4_q6_exactness_cpu():
     assert cos_ladder[0] < cos_ladder[1] < cos_ladder[2]
     assert cos_ladder[2] > 0.99
 
-    # Ideal Q2 & Colibri Q8
+    # Ideal Q2 & Quintessentia Q8
     pk_q2 = pack_weight(w_bf16, bits=2, group_size=64, device="cpu")
     w_q2 = unpack_weight(pk_q2, group_size=64, dtype=torch.float32)
     cos_q2 = float(
@@ -206,7 +206,7 @@ def test_all_6_modes_cpu_only_end_to_end_zero_cuda(tmp_path, monkeypatch):
     forbid_cuda(monkeypatch)
 
     for fmt in ("q1", "q2", "q4", "q6", "q8", "bf16"):
-        with AirColibriUnifiedEngine(
+        with QuintessentiaUnifiedEngine(
             tmp_path,
             device="cpu",
             weight_format=fmt,
@@ -339,7 +339,7 @@ def test_unified_engine_all_6_modes_progressive_moe_and_q1_speculation_cuda(tmp_
     # 1. All 6 weight_formats on GPU-first + Q1 LM head telemetry + progressive Q1 takeover
     q1_ref_answer = None
     for fmt in ("q1", "q2", "q4", "q6", "q8", "bf16"):
-        with AirColibriUnifiedEngine(
+        with QuintessentiaUnifiedEngine(
             lm_dir,
             cpu_first=False,
             weight_format=fmt,
@@ -361,7 +361,7 @@ def test_unified_engine_all_6_modes_progressive_moe_and_q1_speculation_cuda(tmp_
                 assert "effective_bits" in q1_lh and "vocab_rows_pruned_pct" in q1_lh
 
     # 2. Lossless Q1 self-speculation on weight_format="q1" (planes=4 -> draft active_planes=2 -> full verify planes=4)
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         lm_dir,
         cpu_first=False,
         weight_format="q1",
@@ -372,17 +372,17 @@ def test_unified_engine_all_6_modes_progressive_moe_and_q1_speculation_cuda(tmp_
         max_context_tokens=128,
         prefill_chunk_tokens=8,
     ) as u_spec:
-        orig_pick = ColibriSpecGate.pick_depth
-        ColibriSpecGate.pick_depth = lambda self_g, src, probs: min(len(probs), self_g.max_drafts)
+        orig_pick = QuintessentiaSpecGate.pick_depth
+        QuintessentiaSpecGate.pick_depth = lambda self_g, src, probs: min(len(probs), self_g.max_drafts)
         try:
             done_spec = list(u_spec.stream_chat(prompt, max_new_tokens=5, enable_thinking=False, stop_on_eos=False))[-1]
         finally:
-            ColibriSpecGate.pick_depth = orig_pick
+            QuintessentiaSpecGate.pick_depth = orig_pick
         assert done_spec["answer_text"] == q1_ref_answer
         assert done_spec["metrics"]["spec_gate"]["q1_verifies"] > 0
 
     # 3. Progressive CPU->GPU takeover with weight_format="q1" adopts IdealQ1LMHead
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         lm_dir,
         progressive_start=True,
         weight_format="q1",
@@ -406,7 +406,7 @@ def test_unified_engine_all_6_modes_progressive_moe_and_q1_speculation_cuda(tmp_
     moe_dir.mkdir()
     _make_tiny_olmoe(moe_dir, hidden_size=128, intermediate_size=128, num_layers=3, num_experts=8)
     for fmt in ("q1", "q2", "q8"):
-        with AirColibriUnifiedEngine(
+        with QuintessentiaUnifiedEngine(
             moe_dir,
             cpu_first=False,
             weight_format=fmt,
@@ -421,7 +421,7 @@ def test_unified_engine_all_6_modes_progressive_moe_and_q1_speculation_cuda(tmp_
             assert done_m["metrics"]["generated_tokens"] == 4
 
     # 5. Progressive MoE CPU -> GPU takeover with weight_format="q1", q1_planes=4 (exercises _adopt_all + adopt_cpu_packed)
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         moe_dir,
         progressive_start=True,
         weight_format="q1",

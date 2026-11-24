@@ -3,7 +3,7 @@
 This is a historical development record between v1.1.0 and v1.2.0. Its individual
 results are not a fresh release-wide rerun or a universal-support claim. See
 [final release validation](RELEASE_1_2_0.md) for the later census and regression suite.
-Raw reports are in `D:\Air-Colibri Storage\development_20261118`.
+Raw reports are in `D:\Quintessentia Storage\development_20261118`.
 
 ## Active scope
 
@@ -96,7 +96,7 @@ census is a separate ordinary-runtime startup/decode/state-continuation test.
 ## Final regression and timing results
 
 `full_regression_v3.xml`: **180 passed, 10 skipped**, 214.83 seconds. Seven skips require
-the removed compatible native Qwen3.5-9B fixture; three require absent native Colibri weights.
+the removed compatible native Qwen3.5-9B fixture; three require absent native Quintessentia weights.
 These are unavailable fixtures, not successful executions. The original eight failing
 staging assertions pass unchanged, along with the new no-whole-shard-map and producer tests.
 

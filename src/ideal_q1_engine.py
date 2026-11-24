@@ -613,7 +613,7 @@ class IdealQ1Linear(nn.Module):
             return torch.empty((*orig_shape[:-1], self.out_features), dtype=x.dtype, device=x.device)
 
         if x.device.type == "cuda" and x.dtype == torch.bfloat16:
-            from src.colibri_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
+            from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
 
             y_out = torch.empty((m, self.out_features), dtype=torch.bfloat16, device=x.device)
             if m >= 8:
@@ -795,7 +795,7 @@ class IdealQ1LMHead(nn.Module):
             self._total_vocab_rows_evaluated += m * self.vocab_size
             self._total_plane_rows_evaluated += m * self.vocab_size * p_act
             if is_cuda_bf16:
-                from src.colibri_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
+                from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
                 y_out = torch.empty((m, self.vocab_size), dtype=torch.bfloat16, device=x.device)
                 if m >= 8:
                     launch_ideal_q1_b1_mma(
@@ -831,7 +831,7 @@ class IdealQ1LMHead(nn.Module):
         x_norm = float(x_scaled.norm(dim=-1)[0].item())
 
         if is_cuda_bf16:
-            from src.colibri_q1_cube_nvrtc import launch_ideal_q1_fwht_gemv
+            from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_fwht_gemv
             y_acc = torch.empty((1, self.vocab_size), dtype=torch.float32, device=x.device)
             launch_ideal_q1_fwht_gemv(
                 flat_x.contiguous(),
@@ -1025,7 +1025,7 @@ class MultiStratumLinear(nn.Module):
             from src.quantized_projection import unpack_weight
             for p in self.stratum_dicts:
                 if x.device.type == "cuda" and flat_x.dtype == torch.bfloat16:
-                    from src.colibri_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4
+                    from src.quintessentia_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4
                     if can_use_fused_dense_q4(flat_x, p["packed_lo"], p["qscale"], p["qzero"], self.group_size):
                         y_acc += fused_dense_linear_q4(flat_x, p["packed_lo"], p["qscale"], p["qzero"], None, self.group_size).float()
                         continue
@@ -1034,9 +1034,9 @@ class MultiStratumLinear(nn.Module):
         else:
             for p in self.stratum_dicts:
                 if x.device.type == "cuda" and flat_x.dtype == torch.bfloat16:
-                    from src.colibri_q1_cube_nvrtc import launch_colibri_q2_fwht_gemv
+                    from src.quintessentia_q1_cube_nvrtc import launch_quintessentia_q2_fwht_gemv
                     y_s = torch.empty((flat_x.shape[0], self.out_features), dtype=torch.float32, device=x.device)
-                    launch_colibri_q2_fwht_gemv(
+                    launch_quintessentia_q2_fwht_gemv(
                         flat_x.contiguous(),
                         p["packed_lo"].to(x.device), p["qscale"].to(x.device), p["qzero"].to(x.device),
                         p["row_scale"].to(x.device), p["col_scale"].to(x.device), y_s,

@@ -15,7 +15,7 @@ from accelerate.utils import set_module_tensor_to_device
 class NativeMTPHead(nn.Module):
     def __init__(self, engine, path=None, budget_bytes=128*2**20):
         super().__init__()
-        from aircolibri_cli.model_source import PreadSafetensorsReader, read_safetensors_header
+        from quintessentia_cli.model_source import PreadSafetensorsReader, read_safetensors_header
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
             Qwen3_5DecoderLayer, Qwen3_5RMSNorm, Qwen3_5TextRotaryEmbedding)
         if engine.config.model_type != "qwen3_5_text":

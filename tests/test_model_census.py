@@ -11,7 +11,7 @@ from benchmarks import model_census
 
 class CensusCompletionTest(unittest.TestCase):
     def test_late_controller_poll_keeps_completed_reports(self):
-        with tempfile.TemporaryDirectory(prefix='aircolibri-census-') as directory:
+        with tempfile.TemporaryDirectory(prefix='quintessentia-census-') as directory:
             output = Path(directory)
             entries = [{'model':'first'}, {'model':'last'}]
 

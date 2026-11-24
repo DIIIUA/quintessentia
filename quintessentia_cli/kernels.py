@@ -1,4 +1,4 @@
-"""Standalone NVRTC CUDA Kernel Suite for AirColibri Unified Public Runtime.
+"""Standalone NVRTC CUDA Kernel Suite for Quintessentia Unified Public Runtime.
 
 Includes:
 1. `GrandUnifiedKernels`:
@@ -21,7 +21,7 @@ from __future__ import annotations
 import ctypes
 import torch
 
-from src.colibri_nvrtc import _load_driver_and_nvrtc
+from src.quintessentia_nvrtc import _load_driver_and_nvrtc
 
 
 UNIFIED_CUDA_SRC = r"""

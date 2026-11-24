@@ -18,7 +18,7 @@ from src.bounded_memory_manager import (
 from src.quantization_q4 import (
     Q4_GROUP_SIZE,
     Q4_SCRATCH_ELEMS,
-    ColibriQ4Linear,
+    QuintessentiaQ4Linear,
     _compute_tile_rows,
     dequantize_q4_tensor,
     is_q4_quantizable,
@@ -27,7 +27,7 @@ from src.quantization_q4 import (
     quantize_tensor_q4,
 )
 
-MODEL_DIR = os.environ.get("AIRCOLIBRI_TEST_MODEL") or os.path.join(
+MODEL_DIR = os.environ.get("QUINTESSENTIA_TEST_MODEL") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "deepseek-v4-9b-colibri"
 )
 HAVE_MODEL = os.path.isfile(os.path.join(MODEL_DIR, "model-00000.safetensors"))
@@ -57,7 +57,7 @@ class TestQuantizationQ4(unittest.TestCase):
         ref = torch.stack([lo, hi], dim=-1).reshape(2, Q4_GROUP_SIZE) * scales + zeros
         self.assertTrue(torch.equal(w_rec, ref))
 
-    @unittest.skipUnless(HAVE_MODEL, "local Colibri model weights not present")
+    @unittest.skipUnless(HAVE_MODEL, "local Quintessentia model weights not present")
     def test_q4_layout_composition_no_lut_and_exact_stride(self):
         """Условие D17 #1 + Z5: в layout.specs нет LUT-тензоров, только qweight/scales/zeros и bf16-остатки."""
         wm = StableWeightManager(
@@ -134,13 +134,13 @@ class TestQuantizationQ4(unittest.TestCase):
         _ = F.linear(x.reshape(-1, 4096), _warm_scratch[: tile_rows * 4096].view(tile_rows, 4096))
         del _warm_scratch, _
 
-        # Базу VRAM снимаем ДО выделения scratch (12 MiB) и ColibriQ4Linear (условие D20 #1)
+        # Базу VRAM снимаем ДО выделения scratch (12 MiB) и QuintessentiaQ4Linear (условие D20 #1)
         torch.cuda.synchronize()
         base_alloc = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
 
         scratch = torch.empty(Q4_SCRATCH_ELEMS, dtype=torch.bfloat16, device=device)
-        mod = ColibriQ4Linear(
+        mod = QuintessentiaQ4Linear(
             out_features=12288,
             in_features=4096,
             scratch_provider=lambda _d: scratch,
@@ -183,7 +183,7 @@ class TestQuantizationQ4(unittest.TestCase):
             f"Pre-scratch PeakVRAM too high: {peak_from_pre_scratch_mib:.2f} MiB",
         )
 
-    @unittest.skipUnless(HAVE_MODEL, "local Colibri model weights not present")
+    @unittest.skipUnless(HAVE_MODEL, "local Quintessentia model weights not present")
     def test_q4_real_layer_weight_cosine_f64(self):
         min_cos = 1.0
         for l_idx in (0, 3):
@@ -204,7 +204,7 @@ class TestQuantizationQ4(unittest.TestCase):
                     min_cos = min(min_cos, cos)
         self.assertGreaterEqual(min_cos, 0.995)
 
-    @unittest.skipUnless(HAVE_MODEL, "local Colibri model weights not present")
+    @unittest.skipUnless(HAVE_MODEL, "local Quintessentia model weights not present")
     def test_lazy_embed_lookup_equivalence(self):
         globals_path = os.path.join(MODEL_DIR, "model-globals.safetensors")
         gmap = LazyGlobalsMap(globals_path, dtype=torch.bfloat16)

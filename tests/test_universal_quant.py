@@ -76,7 +76,7 @@ class FakeExpertSource:
 @pytest.mark.parametrize("bits", [4, 6])
 def test_routed_kernel_cache_eviction_prefill_and_math_guard(bits):
     from src.quantized_experts import QuantizedExpertCache
-    from aircolibri_cli.model_source import _fast_moe_dispatch
+    from quintessentia_cli.model_source import _fast_moe_dispatch
     torch.manual_seed(67)
     source = FakeExpertSource()
     # Deliberately eight slots for sixteen experts: force eviction and cross-layer keys.
@@ -122,9 +122,9 @@ def test_unified_ring_experts_session_cancel_and_recovery(tmp_path, monkeypatch,
     from safetensors.torch import save_file
     from transformers import AutoModelForCausalLM, OlmoeConfig
     from test_model_source import _write_tiny_hf_tokenizer
-    from aircolibri_cli import unified_runtime as runtime
-    from aircolibri_cli.model_source import open_model_source
-    from src.aircolibri_integrated import AirColibriModel
+    from quintessentia_cli import unified_runtime as runtime
+    from quintessentia_cli.model_source import open_model_source
+    from src.quintessentia_integrated import QuintessentiaModel
     from src.quantized_projection import projection_stats
     torch.manual_seed(17)
     folder = tmp_path / "olmoe"
@@ -143,7 +143,7 @@ def test_unified_ring_experts_session_cancel_and_recovery(tmp_path, monkeypatch,
     save_file({k: v.contiguous() for k, v in model.state_dict().items()}, str(folder / "model.safetensors"))
     del model
     resident_logits = []
-    with AirColibriModel(str(folder), weight_format=f"q{bits}", universal_quantization=True,
+    with QuintessentiaModel(str(folder), weight_format=f"q{bits}", universal_quantization=True,
                          vram_resident_layers=5, model_source=open_model_source(folder),
                          expert_cache_bytes=64*1024**2) as resident:
         past = None
@@ -158,7 +158,7 @@ def test_unified_ring_experts_session_cancel_and_recovery(tmp_path, monkeypatch,
         return profile, replace(plan, full_residency=False, resident_layers=1, ring_slots=3), mtp
 
     monkeypatch.setattr(runtime, "plan_for_checkpoint", force_ring)
-    with runtime.AirColibriUnifiedEngine(cpu_first=False, model_dir=folder, weight_format=f"q{bits}", verbose=False,
+    with runtime.QuintessentiaUnifiedEngine(cpu_first=False, model_dir=folder, weight_format=f"q{bits}", verbose=False,
                                         max_context_tokens=256, prefill_chunk_tokens=16) as engine:
         assert engine.engine.num_slots == 3
         assert engine.engine.tail_to_head_prefetch

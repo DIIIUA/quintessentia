@@ -24,12 +24,12 @@ from src.quantized_projection import PackedLinear, pack_weight, unpack_weight
 
 
 SMOLLM2_CKPT = Path(
-    r"D:\Air-Colibri Storage\release_validation_1_2_0\downloaded\SmolLM2-135M-Instruct\model.safetensors"
+    r"D:\Quintessentia Storage\release_validation_1_2_0\downloaded\SmolLM2-135M-Instruct\model.safetensors"
 )
 
 
 @pytest.mark.parametrize("bits", [4, 6])
-def test_q1_positional_equivalence_to_colibri_q4_q6_exact(bits):
+def test_q1_positional_equivalence_to_quintessentia_q4_q6_exact(bits):
     torch.manual_seed(123)
     w = torch.randn(192, 576, dtype=torch.bfloat16) * 0.05
     ref_unpacked = unpack_weight(pack_weight(w, bits=bits, group_size=64), group_size=64, dtype=torch.bfloat16)
@@ -264,7 +264,7 @@ def test_packed_linear_active_planes_cpu_matches_q1_unbiased(bits):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("K,GS", [(256, 16), (16384, 64), (16384, 16)])
 def test_nvrtc_all_5_kernels_gs16_and_large_k_smem_cuda(K, GS):
-    from src.colibri_q1_cube_nvrtc import (
+    from src.quintessentia_q1_cube_nvrtc import (
         launch_q1_adaptive_radar_gemv,
         launch_q1_multiplane_gemv,
         launch_q1_packed_trunc_gemv,
@@ -388,16 +388,16 @@ def test_q1_streamed_modules_and_packed_active_planes_cuda():
 @torch.no_grad()
 def test_q1_speculation_preserves_tokens_and_restores_planes(tmp_path, monkeypatch):
     from test_cpu_independence import tiny_checkpoint
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     from src.general_speculation import GeneralSpeculation, Q1SkeletonDrafter
 
     tiny_checkpoint(tmp_path)
     prompt = [3, 7, 4, 9]
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", weight_format="q4", speculation="off", verbose=False) as base:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", weight_format="q4", speculation="off", verbose=False) as base:
         events_base = list(base._stream_token_ids(prompt, 8, False, 0, None))
         expected = [t for ev in events_base if ev["kind"] == "tokens" for t in ev["new_ids"]]
 
-    with AirColibriUnifiedEngine(tmp_path, device="cpu", weight_format="q4", speculation="lookup", verbose=False) as u:
+    with QuintessentiaUnifiedEngine(tmp_path, device="cpu", weight_format="q4", speculation="lookup", verbose=False) as u:
         u.speculator.close()
         u.speculator = GeneralSpeculation(u, mode="q1")
         events = list(u._stream_token_ids(prompt, 8, False, 0, None))
@@ -434,17 +434,17 @@ def test_q1_speculation_preserves_tokens_and_restores_planes(tmp_path, monkeypat
 @torch.no_grad()
 def test_q1_speculation_cuda_q1_and_auto_preserves_tokens(tmp_path):
     from test_cpu_independence import tiny_checkpoint
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     from src.general_speculation import GeneralSpeculation
 
     tiny_checkpoint(tmp_path)
     prompt = [3, 7, 4, 9]
-    with AirColibriUnifiedEngine(tmp_path, device="auto", cpu_first=False, weight_format="q4", speculation="off", verbose=False) as base:
+    with QuintessentiaUnifiedEngine(tmp_path, device="auto", cpu_first=False, weight_format="q4", speculation="off", verbose=False) as base:
         events_base = list(base._stream_token_ids(prompt, 8, False, 0, None))
         expected = [t for ev in events_base if ev["kind"] == "tokens" for t in ev["new_ids"]]
 
     for mode in ("q1", "auto"):
-        with AirColibriUnifiedEngine(tmp_path, device="auto", cpu_first=False, weight_format="q4", speculation="lookup", verbose=False) as u:
+        with QuintessentiaUnifiedEngine(tmp_path, device="auto", cpu_first=False, weight_format="q4", speculation="lookup", verbose=False) as u:
             u.speculator.close()
             u.speculator = GeneralSpeculation(u, mode=mode)
             assert u.engine.device.type == "cuda"

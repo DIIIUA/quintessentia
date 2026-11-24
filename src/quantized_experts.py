@@ -210,7 +210,7 @@ class QuantizedExpertCache:
             keep_cpu = self.bits in (1, 2)
             planes = getattr(self, "q1_planes", 1)
             if self.bits in (4, 6, 8) and self.device.type == "cuda":
-                from src.colibri_q1_cube_nvrtc import launch_colibri_pack_affine
+                from src.quintessentia_q1_cube_nvrtc import launch_quintessentia_pack_affine
                 m_cnt = len(miss_sorted)
                 self.conversions += m_cnt
                 gu_cat = torch.cat((g, u), dim=1).contiguous()
@@ -219,11 +219,11 @@ class QuantizedExpertCache:
                 dn_specs = packed_specs("weight", (self.H, self.I), self.bits, self.group_size)
                 gu_p = {k: torch.empty((m_cnt, *sh), dtype=dt, device=self.device) for k, (sh, dt) in gu_specs.items()}
                 dn_p = {k: torch.empty((m_cnt, *sh), dtype=dt, device=self.device) for k, (sh, dt) in dn_specs.items()}
-                launch_colibri_pack_affine(
+                launch_quintessentia_pack_affine(
                     gu_cat, gu_p["packed_lo"], gu_p.get("packed_hi"), gu_p["qscale"], gu_p["qzero"],
                     bits=self.bits, group_size=self.group_size,
                 )
-                launch_colibri_pack_affine(
+                launch_quintessentia_pack_affine(
                     d_c, dn_p["packed_lo"], dn_p.get("packed_hi"), dn_p["qscale"], dn_p["qzero"],
                     bits=self.bits, group_size=self.group_size,
                 )
@@ -303,7 +303,7 @@ class QuantizedExpertCache:
             and self.device.type == "cuda"
             and dtype in (torch.bfloat16, torch.float32)
         ):
-            from src.colibri_q1_cube_nvrtc import launch_colibri_quant_dequant_affine, launch_colibri_unpack_affine
+            from src.quintessentia_q1_cube_nvrtc import launch_quintessentia_quant_dequant_affine, launch_quintessentia_unpack_affine
             int_ids = [int(e) for e in ids]
             hit_entries = [None] * len(int_ids)
             miss_order = []
@@ -335,16 +335,16 @@ class QuantizedExpertCache:
                 self.conversions += len(miss_sorted)
                 if dtype == torch.bfloat16:
                     mg_o, mu_o, md_o = mg.contiguous(), mu.contiguous(), md.contiguous()
-                    launch_colibri_quant_dequant_affine(mg_o, mg_o, bits=self.bits, group_size=self.group_size)
-                    launch_colibri_quant_dequant_affine(mu_o, mu_o, bits=self.bits, group_size=self.group_size)
-                    launch_colibri_quant_dequant_affine(md_o, md_o, bits=self.bits, group_size=self.group_size)
+                    launch_quintessentia_quant_dequant_affine(mg_o, mg_o, bits=self.bits, group_size=self.group_size)
+                    launch_quintessentia_quant_dequant_affine(mu_o, mu_o, bits=self.bits, group_size=self.group_size)
+                    launch_quintessentia_quant_dequant_affine(md_o, md_o, bits=self.bits, group_size=self.group_size)
                 else:
                     mg_o = torch.empty_like(mg, dtype=dtype)
                     mu_o = torch.empty_like(mu, dtype=dtype)
                     md_o = torch.empty_like(md, dtype=dtype)
-                    launch_colibri_quant_dequant_affine(mg, mg_o, bits=self.bits, group_size=self.group_size)
-                    launch_colibri_quant_dequant_affine(mu, mu_o, bits=self.bits, group_size=self.group_size)
-                    launch_colibri_quant_dequant_affine(md, md_o, bits=self.bits, group_size=self.group_size)
+                    launch_quintessentia_quant_dequant_affine(mg, mg_o, bits=self.bits, group_size=self.group_size)
+                    launch_quintessentia_quant_dequant_affine(mu, mu_o, bits=self.bits, group_size=self.group_size)
+                    launch_quintessentia_quant_dequant_affine(md, md_o, bits=self.bits, group_size=self.group_size)
                 del mg, mu, md
                 if len(pending_idx) == len(int_ids) and int_ids == miss_sorted:
                     return mg_o, mu_o, md_o
@@ -358,15 +358,15 @@ class QuantizedExpertCache:
                     gu, dn = hit
                     g_part = _slice_gu_part(gu, 0, self.I)
                     u_part = _slice_gu_part(gu, self.I, 2 * self.I)
-                    launch_colibri_unpack_affine(
+                    launch_quintessentia_unpack_affine(
                         g_part["packed_lo"], g_part.get("packed_hi"), g_part["qscale"], g_part["qzero"],
                         g[i], bits=self.bits, group_size=self.group_size,
                     )
-                    launch_colibri_unpack_affine(
+                    launch_quintessentia_unpack_affine(
                         u_part["packed_lo"], u_part.get("packed_hi"), u_part["qscale"], u_part["qzero"],
                         u[i], bits=self.bits, group_size=self.group_size,
                     )
-                    launch_colibri_unpack_affine(
+                    launch_quintessentia_unpack_affine(
                         dn["packed_lo"], dn.get("packed_hi"), dn["qscale"], dn["qzero"],
                         d[i], bits=self.bits, group_size=self.group_size,
                     )
@@ -382,19 +382,19 @@ class QuantizedExpertCache:
         u = torch.empty_like(g)
         d = torch.empty((len(ids), self.H, self.I), dtype=dtype, device=device)
         if self.bits in (4, 6, 8) and self.device.type == "cuda" and dtype in (torch.bfloat16, torch.float32):
-            from src.colibri_q1_cube_nvrtc import launch_colibri_unpack_affine
+            from src.quintessentia_q1_cube_nvrtc import launch_quintessentia_unpack_affine
             for i, (gu, dn, _) in enumerate(entries):
                 g_part = _slice_gu_part(gu, 0, self.I)
                 u_part = _slice_gu_part(gu, self.I, 2 * self.I)
-                launch_colibri_unpack_affine(
+                launch_quintessentia_unpack_affine(
                     g_part["packed_lo"], g_part.get("packed_hi"), g_part["qscale"], g_part["qzero"],
                     g[i], bits=self.bits, group_size=self.group_size,
                 )
-                launch_colibri_unpack_affine(
+                launch_quintessentia_unpack_affine(
                     u_part["packed_lo"], u_part.get("packed_hi"), u_part["qscale"], u_part["qzero"],
                     u[i], bits=self.bits, group_size=self.group_size,
                 )
-                launch_colibri_unpack_affine(
+                launch_quintessentia_unpack_affine(
                     dn["packed_lo"], dn.get("packed_hi"), dn["qscale"], dn["qzero"],
                     d[i], bits=self.bits, group_size=self.group_size,
                 )
@@ -485,7 +485,7 @@ class QuantizedExpertCache:
         return None
 
     def _fused_shared(self, layer, hidden, valid, weights):
-        from src.colibri_nvrtc import fused_routed_moe_q4, fused_routed_moe_q6, reduce_routed_parts
+        from src.quintessentia_nvrtc import fused_routed_moe_q4, fused_routed_moe_q6, reduce_routed_parts
         memory = self.shared_memory
         lim = getattr(memory, '_resident_layer_limit', 0)
         pinned = getattr(memory, '_pinned_resident_pos', None)
@@ -586,7 +586,7 @@ class QuantizedExpertCache:
             return None
         slot_idx = torch.tensor(slots, device=self.device, dtype=torch.int64)
         route_weights = weights[0, [pos for pos, _ in valid]].contiguous()
-        from src.colibri_nvrtc import fused_routed_moe_q4, fused_routed_moe_q6
+        from src.quintessentia_nvrtc import fused_routed_moe_q4, fused_routed_moe_q6
         self.fused_calls += 1
         gu, dn = self.gu, self.dn
         if self.bits == 4:
@@ -604,7 +604,7 @@ class QuantizedExpertCache:
                 size = int(sm.get("gpu_bytes", 0))
             hits += int(sm.get("hits", 0) or (sm.get("cache_hits", 0) + sm.get("warm_direct_hits", 0)))
             misses += int(sm.get("misses", 0) or sm.get("demand_writes", 0))
-        return {"format": f"colibri_q{self.bits}", "slots": slots, "arena_mib": round(size/1024**2, 2),
+        return {"format": f"quintessentia_q{self.bits}", "slots": slots, "arena_mib": round(size/1024**2, 2),
                 "enabled_layers": sorted(self.enabled_layers), "hits": hits, "misses": misses,
                 "hit_rate": hits/max(1, hits+misses), "conversions": self.conversions,
                 "fused_calls": self.fused_calls, "prefill_batches": self.prefill_batches,

@@ -34,7 +34,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from src.colibri_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
+from src.quintessentia_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
 
 _MIRROR_CUDA_SOURCE = r"""
 __device__ __forceinline__ float bf16_to_f32(unsigned short b) {

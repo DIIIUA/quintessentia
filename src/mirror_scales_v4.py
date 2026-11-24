@@ -203,7 +203,7 @@ class MirrorLoadDispatcher:
 
         self._monitor = None
         if self._sensor_fn is None and self.device.type == "cuda" and torch.cuda.is_available():
-            from aircolibri_cli.gpu_memory import PhysicalVRAMMonitor
+            from quintessentia_cli.gpu_memory import PhysicalVRAMMonitor
             self._monitor = PhysicalVRAMMonitor(self.device)
 
         if safety_reserve_bytes is not None:
@@ -1342,7 +1342,7 @@ class MirrorIsolatedMoEOverlayV4:
             else [None, None]
         )
         self._stream_cursor: int = 0
-        self._io_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aircolibri-v4-io")
+        self._io_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quintessentia-v4-io")
         self._warm_future = None
         self._warm_target_layer: Optional[int] = None
         self._warm_eids: Tuple[int, ...] = ()
@@ -2400,7 +2400,7 @@ def warmup_v4_cuda_kernels(device: torch.device) -> int:
     warmed = 0
     try:
         from src.binary_halving_q1 import carve_q1_cubes_incremental
-        from src.colibri_q1_cube_nvrtc import launch_ideal_q1_fwht_gemv
+        from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_fwht_gemv
 
         w = torch.randn((64, 64), dtype=torch.bfloat16, device=device)
         x = torch.randn((1, 64), dtype=torch.bfloat16, device=device)

@@ -1,4 +1,4 @@
-"""AirColibri Unified Engine:
+"""Quintessentia Unified Engine:
 1. Статическая карта весов (Static Weight Map) — строится 1 раз при старте.
 2. Динамический ярусный кэш (Dynamic Tiered Cache) с настраиваемым бюджетом VRAM (2, 4, 6 ГБ).
 3. Реальное повторное использование памяти (Zero Disk Re-read) — загруженные веса не перечитываются.
@@ -20,7 +20,7 @@ import safetensors
 import safetensors.torch
 import torch
 from src.bounded_memory_manager import SlotArenaLayout
-from src.lfru_cache import ColibriLFRUCache
+from src.lfru_cache import QuintessentiaLFRUCache
 
 
 def _validate_single_attention_branch(keys: Any) -> None:
@@ -232,7 +232,7 @@ class MemoryStandPool:
 
         self.active_stand_idx: int = 0
         self.stand_nbytes = self.layout.slot_stride
-        self.lfru = ColibriLFRUCache(num_slots=num_stands, num_experts=32)
+        self.lfru = QuintessentiaLFRUCache(num_slots=num_stands, num_experts=32)
 
     def place_on_stand(
         self,
@@ -542,8 +542,8 @@ class DynamicTieredCache:
         self.close()
 
 
-class AirColibriEngine:
-    """Единый модернизированный движок AirColibri со статической картой и ярусным кэшем."""
+class QuintessentiaEngine:
+    """Единый модернизированный движок Quintessentia со статической картой и ярусным кэшем."""
 
     def __init__(
         self,
@@ -554,7 +554,7 @@ class AirColibriEngine:
     ):
         self.model_dir = model_dir
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[AirColibri] Initializing on {self.device.type.upper()}: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+        print(f"[Quintessentia] Initializing on {self.device.type.upper()}: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
 
         # 1. Построение статической карты весов (СТРОГО ОДИН РАЗ)
         self.weight_map = StaticWeightMap(model_dir)
@@ -578,7 +578,7 @@ class AirColibriEngine:
         if preload_at_init:
             t0 = time.perf_counter()
             self.cold_init_time_s = self.cache.preload_cache()
-            print(f"[AirColibri] Preload complete in {self.cold_init_time_s:.2f} s | Zero Disk Re-read mode ACTIVE")
+            print(f"[Quintessentia] Preload complete in {self.cold_init_time_s:.2f} s | Zero Disk Re-read mode ACTIVE")
 
     def execute_token_step(
         self,
@@ -651,7 +651,7 @@ class AirColibriEngine:
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def __enter__(self) -> "AirColibriEngine":
+    def __enter__(self) -> "QuintessentiaEngine":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

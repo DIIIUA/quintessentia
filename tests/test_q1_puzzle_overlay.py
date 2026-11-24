@@ -7,8 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aircolibri_cli.cli import build_parser
-from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, MiB
+from quintessentia_cli.cli import build_parser
+from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, MiB
 from src.quantized_projection import pack_weight, unpack_weight
 
 
@@ -51,7 +51,7 @@ def test_cli_puzzle_flags_and_q2_30layer_norm_stability_cpu():
     assert args_def.puzzle_slice_ratio == 0.35
 
     with pytest.raises(ValueError, match="puzzle_slice_ratio"):
-        AirColibriUnifiedEngine(device="cpu", puzzle_overlay=True, puzzle_slice_ratio=1.5)
+        QuintessentiaUnifiedEngine(device="cpu", puzzle_overlay=True, puzzle_slice_ratio=1.5)
 
     # Verify Wave 3/4 Q2 depth fix: 30-layer transformer residual + RMSNorm chain with 8x channel outliers preserves norm & cosine
     torch.manual_seed(2026)
@@ -140,7 +140,7 @@ def test_q1_puzzle_overlay_cpu_only_engine_zero_cuda(tmp_path, monkeypatch):
     _make_tiny_llama(tmp_path, hidden_size=128, intermediate_size=256, num_layers=2, vocab_size=320)
     forbid_cuda(monkeypatch)
 
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         tmp_path,
         device="cpu",
         weight_format="q6",
@@ -206,11 +206,11 @@ def test_nvrtc_puzzle_kernel_abc_arena_and_unified_engine_cuda(tmp_path):
     finally:
         del puz_lin, arena
 
-    # 2. Full AirColibriUnifiedEngine on CUDA (GPU-first & Progressive takeover) with puzzle_overlay=True
+    # 2. Full QuintessentiaUnifiedEngine on CUDA (GPU-first & Progressive takeover) with puzzle_overlay=True
     _make_tiny_llama(tmp_path, hidden_size=128, intermediate_size=256, num_layers=3, vocab_size=320)
     prompt = [{"role": "user", "content": "1 2 3 4 5"}]
 
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         tmp_path,
         cpu_first=False,
         weight_format="q8",
@@ -231,7 +231,7 @@ def test_nvrtc_puzzle_kernel_abc_arena_and_unified_engine_cuda(tmp_path):
 
     # Tight-slot regression: max_slot_mib smaller than one Q8 layer triggers plan.sub_layer_cubes=True,
     # yet puzzle_overlay MUST install Q1PuzzleLinear (not Q1StreamedLinear) with calls > 0!
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         tmp_path,
         cpu_first=False,
         weight_format="q8",
@@ -253,7 +253,7 @@ def test_nvrtc_puzzle_kernel_abc_arena_and_unified_engine_cuda(tmp_path):
         assert puz_t["arena"]["transitions"]["B->A"] == 0
         assert puz_t["arena"]["area_used_bytes"][puz_t["arena"]["standby_area"]] == 0
 
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         tmp_path,
         progressive_start=True,
         weight_format="q6",

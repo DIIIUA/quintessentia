@@ -1072,7 +1072,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 768,
               "arena_mib": 648.0,
               "enabled_layers": [
@@ -1156,7 +1156,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 768,
               "arena_mib": 648.0,
               "enabled_layers": [
@@ -1240,7 +1240,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 768,
               "arena_mib": 648.0,
               "enabled_layers": [
@@ -1349,7 +1349,7 @@
             "mtp_accept_rate_pct": 0.0
           },
           "expert_cache": {
-            "format": "colibri_q4",
+            "format": "quintessentia_q4",
             "slots": 768,
             "arena_mib": 648.0,
             "enabled_layers": [
@@ -1434,7 +1434,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 768,
               "arena_mib": 648.0,
               "enabled_layers": [
@@ -1518,7 +1518,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 768,
               "arena_mib": 648.0,
               "enabled_layers": [
@@ -1620,7 +1620,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q6",
+              "format": "quintessentia_q6",
               "slots": 768,
               "arena_mib": 936.0,
               "enabled_layers": [
@@ -1704,7 +1704,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q6",
+              "format": "quintessentia_q6",
               "slots": 768,
               "arena_mib": 936.0,
               "enabled_layers": [
@@ -1788,7 +1788,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q6",
+              "format": "quintessentia_q6",
               "slots": 768,
               "arena_mib": 936.0,
               "enabled_layers": [
@@ -1897,7 +1897,7 @@
             "mtp_accept_rate_pct": 0.0
           },
           "expert_cache": {
-            "format": "colibri_q6",
+            "format": "quintessentia_q6",
             "slots": 768,
             "arena_mib": 936.0,
             "enabled_layers": [
@@ -1982,7 +1982,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q6",
+              "format": "quintessentia_q6",
               "slots": 768,
               "arena_mib": 936.0,
               "enabled_layers": [
@@ -2066,7 +2066,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q6",
+              "format": "quintessentia_q6",
               "slots": 768,
               "arena_mib": 936.0,
               "enabled_layers": [
@@ -2169,7 +2169,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -2253,7 +2253,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -2337,7 +2337,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -2446,7 +2446,7 @@
             "mtp_accept_rate_pct": 0.0
           },
           "expert_cache": {
-            "format": "colibri_q4",
+            "format": "quintessentia_q4",
             "slots": 700,
             "arena_mib": 590.62,
             "enabled_layers": [
@@ -2531,7 +2531,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -2615,7 +2615,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -2718,7 +2718,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -2881,7 +2881,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -3044,7 +3044,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -3232,7 +3232,7 @@
             "mtp_accept_rate_pct": 0.0
           },
           "expert_cache": {
-            "format": "colibri_q4",
+            "format": "quintessentia_q4",
             "slots": 707,
             "arena_mib": 0.0,
             "enabled_layers": [
@@ -3396,7 +3396,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -3559,7 +3559,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -7423,7 +7423,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -7507,7 +7507,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -7591,7 +7591,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -7700,7 +7700,7 @@
             "mtp_accept_rate_pct": 0.0
           },
           "expert_cache": {
-            "format": "colibri_q4",
+            "format": "quintessentia_q4",
             "slots": 700,
             "arena_mib": 590.62,
             "enabled_layers": [
@@ -7785,7 +7785,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -7869,7 +7869,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 700,
               "arena_mib": 590.62,
               "enabled_layers": [
@@ -7972,7 +7972,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -8138,7 +8138,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -8304,7 +8304,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -8495,7 +8495,7 @@
             "mtp_accept_rate_pct": 0.0
           },
           "expert_cache": {
-            "format": "colibri_q4",
+            "format": "quintessentia_q4",
             "slots": 707,
             "arena_mib": 0.0,
             "enabled_layers": [
@@ -8662,7 +8662,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [
@@ -8828,7 +8828,7 @@
               "mtp_accept_rate_pct": 0.0
             },
             "expert_cache": {
-              "format": "colibri_q4",
+              "format": "quintessentia_q4",
               "slots": 707,
               "arena_mib": 0.0,
               "enabled_layers": [

@@ -8,7 +8,7 @@ import torch
 from src.binary_halving_q1 import AirLLMLazyBinaryHalvingRunner, LazyMoEBinaryHalvingCache
 from src.q1_cube_engine import Q1RoleCycleArena
 from src.streaming_cube_survey import StreamingCubeSurvey, projection_prefix_errors
-from test_colibri_cube_blueprint import _ToyCausalLM
+from test_quintessentia_cube_blueprint import _ToyCausalLM
 
 
 def test_reference_survey_observes_experts_without_duplicate_reads_and_restores_fused():
@@ -171,7 +171,7 @@ def test_cold_B_prepares_cubes_before_handoff_without_recarving_in_A(monkeypatch
                 if relay:
                     assert runner.stats()['relay']['gpu_prepares'] == 2
                     assert len(calls) == 10
-                    assert all(name.startswith('aircolibri-cube-B') for name in calls)
+                    assert all(name.startswith('quintessentia-cube-B') for name in calls)
             finally:
                 runner.close()
         assert torch.equal(outputs[0], outputs[1])

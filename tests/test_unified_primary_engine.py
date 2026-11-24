@@ -5,10 +5,10 @@ from dataclasses import replace
 import torch
 import pytest
 
-from aircolibri_cli.cli import build_parser
-from aircolibri_cli.unified_runtime import (
-    AirColibriUnifiedEngine,
-    ColibriSpecGate,
+from quintessentia_cli.cli import build_parser
+from quintessentia_cli.unified_runtime import (
+    QuintessentiaUnifiedEngine,
+    QuintessentiaSpecGate,
     GiB,
     MiB,
     plan_vram,
@@ -53,11 +53,11 @@ def test_cli_new_flags_and_vram_cube_subdivision_cpu():
     doc_args = parser.parse_args(["doctor", "--max-slot-mib", "2.0"])
     assert doc_args.max_slot_mib == 2.0
 
-    gate = ColibriSpecGate(max_drafts=2)
-    assert ColibriSpecGate.SRC_Q1 == 2
-    assert gate.expected_gain(ColibriSpecGate.SRC_Q1, [0.75, 0.55]) > 1.02
-    gate.record_draft_cost(ColibriSpecGate.SRC_Q1, 0.001)
-    gate.record_result(ColibriSpecGate.SRC_Q1, judged=2, accepted=1, probs=[0.75, 0.55])
+    gate = QuintessentiaSpecGate(max_drafts=2)
+    assert QuintessentiaSpecGate.SRC_Q1 == 2
+    assert gate.expected_gain(QuintessentiaSpecGate.SRC_Q1, [0.75, 0.55]) > 1.02
+    gate.record_draft_cost(QuintessentiaSpecGate.SRC_Q1, 0.001)
+    gate.record_result(QuintessentiaSpecGate.SRC_Q1, judged=2, accepted=1, probs=[0.75, 0.55])
     summary = gate.summary()
     assert summary["q1_verifies"] == 1
     assert summary["q1_proposed"] == 2
@@ -107,12 +107,12 @@ def test_cli_new_flags_and_vram_cube_subdivision_cpu():
 @torch.no_grad()
 def test_cpu_only_survivor_tracker_zero_cuda_zero_disk_and_thought_anchor(tmp_path, monkeypatch):
     from test_cpu_independence import forbid_cuda
-    from aircolibri_cli.model_source import PreadSafetensorsReader
+    from quintessentia_cli.model_source import PreadSafetensorsReader
 
     _make_tiny_llama(tmp_path)
     forbid_cuda(monkeypatch)
 
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         tmp_path,
         device="cpu",
         weight_format="q6",
@@ -171,7 +171,7 @@ def test_cpu_only_survivor_tracker_zero_cuda_zero_disk_and_thought_anchor(tmp_pa
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.no_grad()
 def test_default_unified_primary_dense_and_moe_auto_attach_and_manual_override_cuda(tmp_path, monkeypatch):
-    import aircolibri_cli.unified_runtime as runtime
+    import quintessentia_cli.unified_runtime as runtime
     from test_probability_warmup import make_model
 
     dense_dir = tmp_path / "dense_llama"
@@ -187,7 +187,7 @@ def test_default_unified_primary_dense_and_moe_auto_attach_and_manual_override_c
     monkeypatch.setattr(runtime, "plan_for_checkpoint", force_streaming)
 
     # 1. Default Dense GPU-first auto-attaches DynamicWorkingMemory(cache=None)
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         dense_dir,
         cpu_first=False,
         weight_format="q6",
@@ -226,7 +226,7 @@ def test_default_unified_primary_dense_and_moe_auto_attach_and_manual_override_c
         return profile, replace(plan, full_residency=False, resident_layers=2, ring_slots=3, budget_bytes=budget), mtp
 
     monkeypatch.setattr(runtime, "plan_for_checkpoint", force_moe_streaming)
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         moe_dir,
         cpu_first=False,
         weight_format="q4",
@@ -260,7 +260,7 @@ def test_default_unified_primary_dense_and_moe_auto_attach_and_manual_override_c
 @torch.no_grad()
 def test_progressive_no_pingpong_and_auto_unified_takeover_cuda(tmp_path, monkeypatch):
     import threading
-    import aircolibri_cli.unified_runtime as runtime
+    import quintessentia_cli.unified_runtime as runtime
 
     _make_tiny_llama(tmp_path, hidden_size=128, intermediate_size=256, num_layers=5)
     orig_plan = runtime.plan_for_checkpoint
@@ -271,7 +271,7 @@ def test_progressive_no_pingpong_and_auto_unified_takeover_cuda(tmp_path, monkey
         return profile, replace(plan, full_residency=False, resident_layers=2, ring_slots=3), mtp
 
     monkeypatch.setattr(runtime, "plan_for_checkpoint", streaming_plan)
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         tmp_path,
         progressive_start=True,
         weight_format="q6",
@@ -338,7 +338,7 @@ def test_sub_layer_and_sub_lm_head_q1_batched_streaming_and_q1_speculation_cuda(
 
     # Reference output with speculation="off" under tight 0.125 MiB (128 KiB) per-slot cap
     # (128 KiB < single layer and < lm_head 512*128*2 = 128 KiB BF16 -> triggers both!)
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         tmp_path,
         cpu_first=False,
         weight_format="q6",
@@ -365,7 +365,7 @@ def test_sub_layer_and_sub_lm_head_q1_batched_streaming_and_q1_speculation_cuda(
         assert u_ref.engine.model.lm_head.candidate_calls >= 1
 
     # Q1 self-speculation (SRC_Q1) on the same streamed Q1 engine preserves exact lossless output!
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         tmp_path,
         cpu_first=False,
         weight_format="q6",
@@ -376,14 +376,14 @@ def test_sub_layer_and_sub_lm_head_q1_batched_streaming_and_q1_speculation_cuda(
         prefill_chunk_tokens=8,
     ) as u_q1:
         # Force gate to accept testing depth >= 1 so Q1SkeletonDrafter + RowwiseVerification execute
-        orig_pick = ColibriSpecGate.pick_depth
-        ColibriSpecGate.pick_depth = lambda self_g, src, probs: min(len(probs), self_g.max_drafts)
+        orig_pick = QuintessentiaSpecGate.pick_depth
+        QuintessentiaSpecGate.pick_depth = lambda self_g, src, probs: min(len(probs), self_g.max_drafts)
         try:
             done_q1 = list(
                 u_q1.stream_chat(prompt, max_new_tokens=6, enable_thinking=False, stop_on_eos=False)
             )[-1]
         finally:
-            ColibriSpecGate.pick_depth = orig_pick
+            QuintessentiaSpecGate.pick_depth = orig_pick
         assert done_q1["answer_text"] == ref_text
         sg = done_q1["metrics"]["spec_gate"]
         assert sg["q1_verifies"] > 0

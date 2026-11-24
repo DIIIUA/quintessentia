@@ -37,11 +37,11 @@ def main():
         p.error("At least two trials and tokens are required")
     import psutil
     import torch
-    from aircolibri_cli import unified_runtime as runtime
+    from quintessentia_cli import unified_runtime as runtime
 
     model = Path(args.model).resolve()
     source_hash = hashlib.sha256()
-    for folder in ("aircolibri_cli", "src"):
+    for folder in ("quintessentia_cli", "src"):
         for file in sorted((ROOT/folder).rglob("*")):
             if file.suffix in (".py", ".cu", ".h", ".c"):
                 source_hash.update(file.relative_to(ROOT).as_posix().encode())
@@ -85,7 +85,7 @@ def main():
         return result
     def generate(messages, tokens, *, measured=False):
         if args.anchor:
-            from aircolibri_cli.thought_buffer import InitialProbabilityAnchor
+            from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
             engine._active_thought_anchor = InitialProbabilityAnchor()
         engine.reset_session()
         torch.cuda.synchronize()
@@ -116,7 +116,7 @@ def main():
         return result
     try:
         t0 = time.perf_counter()
-        engine = runtime.AirColibriUnifiedEngine(model_dir=model, weight_format=args.weight_format,
+        engine = runtime.QuintessentiaUnifiedEngine(model_dir=model, weight_format=args.weight_format,
             enable_mtp=False, verbose=False, max_context_tokens=2048, prefill_chunk_tokens=64)
         if args.placement == "granite-dynamic":
             engine.enable_unified_memory(region_experts=12, gpu_budget_bytes=0, host_cache_bytes=64*2**20)

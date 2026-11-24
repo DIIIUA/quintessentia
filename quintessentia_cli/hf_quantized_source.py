@@ -12,7 +12,7 @@ import math
 import threading
 import torch
 
-from aircolibri_cli.model_source import (
+from quintessentia_cli.model_source import (
     HFShardedSource, UnsupportedModelError, _ShapeOnlySlice, raw_text_config_dict,
 )
 

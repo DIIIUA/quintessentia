@@ -12,7 +12,7 @@ import os
 import threading
 from typing import Sequence
 import torch
-from src.colibri_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
+from src.quintessentia_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
 from src.mirror_micro_agents_nvrtc import _MICRO_CUDA_SOURCE
 
 _FABRIC_SOURCE = r'''

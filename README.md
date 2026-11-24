@@ -1,23 +1,23 @@
 <p align="center">
-  <img src="assets/aircolibri-logo.png" width="300" alt="AirColibri — AirLLM-inspired wings meet the Colibrì hummingbird">
+  <img src="assets/quintessentia-logo.png" width="280" alt="Quintessentia — faceted crystal polyhedron bisected by an axis of mirror equality">
 </p>
 
-# AirColibri
+# Quintessentia
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache 2.0"></a>
 </p>
 
-Local inference of supported **Hugging Face and GGUF language models** with bounded layer
-streaming, BF16 or packed Q4/Q6 execution and an OpenAI-compatible LAN server. The
-CPU executor can run on its own; an NVIDIA GPU can join when ready.
+**Quintessentia** is a local inference engine for **Hugging Face and GGUF language models** built around **isolated pure-math mirror equality scales (V4)**, **Q1 binary-halving crystals**, self-contained **NVRTC CUDA kernels**, bounded CPU/GPU streaming, and an OpenAI-compatible LAN server.
 
-**Version 1.2.0 does not support every model.** See [model support](MODEL_SUPPORT.md) for dated
-per-checkpoint evidence, unsupported cases and experimental mechanisms.
-
-AirColibri combines ideas from [AirLLM](https://github.com/lyogavin/airllm) (layer streaming,
-selective weight reads) and [Colibrì](https://github.com/JustVugg/colibri) (tiered placement,
-native MTP speculation) with its own packed Q4/Q6 weights and NVRTC CUDA kernels.
+> **Core architecture (`V4` / `--feedback-mode v4`):** Seven strictly isolated pure-math mirror scales (**M0–M6**) with zero cross-scale coupling and no rigid 3-slot conveyor:
+> - **M0:** Mirror trunk carving (`carve_trunk_mirror_q1`) + differential CUDA Kernel #6 across dense trunk layers (`BinaryHalvingQ1Linear`) and mirror survey (`selection_policy="mirror"`).
+> - **M1 + M2:** Two independent conveyor-free GPU mechanisms — `MirrorLoadDispatcher` (NVML VRAM + GPU/memory utilization + compute-vs-IO load balancing) and `MirrorRegionBreathingPool` (hardware CUDA-event direct admit, entry-cone warm reuse, and immediate exhale).
+> - **M3 + M4:** Cold plateau warmup (`MirrorColdWarmupScale`) and post-prefill region warmup (`MirrorPostPrefillRegionWarmupScale`).
+> - **M5 / M5b:** Continuous algebraic cube depth (`mirror_cube_depth_math`), reversible host bit-plane scars, and differential Q1 expert execution.
+> - **M6:** Pure-math tensor `MirrorProbabilityPath` with late-rising `SPLIT` protection and dynamic entropy-based pruning floor.
+>
+> Validated live on **Qwen3.6-35B-A3B** (24 GiB GGUF, `RTX 3060 Ti 8 GiB`): cold SSD prefill **`19.68 s`**, warm session prefill **`3.95 s`**, peak VRAM **`5,303.8 MiB`** (`0` OOM), **`36.44%`** zero-disk-spike decode layers. Legacy `bf16`, `q4`, `q6`, and `V1–V3` modes remain intact; see [model support](MODEL_SUPPORT.md) for dated per-checkpoint evidence.
 
 <a href="https://buymeacoffee.com/silentfish">
   <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="217" height="60">
@@ -27,8 +27,8 @@ native MTP speculation) with its own packed Q4/Q6 weights and NVRTC CUDA kernels
 ## Requirements
 
 - Optional NVIDIA GPU with CUDA (tested: RTX 3060 Ti 8 GB; smaller budgets require streaming and sufficient room for individual operators). CPU-only execution is available with `--device cpu`.
-- Python 3.12, PyTorch 2.6 with CUDA 12.4 (`requirements.txt`)
-- Windows x64 or Linux
+- Python 3.12, PyTorch with CUDA 12.4 / 12.6 (`requirements.txt`)
+- Windows x64 or Linux / WSL 2 (native `os.pread()` and bundled `nvidia-cuda-nvrtc` discovery supported out of the box)
 
 ```bash
 python -m venv .venv
@@ -45,12 +45,12 @@ it needs no manual converter or second full checkpoint. The specialized Qwen3.5-
 path builds its persistent Q4 cache in `data/q4-g64-cache/`.
 
 ```bash
-aircolibri download https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
+quintessentia download https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct --device cpu
 ```
 
 You can point `--model` at a local folder or place it in `models/`. The loader reads
 single or sharded Hugging Face `.safetensors`, supported single/split `.gguf` files,
-and Colibri per-layer containers. Original checkpoint files are not modified.
+and Quintessentia per-layer containers. Original checkpoint files are not modified.
 Selected MoE expert slices are read on demand rather than loading all experts.
 
 The architecture registry contains adapters for dense attention, MoE and several
@@ -77,17 +77,17 @@ operations without Triton. The specialized Qwen MTP head is not enabled on unrel
 ## Usage
 
 ```bash
-aircolibri doctor                      # GPU, model, VRAM plan, LAN addresses
-aircolibri models                      # numbered local model catalog
-aircolibri ask --model 1 "Hello"        # select the current catalog's first entry
-aircolibri ask "Привет! Кто ты?"       # one answer, streamed
-aircolibri chat                        # multi-turn chat (Ctrl+C stops the current answer)
-aircolibri serve                       # web chat + OpenAI API on :8787, UDP beacon on :8788
-aircolibri discover                    # find AirColibri servers on the LAN
+quintessentia doctor                                          # GPU, model, VRAM plan, LAN addresses
+quintessentia models                                          # numbered local model catalog
+quintessentia ask --model 1 "Hello"                           # select the current catalog's first entry
+quintessentia ask --weight-format q1_cubes --feedback-mode v4 "Привет! Кто ты?"  # V4 pure-math mirror scales
+quintessentia chat                                            # multi-turn chat (Ctrl+C stops the current answer)
+quintessentia serve                                           # web chat + OpenAI API on :8787, UDP beacon on :8788
+quintessentia discover                                        # find Quintessentia servers on the LAN
 ```
 
-On Windows use `aircolibri.cmd` (it picks `.venv` automatically) or `python aircolibri.py`.
-In PowerShell from the program directory, for example: `.\aircolibri.cmd models`.
+On Windows use `quintessentia.cmd` (it picks `.venv` automatically) or `python quintessentia.py`.
+In PowerShell from the program directory, for example: `.\quintessentia.cmd models`.
 
 ### Model downloads and preparation
 
@@ -97,14 +97,14 @@ catalog folder name or a full path. Numbers refer to the current sorted catalog.
 Plain listing and command help do not initialize PyTorch or CUDA.
 
 ```bash
-aircolibri download https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct --directory "D:/Models/SmolLM2-135M" --device cpu --weight-format q6
-aircolibri ask --model "D:/Models/SmolLM2-135M" --device cpu "What is 6 times 7?"
-aircolibri prepare --model "D:/Models/SmolLM2-135M" --device cpu --weight-format q6
+quintessentia download https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct --directory "D:/Models/SmolLM2-135M" --device cpu --weight-format q6
+quintessentia ask --model "D:/Models/SmolLM2-135M" --device cpu "What is 6 times 7?"
+quintessentia prepare --model "D:/Models/SmolLM2-135M" --device cpu --weight-format q6
 ```
 
 `download` defaults to `models/OWNER__REPO`, registers external destinations in the
 local catalog, and performs a finite first-forward check including runtime packing.
-Its `aircolibri-source.json` records `ready`, an unverified download or a failure;
+Its `quintessentia-source.json` records `ready`, an unverified download or a failure;
 downloaded files alone are not a support claim. `--no-verify` skips that forward.
 An unsupported checkpoint reports the error and retains its source files.
 
@@ -124,7 +124,7 @@ records the scope.
 
 ### VRAM modes
 
-AirColibri measures the **free** VRAM at start and plans with it — there are no fixed card profiles.
+Quintessentia measures the **free** VRAM at start and plans with it — there are no fixed card profiles.
 When NVML is available it matches the CUDA device by UUID and uses the lower CUDA/NVML
 free reading, so another process's allocation enters the startup budget. Status and
 `doctor` expose the counters and any NVML fallback diagnostic. This samples startup
@@ -217,7 +217,7 @@ The foreground reads weights once and offers them to a bounded GPU-transfer queu
 before computation. Prepared dense layers can join the same running graph; their live
 per-layer cache follows them. At a safe chunk/token boundary the completed GPU setup
 adopts that graph, state and the existing streaming ring. The prompt is not replayed.
-Readiness includes the original Colibri NVRTC kernels and completed weight transfers.
+Readiness includes the original Quintessentia NVRTC kernels and completed weight transfers.
 Construction and CPU arithmetic still cost time; this does not guarantee instant output
 or a lower time to first token.
 
@@ -265,7 +265,7 @@ but only accepted route rows may revise the task map.
 Before the first generation on an HF Granite/OLMoE Q4/Q6 engine with a three-slot
 streaming plan, `engine.enable_unified_memory(region_experts=12)` joins the dense
 ring, expert cache and prefill-map producer in one bounded GPU allocation. The
-same method is available on `AirColibriUnifiedEngine`. By default it reuses the
+same method is available on `QuintessentiaUnifiedEngine`. By default it reuses the
 existing ring/cache weight budget; an explicit `gpu_budget_bytes` adds an allowance.
 
 The default uses elastic roles: A owns current work and retained cache, B prepares
@@ -292,7 +292,7 @@ still needs contiguous pages. It is not a speed or reasoning-quality guarantee.
 
 ## Experimental thought buffer
 
-The Python `ColibriThoughtBuffer` API keeps the original full FP32 log-probability distribution
+The Python `QuintessentiaThoughtBuffer` API keeps the original full FP32 log-probability distribution
 and its contrastive prior separate from the revisable working field. It is off by default and
 changes the model's output distribution. Version 1.2.0 bounds the prior's pairwise
 log-odds contribution to 0.125 and retains FP32 sampling logits. New user input may revise the
@@ -335,9 +335,12 @@ resident-versus-three-slot-ring parity, tail prefetch, session reuse, cancellati
 
 ## License & acknowledgments
 
+Quintessentia grew into an independent mirror-equality inference architecture, with
+gratitude to the two original projects that sparked the initial direction:
+
 - **AirLLM:** Gavin Li and contributors — [original project](https://github.com/lyogavin/airllm).
 - **Colibrì:** Vincenzo Fornaro / JustVugg and contributors — [original project](https://github.com/JustVugg/colibri).
 
-AirColibri is an independent project licensed under [Apache-2.0](LICENSE). Upstream names and marks
+Quintessentia is an independent project licensed under [Apache-2.0](LICENSE). Upstream names and marks
 do not imply endorsement; see [NOTICE](NOTICE) and [asset sources](assets/README.md).
 Changes are listed in [CHANGELOG.md](CHANGELOG.md).

@@ -1,4 +1,4 @@
-# AirColibri 1.1.0 validation — 2026-11-18
+# Quintessentia 1.1.0 validation — 2026-11-18
 
 This release stabilizes the default supported HF/GGUF inference paths and packages
 optional memory/thought experiments with explicit boundaries. It does not certify

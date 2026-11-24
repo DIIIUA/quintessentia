@@ -21,7 +21,7 @@ import threading
 
 import torch
 
-from src.colibri_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
+from src.quintessentia_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
 
 _Q1_CUDA_SOURCE = r"""
 __device__ __forceinline__ float bf16_to_f32(unsigned short b) {
@@ -1413,7 +1413,7 @@ extern "C" __global__ void ideal_q1_b1_mma_gemm_f32(
 }
 
 /* 9. Ideal Q2 (2-bit + FWHT + Sinkhorn) GEMV */
-extern "C" __global__ void colibri_q2_fwht_gemv_f32(
+extern "C" __global__ void quintessentia_q2_fwht_gemv_f32(
     const unsigned short* __restrict__ x_bf16,
     const unsigned char* __restrict__ packed_lo,
     const unsigned short* __restrict__ qscale,
@@ -1495,8 +1495,8 @@ extern "C" __global__ void colibri_q2_fwht_gemv_f32(
     }
 }
 
-/* 10. Colibri Q8 (8-bit group affine) GEMV */
-extern "C" __global__ void colibri_q8_gemv_f32(
+/* 10. Quintessentia Q8 (8-bit group affine) GEMV */
+extern "C" __global__ void quintessentia_q8_gemv_f32(
     const unsigned short* __restrict__ x_bf16,
     const unsigned char* __restrict__ packed_lo,
     const unsigned short* __restrict__ qscale,
@@ -1683,7 +1683,7 @@ extern "C" __global__ void puzzle_overlay_delta_cubes_f32(
 }
 
 /* 12. Exact IEEE-754 FP64-decision affine Q4/Q6/Q8 weight packer (1 launch, zero temp VRAM) */
-extern "C" __global__ void colibri_pack_affine_q46(
+extern "C" __global__ void quintessentia_pack_affine_q46(
     const void* __restrict__ src_ptr,
     unsigned char* __restrict__ packed_lo,
     unsigned char* __restrict__ packed_hi,
@@ -1790,7 +1790,7 @@ extern "C" __global__ void colibri_pack_affine_q46(
 }
 
 /* 13. Bit-exact affine Q4/Q6/Q8 weight unpacker (matches q.float()*qs.float()+qz.float()) */
-extern "C" __global__ void colibri_unpack_affine_q46(
+extern "C" __global__ void quintessentia_unpack_affine_q46(
     const unsigned char* __restrict__ packed_lo,
     const unsigned char* __restrict__ packed_hi,
     const unsigned short* __restrict__ qscale,
@@ -1824,7 +1824,7 @@ extern "C" __global__ void colibri_unpack_affine_q46(
 }
 
 /* 14. Zero-alloc fused quant+dequant affine Q4/Q6/Q8 (bit-exact with unpack(pack(w))) */
-extern "C" __global__ void colibri_quant_dequant_affine_q46(
+extern "C" __global__ void quintessentia_quant_dequant_affine_q46(
     const void* __restrict__ src_ptr,
     void* __restrict__ dst_ptr,
     long long total_groups,
@@ -1919,12 +1919,12 @@ _KERNEL_NAMES = (
     b"ideal_q1_fwht_gemv_f32",
     b"b1_mma_m8n8k128_verify_u32",
     b"ideal_q1_b1_mma_gemm_f32",
-    b"colibri_q2_fwht_gemv_f32",
-    b"colibri_q8_gemv_f32",
+    b"quintessentia_q2_fwht_gemv_f32",
+    b"quintessentia_q8_gemv_f32",
     b"puzzle_overlay_delta_cubes_f32",
-    b"colibri_pack_affine_q46",
-    b"colibri_unpack_affine_q46",
-    b"colibri_quant_dequant_affine_q46",
+    b"quintessentia_pack_affine_q46",
+    b"quintessentia_unpack_affine_q46",
+    b"quintessentia_quant_dequant_affine_q46",
 )
 
 _LOCK = threading.Lock()
@@ -1935,13 +1935,13 @@ def _compile_or_load_ptx(major: int, minor: int, nvrtc) -> bytes:
     src_bytes = _Q1_CUDA_SOURCE.encode("utf-8")
     digest = hashlib.sha256(src_bytes).hexdigest()[:16]
     PTX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = PTX_CACHE_DIR / f"colibri_q1_cubes_sm{major}{minor}_{digest}.ptx"
+    cache_file = PTX_CACHE_DIR / f"quintessentia_q1_cubes_sm{major}{minor}_{digest}.ptx"
     if cache_file.is_file():
         data = cache_file.read_bytes()
         return data if data.endswith(b"\x00") else data + b"\x00"
 
     prog = ctypes.c_void_p()
-    rc = nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src_bytes, b"colibri_q1_cubes.cu", 0, None, None)
+    rc = nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src_bytes, b"quintessentia_q1_cubes.cu", 0, None, None)
     if rc != 0:
         raise RuntimeError(f"nvrtcCreateProgram failed with error {rc}")
     try:
@@ -2399,7 +2399,7 @@ def launch_ideal_q1_b1_mma(
         raise RuntimeError(f"cuLaunchKernel(ideal_q1_b1_mma_gemm_f32) failed with CUresult={rc}")
 
 
-def launch_colibri_q2_fwht_gemv(
+def launch_quintessentia_q2_fwht_gemv(
     x_bf16: torch.Tensor,
     packed_lo: torch.Tensor,
     qscale: torch.Tensor,
@@ -2446,14 +2446,14 @@ def launch_colibri_q2_fwht_gemv(
     grid_x = (N + 7) // 8
     stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
     rc = nvcuda.cuLaunchKernel(
-        fns[b"colibri_q2_fwht_gemv_f32"],
+        fns[b"quintessentia_q2_fwht_gemv_f32"],
         grid_x, M, 1, 256, 1, 1, smem, stream, args, None,
     )
     if rc != 0:
-        raise RuntimeError(f"cuLaunchKernel(colibri_q2_fwht_gemv_f32) failed with CUresult={rc}")
+        raise RuntimeError(f"cuLaunchKernel(quintessentia_q2_fwht_gemv_f32) failed with CUresult={rc}")
 
 
-def launch_colibri_q8_gemv(
+def launch_quintessentia_q8_gemv(
     x_bf16: torch.Tensor,
     packed_lo: torch.Tensor,
     qscale: torch.Tensor,
@@ -2463,7 +2463,7 @@ def launch_colibri_q8_gemv(
     group_size: int,
     bias: torch.Tensor | None = None,
 ) -> None:
-    """Launch Colibri Q8 (8-bit group affine) GEMV (#10)."""
+    """Launch Quintessentia Q8 (8-bit group affine) GEMV (#10)."""
     dev = x_bf16.device
     nvcuda, fns = get_q1_kernels(dev)
     M, K = int(x_bf16.shape[0]), int(x_bf16.shape[1])
@@ -2495,11 +2495,11 @@ def launch_colibri_q8_gemv(
     grid_x = (N + 7) // 8
     stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
     rc = nvcuda.cuLaunchKernel(
-        fns[b"colibri_q8_gemv_f32"],
+        fns[b"quintessentia_q8_gemv_f32"],
         grid_x, M, 1, 256, 1, 1, smem, stream, args, None,
     )
     if rc != 0:
-        raise RuntimeError(f"cuLaunchKernel(colibri_q8_gemv_f32) failed with CUresult={rc}")
+        raise RuntimeError(f"cuLaunchKernel(quintessentia_q8_gemv_f32) failed with CUresult={rc}")
 
 
 def launch_puzzle_overlay_delta_cubes(
@@ -2578,7 +2578,7 @@ def launch_puzzle_overlay_delta_cubes(
         raise RuntimeError(f"cuLaunchKernel(puzzle_overlay_delta_cubes_f32) failed with CUresult={rc}")
 
 
-def launch_colibri_pack_affine(
+def launch_quintessentia_pack_affine(
     src: torch.Tensor,
     packed_lo: torch.Tensor,
     packed_hi: torch.Tensor | None,
@@ -2634,14 +2634,14 @@ def launch_colibri_pack_affine(
     )
     stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
     rc = nvcuda.cuLaunchKernel(
-        fns[b"colibri_pack_affine_q46"],
+        fns[b"quintessentia_pack_affine_q46"],
         grid_x, 1, 1, 256, 1, 1, 0, stream, args, None,
     )
     if rc != 0:
-        raise RuntimeError(f"cuLaunchKernel(colibri_pack_affine_q46) failed with CUresult={rc}")
+        raise RuntimeError(f"cuLaunchKernel(quintessentia_pack_affine_q46) failed with CUresult={rc}")
 
 
-def launch_colibri_unpack_affine(
+def launch_quintessentia_unpack_affine(
     packed_lo: torch.Tensor,
     packed_hi: torch.Tensor | None,
     qscale: torch.Tensor,
@@ -2696,14 +2696,14 @@ def launch_colibri_unpack_affine(
     )
     stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
     rc = nvcuda.cuLaunchKernel(
-        fns[b"colibri_unpack_affine_q46"],
+        fns[b"quintessentia_unpack_affine_q46"],
         grid_x, 1, 1, 256, 1, 1, 0, stream, args, None,
     )
     if rc != 0:
-        raise RuntimeError(f"cuLaunchKernel(colibri_unpack_affine_q46) failed with CUresult={rc}")
+        raise RuntimeError(f"cuLaunchKernel(quintessentia_unpack_affine_q46) failed with CUresult={rc}")
 
 
-def launch_colibri_quant_dequant_affine(
+def launch_quintessentia_quant_dequant_affine(
     src: torch.Tensor,
     dst: torch.Tensor,
     *,
@@ -2750,9 +2750,9 @@ def launch_colibri_quant_dequant_affine(
     )
     stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
     rc = nvcuda.cuLaunchKernel(
-        fns[b"colibri_quant_dequant_affine_q46"],
+        fns[b"quintessentia_quant_dequant_affine_q46"],
         grid_x, 1, 1, 256, 1, 1, 0, stream, args, None,
     )
     if rc != 0:
-        raise RuntimeError(f"cuLaunchKernel(colibri_quant_dequant_affine_q46) failed with CUresult={rc}")
+        raise RuntimeError(f"cuLaunchKernel(quintessentia_quant_dequant_affine_q46) failed with CUresult={rc}")
 

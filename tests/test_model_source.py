@@ -8,7 +8,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from aircolibri_cli.model_source import (
+from quintessentia_cli.model_source import (
     FAST_KERNEL_FIELDS,
     GGUFModelSource,
     HFShardedSource,
@@ -22,7 +22,7 @@ from aircolibri_cli.model_source import (
     resolve_model_dir,
     runtime_profile,
 )
-from aircolibri_cli.unified_runtime import plan_for_checkpoint
+from quintessentia_cli.unified_runtime import plan_for_checkpoint
 
 TEXT_CFG = {
     "model_type": "qwen3_5_text",
@@ -391,7 +391,7 @@ def _write_tiny_qwen35moe_gguf(gguf_path):
 
 
 def test_tiny_gguf_qwen35moe_source_and_sliced_experts_forward(tmp_path):
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
 
     d = tmp_path / "Qwen3.6-tiny-gguf"
     d.mkdir(parents=True)
@@ -428,7 +428,7 @@ def test_tiny_gguf_qwen35moe_source_and_sliced_experts_forward(tmp_path):
     finally:
         src.close()
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(d),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -454,7 +454,7 @@ def test_tiny_gguf_qwen35moe_source_and_sliced_experts_forward(tmp_path):
 
 
 def test_hf_moe_per_expert_shards_route_on_demand(tmp_path):
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
 
     d = tmp_path / "olmoe-tiny"
     d.mkdir(parents=True)
@@ -471,7 +471,7 @@ def test_hf_moe_per_expert_shards_route_on_demand(tmp_path):
         "tie_word_embeddings": False,
     }
     (d / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-    # Minimal char-level fast tokenizer so AirColibriModel can instantiate offline.
+    # Minimal char-level fast tokenizer so QuintessentiaModel can instantiate offline.
     tok_json = {
         "version": "1.0",
         "truncation": None,
@@ -521,7 +521,7 @@ def test_hf_moe_per_expert_shards_route_on_demand(tmp_path):
     assert all("mlp.experts." not in k for k in src.layer_entries(0))
     src.close()
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(d),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -537,7 +537,7 @@ def test_hf_moe_per_expert_shards_route_on_demand(tmp_path):
 
 def test_extended_gguf_dequantizers_and_nvrtc_exactness():
     from transformers.integrations.gguf.dequant import dequantize as hf_dequantize
-    from aircolibri_cli.gguf_reader import (
+    from quintessentia_cli.gguf_reader import (
         GGML_TYPE_MXFP4,
         GGML_TYPE_Q4_0,
         GGML_TYPE_Q4_K,
@@ -548,7 +548,7 @@ def test_extended_gguf_dequantizers_and_nvrtc_exactness():
         GGML_TYPE_Q8_0,
         GGML_TYPE_Q8_K,
     )
-    from aircolibri_cli.model_source import dequantize_gguf_tensor
+    from quintessentia_cli.model_source import dequantize_gguf_tensor
 
     # Q5_0: 2B fp16 d (0.5) + 4B qh (alternating 0xAA) + 16B qs (0x21) -> 2 blocks = 44 bytes
     d_half = torch.tensor([0.5], dtype=torch.float16).numpy().tobytes()
@@ -603,9 +603,9 @@ def test_extended_gguf_dequantizers_and_nvrtc_exactness():
 def test_gguf_zero_mmap_and_mid_layer_stream_cancel(tmp_path, monkeypatch):
     import mmap
     import numpy as np
-    from aircolibri_cli.model_source import load_runtime_config, load_runtime_tokenizer
-    from aircolibri_cli.unified_runtime import GenerationCancelled
-    from src.aircolibri_integrated import AirColibriModel
+    from quintessentia_cli.model_source import load_runtime_config, load_runtime_tokenizer
+    from quintessentia_cli.unified_runtime import GenerationCancelled
+    from src.quintessentia_integrated import QuintessentiaModel
 
     d = tmp_path / "gguf-nommap"
     d.mkdir(parents=True)
@@ -622,7 +622,7 @@ def test_gguf_zero_mmap_and_mid_layer_stream_cancel(tmp_path, monkeypatch):
     assert tok.eos_token_id == 258
 
     dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(d),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -658,15 +658,15 @@ def test_gguf_zero_mmap_and_mid_layer_stream_cancel(tmp_path, monkeypatch):
 
 def test_bf16_session_prefix_reuse_on_gguf_and_olmoe(tmp_path):
     if not torch.cuda.is_available():
-        pytest.skip("AirColibriUnifiedEngine requires CUDA")
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+        pytest.skip("QuintessentiaUnifiedEngine requires CUDA")
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
 
     # Tiny GGUF qwen35moe hybrid: verify Turn 1 -> park -> Turn 2 unpark reuses prefix and matches
     # running the exact same full Turn-2 token sequence from scratch (cached_prefix_len=0).
     gguf_dir = tmp_path / "gguf-chat"
     gguf_dir.mkdir(parents=True)
     _write_tiny_qwen35moe_gguf(gguf_dir / "tiny.gguf")
-    with AirColibriUnifiedEngine(cpu_first=False, model_dir=gguf_dir, vram_mode="normal", verbose=False) as ueng:
+    with QuintessentiaUnifiedEngine(cpu_first=False, model_dir=gguf_dir, vram_mode="normal", verbose=False) as ueng:
         m1 = [{"role": "user", "content": "hi"}]
         r1 = [
             e
@@ -728,7 +728,7 @@ def test_bf16_session_prefix_reuse_on_gguf_and_olmoe(tmp_path):
 
 
 def test_staging_pool_coalesce_tasks():
-    from aircolibri_cli.model_source import _ParallelSliceStagingPool
+    from quintessentia_cli.model_source import _ParallelSliceStagingPool
 
     tasks = [
         ("a.gguf", 100, 0, 64),
@@ -754,8 +754,8 @@ def test_nvrtc_deltanet_kernels_and_zero_fallback_warnings(tmp_path):
     import inspect
     import logging
     import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as q35m
-    from src.aircolibri_integrated import AirColibriModel
-    from src.colibri_deltanet_nvrtc import (
+    from src.quintessentia_integrated import QuintessentiaModel
+    from src.quintessentia_deltanet_nvrtc import (
         KERNEL_CALL_STATS,
         nvrtc_causal_conv1d_fn,
         nvrtc_causal_conv1d_update,
@@ -863,7 +863,7 @@ def test_nvrtc_deltanet_kernels_and_zero_fallback_warnings(tmp_path):
     tf_logger.addHandler(catcher)
     before = dict(KERNEL_CALL_STATS)
     try:
-        with AirColibriModel(
+        with QuintessentiaModel(
             str(gguf_dir),
             pipeline_mode="triple_ring_prefetch",
             vram_resident_layers=2,
@@ -1022,7 +1022,7 @@ def _gguf_bpe_meta(vocab_size: int = 259, *, with_template: bool = True, with_me
 
 
 def test_ternary_tq1_tq2_and_q8_1_dequantizers():
-    from aircolibri_cli.model_source import (
+    from quintessentia_cli.model_source import (
         GGML_TYPE_Q8_1,
         GGML_TYPE_TQ1_0,
         GGML_TYPE_TQ2_0,
@@ -1056,7 +1056,7 @@ def test_ternary_tq1_tq2_and_q8_1_dequantizers():
 
 def test_gpt2_hf_custom_safetensors_and_gguf_exact_logit_parity(tmp_path):
     from transformers import AutoModelForCausalLM, GPT2Config
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
 
     torch.manual_seed(7)
     vocab = 259
@@ -1095,7 +1095,7 @@ def test_gpt2_hf_custom_safetensors_and_gguf_exact_logit_parity(tmp_path):
     sd.pop("lm_head.weight", None)
     save_file(sd, str(hf_dir / "custom_gpt2_weights.safetensors"))
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(hf_dir),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -1161,7 +1161,7 @@ def test_gpt2_hf_custom_safetensors_and_gguf_exact_logit_parity(tmp_path):
         )
     _serialize_gguf_v3(gguf_dir / "gpt2.gguf", meta, g_tensors)
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(gguf_dir),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -1190,8 +1190,8 @@ def test_gpt2_hf_custom_safetensors_and_gguf_exact_logit_parity(tmp_path):
 
 def test_mamba_hf_and_gguf_recurrent_cache_parity(tmp_path):
     from transformers import AutoModelForCausalLM, MambaConfig
-    from aircolibri_cli.unified_runtime import ColibriKVPrefixSession
-    from src.aircolibri_integrated import AirColibriModel
+    from quintessentia_cli.unified_runtime import QuintessentiaKVPrefixSession
+    from src.quintessentia_integrated import QuintessentiaModel
 
     torch.manual_seed(11)
     vocab = 259
@@ -1228,7 +1228,7 @@ def test_mamba_hf_and_gguf_recurrent_cache_parity(tmp_path):
     sd.pop("lm_head.weight", None)
     save_file(sd, str(hf_dir / "model.safetensors"))
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(hf_dir),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -1239,7 +1239,7 @@ def test_mamba_hf_and_gguf_recurrent_cache_parity(tmp_path):
     ) as eng:
         lg_pre, c_params = eng._forward_step(torch.tensor([[1, 2, 3]]), past_key_values=None, prefetch_next=True)
         lg_dec, c_params = eng._forward_step(torch.tensor([[4]]), past_key_values=c_params, prefetch_next=False)
-        sess = ColibriKVPrefixSession()
+        sess = QuintessentiaKVPrefixSession()
         sess.record_turn_end(
             config=eng.config,
             all_ids_full=[1, 2, 3, 4],
@@ -1291,7 +1291,7 @@ def test_mamba_hf_and_gguf_recurrent_cache_parity(tmp_path):
         )
     _serialize_gguf_v3(gguf_dir / "mamba.gguf", meta, gt)
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(gguf_dir),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -1308,7 +1308,7 @@ def test_mamba_hf_and_gguf_recurrent_cache_parity(tmp_path):
 
 def test_vlm_gemma3_unwrapping_embed_scale_and_gguf_parity(tmp_path):
     from transformers import AutoModelForCausalLM, Gemma3TextConfig
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
 
     torch.manual_seed(19)
     vocab = 259
@@ -1357,7 +1357,7 @@ def test_vlm_gemma3_unwrapping_embed_scale_and_gguf_parity(tmp_path):
     vlm_sd["multi_modal_projector.mm_input_projection_weight"] = torch.randn(16, 32, dtype=torch.bfloat16)
     save_file(vlm_sd, str(vlm_dir / "model.safetensors"))
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(vlm_dir),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -1378,7 +1378,7 @@ def test_vlm_gemma3_unwrapping_embed_scale_and_gguf_parity(tmp_path):
 
 def test_variable_shape_gemma4_and_coexisting_falcon_h1_ring_streaming(tmp_path):
     from transformers import AutoModelForCausalLM, FalconH1Config, Gemma4TextConfig
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
 
     torch.manual_seed(23)
     # 1) Gemma4: sliding_attention (head_dim=8) vs full_attention (global_head_dim=16) -> different q_proj shapes!
@@ -1412,7 +1412,7 @@ def test_variable_shape_gemma4_and_coexisting_falcon_h1_ring_streaming(tmp_path)
     assert g4_sd["model.layers.0.self_attn.q_proj.weight"].shape != g4_sd["model.layers.1.self_attn.q_proj.weight"].shape
     save_file(g4_sd, str(g4_dir / "model.safetensors"))
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(g4_dir),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -1466,7 +1466,7 @@ def test_variable_shape_gemma4_and_coexisting_falcon_h1_ring_streaming(tmp_path)
     _write_tiny_hf_tokenizer(fh_dir, vocab_size=64)
     save_file({k: v.detach().clone() for k, v in fh_ref.state_dict().items()}, str(fh_dir / "model.safetensors"))
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(fh_dir),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -1489,7 +1489,7 @@ def test_variable_shape_gemma4_and_coexisting_falcon_h1_ring_streaming(tmp_path)
 def test_hf_moe_all_layouts_and_routing_buffers_exact_parity(tmp_path):
     from transformers import GraniteMoeConfig
     from transformers import AutoModelForCausalLM, DeepseekV3Config, GptOssConfig, Llama4TextConfig, MixtralConfig
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
 
     torch.manual_seed(31)
 
@@ -1509,7 +1509,7 @@ def test_hf_moe_all_layouts_and_routing_buffers_exact_parity(tmp_path):
         cfg.save_pretrained(d)
         _write_tiny_hf_tokenizer(d, vocab_size=64)
         save_file(sd, str(d / "model.safetensors"))
-        with AirColibriModel(
+        with QuintessentiaModel(
             str(d),
             pipeline_mode="triple_ring_prefetch",
             vram_resident_layers=0,
@@ -1652,9 +1652,9 @@ def test_hf_moe_all_layouts_and_routing_buffers_exact_parity(tmp_path):
 
 def test_gguf_llama_rope_permute_split_shards_and_chat_fallback(tmp_path):
     from transformers import AutoModelForCausalLM, LlamaConfig
-    from aircolibri_cli.gguf_arch_registry import find_gguf_files
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, ColibriKVPrefixSession
-    from src.aircolibri_integrated import AirColibriModel
+    from quintessentia_cli.gguf_arch_registry import find_gguf_files
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, QuintessentiaKVPrefixSession
+    from src.quintessentia_integrated import QuintessentiaModel
 
     torch.manual_seed(41)
     vocab = 259
@@ -1746,7 +1746,7 @@ def test_gguf_llama_rope_permute_split_shards_and_chat_fallback(tmp_path):
     found = [p.name for p in find_gguf_files(gguf_dir)]
     assert found == ["tiny-llama-00001-of-00002.gguf", "tiny-llama-00002-of-00002.gguf"]
 
-    with AirColibriModel(
+    with QuintessentiaModel(
         str(gguf_dir),
         pipeline_mode="triple_ring_prefetch",
         vram_resident_layers=0,
@@ -1767,13 +1767,13 @@ def test_gguf_llama_rope_permute_split_shards_and_chat_fallback(tmp_path):
             prefetch_next=False,
             cache_position=torch.tensor([4]),
         )
-        # Verify template-less prompt fallback on AirColibriUnifiedEngine._prepare_prompt_and_cache
+        # Verify template-less prompt fallback on QuintessentiaUnifiedEngine._prepare_prompt_and_cache
         assert getattr(eng.tokenizer, "chat_template", None) in (None, "")
-        dummy = object.__new__(AirColibriUnifiedEngine)
+        dummy = object.__new__(QuintessentiaUnifiedEngine)
         from types import SimpleNamespace
         dummy.plan = SimpleNamespace(max_context_tokens=4096)
         dummy.engine = eng
-        dummy.session = ColibriKVPrefixSession()
+        dummy.session = QuintessentiaKVPrefixSession()
         dummy._session_messages = []
         dummy.mtp_head = None
         dummy.device = torch.device("cpu")

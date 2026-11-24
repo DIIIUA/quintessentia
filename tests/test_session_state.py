@@ -2,7 +2,7 @@
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, Gemma2Config, Lfm2Config, MambaConfig, Mamba2Config
-from aircolibri_cli.unified_runtime import ColibriKVPrefixSession
+from quintessentia_cli.unified_runtime import QuintessentiaKVPrefixSession
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -31,7 +31,7 @@ def test_parked_continuation_matches_uninterrupted(family):
     ids = torch.tensor([[3, 7, 4, 9, 12, 14, 8]], device="cuda")
     cache_name = "cache_params" if family.startswith("mamba") else "past_key_values"
     past = getattr(model(input_ids=ids, use_cache=True), cache_name)
-    session = ColibriKVPrefixSession()
+    session = QuintessentiaKVPrefixSession()
     session.record_turn_end(config, ids[0].tolist() + [11], past, None, None, None, {},
                             consumed_tokens=ids.shape[1])
     assert session.fed == ids[0].tolist() and session.unfed_tail == [11]
@@ -55,7 +55,7 @@ def test_parked_continuation_matches_uninterrupted(family):
 @torch.no_grad()
 def test_probe_rollback_preserves_real_family_continuation(family):
     import copy
-    from aircolibri_cli.thought_buffer import capture_cache_snapshot, restore_cache_snapshot
+    from quintessentia_cli.thought_buffer import capture_cache_snapshot, restore_cache_snapshot
 
     torch.manual_seed(193)
     config = tiny_config(family)

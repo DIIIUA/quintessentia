@@ -230,7 +230,7 @@ def q4_tiled_linear(
     return torch.cat(chunks, dim=-1)
 
 
-class ColibriQ4Linear(nn.Module):
+class QuintessentiaQ4Linear(nn.Module):
     """Линейный слой W4A16 (g=64 asym) с zero-copy привязкой буферов слота и общим scratch."""
 
     def __init__(
@@ -298,7 +298,7 @@ def replace_linear_with_q4(
     group_size: int = Q4_GROUP_SIZE,
     compute_dtype: torch.dtype = torch.bfloat16,
 ) -> int:
-    """Заменяет квантуемые nn.Linear декодера (и опционально lm_head) на ColibriQ4Linear."""
+    """Заменяет квантуемые nn.Linear декодера (и опционально lm_head) на QuintessentiaQ4Linear."""
     replaced = 0
 
     def _replace_in_layer(parent: nn.Module, prefix: str = "") -> None:
@@ -311,7 +311,7 @@ def replace_linear_with_q4(
                     or full.startswith("linear_attn.")
                     or full.startswith("self_attn.")
                 ):
-                    q_mod = ColibriQ4Linear(
+                    q_mod = QuintessentiaQ4Linear(
                         out_features=child.out_features,
                         in_features=child.in_features,
                         has_bias=(child.bias is not None),
@@ -332,7 +332,7 @@ def replace_linear_with_q4(
     if quantize_lm_head and hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
         old_head = model.lm_head
         if old_head.in_features % group_size == 0:
-            model.lm_head = ColibriQ4Linear(
+            model.lm_head = QuintessentiaQ4Linear(
                 out_features=old_head.out_features,
                 in_features=old_head.in_features,
                 has_bias=(old_head.bias is not None),

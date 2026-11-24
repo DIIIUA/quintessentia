@@ -15,8 +15,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from src import quantization_q4 as q4
 
-FORMAT = 'aircolibri-prepacked-q4-layer-v1'
-MANIFEST_FORMAT = 'aircolibri-checkpoint-sha256-v1'
+FORMAT = 'quintessentia-prepacked-q4-layer-v1'
+MANIFEST_FORMAT = 'quintessentia-checkpoint-sha256-v1'
 
 class CheckpointChangedError(ValueError):
     pass
@@ -80,7 +80,7 @@ def exclusive_lock(path, timeout=30.0):
 class PrepackedLayerCache:
     """Q4 layer cache keyed by the source checkpoint identity.
 
-    Colibri containers are identified by a trusted SHA256 manifest of the per-layer files.
+    Quintessentia containers are identified by a trusted SHA256 manifest of the per-layer files.
     Hugging Face shards (``source`` given) are identified by the layer's tensor names, dtypes,
     shapes, byte ranges and shard size/mtime, so no multi-GB file hashing is needed.
     """

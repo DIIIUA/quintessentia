@@ -1,4 +1,4 @@
-"""Self-contained NVRTC CUDA kernels for GatedDeltaNet & CausalConv1d in AirColibri.
+"""Self-contained NVRTC CUDA kernels for GatedDeltaNet & CausalConv1d in Quintessentia.
 
 Provides zero-dependency native CUDA kernels compiled at runtime via PyTorch's bundled
 NVRTC (`nvrtc64_*.dll` / `libnvrtc.so*`) and cached as PTX under `data/native/ptx-cache/`:
@@ -27,7 +27,7 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 
-from src.colibri_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
+from src.quintessentia_nvrtc import PTX_CACHE_DIR, _load_driver_and_nvrtc
 
 DELTANET_CUDA_SRC = r"""
 __device__ __forceinline__ float bf16_to_f32(unsigned short b) {
@@ -561,7 +561,7 @@ def compile_deltanet_ptx(major: int, minor: int, nvrtc: Any | None = None) -> by
     src_bytes = DELTANET_CUDA_SRC.encode("utf-8")
     digest = hashlib.sha256(src_bytes).hexdigest()[:16]
     PTX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = PTX_CACHE_DIR / f"colibri_deltanet_sm{major}{minor}_{digest}.ptx"
+    cache_file = PTX_CACHE_DIR / f"quintessentia_deltanet_sm{major}{minor}_{digest}.ptx"
     if cache_file.is_file():
         raw = cache_file.read_bytes()
         return raw if raw.endswith(b"\x00") else raw + b"\x00"
@@ -570,9 +570,9 @@ def compile_deltanet_ptx(major: int, minor: int, nvrtc: Any | None = None) -> by
         _, nvrtc = _load_driver_and_nvrtc()
 
     prog = ctypes.c_void_p()
-    rc = nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src_bytes, b"colibri_deltanet.cu", 0, None, None)
+    rc = nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src_bytes, b"quintessentia_deltanet.cu", 0, None, None)
     if rc != 0:
-        raise RuntimeError(f"nvrtcCreateProgram(colibri_deltanet.cu) failed with error {rc}")
+        raise RuntimeError(f"nvrtcCreateProgram(quintessentia_deltanet.cu) failed with error {rc}")
     try:
         arch_flag = f"--gpu-architecture=compute_{major}{minor}".encode("utf-8")
         opts = (ctypes.c_char_p * 1)(arch_flag)
@@ -620,7 +620,7 @@ def get_deltanet_kernels(device: torch.device) -> tuple[Any, dict[bytes, ctypes.
             mod = ctypes.c_void_p()
             rc = nvcuda.cuModuleLoadData(ctypes.byref(mod), ctypes.cast(ptx_buf, ctypes.c_void_p))
             if rc != 0:
-                raise RuntimeError(f"cuModuleLoadData(colibri_deltanet) failed with CUresult={rc}")
+                raise RuntimeError(f"cuModuleLoadData(quintessentia_deltanet) failed with CUresult={rc}")
             funcs: dict[bytes, ctypes.c_void_p] = {"_module": mod}
             for name in _KERNEL_NAMES:
                 fn = ctypes.c_void_p()
@@ -1251,7 +1251,7 @@ def install_deltanet_nvrtc_kernels(
             for submod in model.modules():
                 cls_name = type(submod).__name__
                 if patch_norms and cls_name.endswith("RMSNormGated") and getattr(submod, "activation", None) == "silu":
-                    if not getattr(submod, "_colibri_nvrtc_norm", False):
+                    if not getattr(submod, "_quintessentia_nvrtc_norm", False):
                         orig_f = submod.forward
                         eps_v = float(getattr(submod, "variance_epsilon", getattr(submod, "eps", 1e-6)))
 
@@ -1272,10 +1272,10 @@ def install_deltanet_nvrtc_kernels(
                             return _fwd
 
                         submod.forward = types.MethodType(_make_gated_fwd(orig_f, eps_v), submod)
-                        submod._colibri_nvrtc_norm = True
+                        submod._quintessentia_nvrtc_norm = True
                         counts["rmsnorm_gated"] += 1
                 elif patch_zero_centered_norm and cls_name in ("Qwen3_5RMSNorm", "Qwen3_5MoeRMSNorm", "Qwen3NextRMSNorm"):
-                    if not getattr(submod, "_colibri_nvrtc_norm", False):
+                    if not getattr(submod, "_quintessentia_nvrtc_norm", False):
                         orig_f = submod.forward
                         eps_v = float(getattr(submod, "eps", getattr(submod, "variance_epsilon", 1e-6)))
 
@@ -1293,7 +1293,7 @@ def install_deltanet_nvrtc_kernels(
                             return _fwd
 
                         submod.forward = types.MethodType(_make_zc_fwd(orig_f, eps_v), submod)
-                        submod._colibri_nvrtc_norm = True
+                        submod._quintessentia_nvrtc_norm = True
                         counts["rmsnorm_zero_centered"] += 1
 
     return counts

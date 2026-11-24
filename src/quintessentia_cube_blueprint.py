@@ -1,13 +1,13 @@
-"""Colibri Dual-Model Probability Comparator & Cube Blueprint Generator.
+"""Quintessentia Dual-Model Probability Comparator & Cube Blueprint Generator.
 
-Implements the Method 1 -> Colibri Tomography -> Method 2 pipeline:
-  1. Runs Colibri probability diagnostics (survivor recall, zero-prob deadzone intrusion,
+Implements the Method 1 -> Quintessentia Tomography -> Method 2 pipeline:
+  1. Runs Quintessentia probability diagnostics (survivor recall, zero-prob deadzone intrusion,
      entropy shift / false confidence, layer amplification vs damping, and MoE router agreement)
      on BOTH the original model and the Q1-cube-reconstructed model across all decoder layers.
-  2. Combines layer-level Colibri sensitivity with real activation-weighted projection errors
+  2. Combines layer-level Quintessentia sensitivity with real activation-weighted projection errors
      ||X @ W^T - X @ W_hat(k)^T||_F / ||X @ W^T||_F measured directly on calibration prompts.
-  3. Allocates exact per-(layer, projection) Q1 cube depths (a ColibriBlueprint) maximizing
-     Colibri probability fidelity per parameter/byte under a target average cube budget,
+  3. Allocates exact per-(layer, projection) Q1 cube depths (a QuintessentiaBlueprint) maximizing
+     Quintessentia probability fidelity per parameter/byte under a target average cube budget,
      ready to drive AirLLMLazyBinaryHalvingRunner (Method 2) with zero guesswork.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from src.binary_halving_q1 import BinaryHalvingQ1Linear, _is_router_module
 
 
 @torch.no_grad()
-def colibri_prob_metrics(
+def quintessentia_prob_metrics(
     logits_orig: torch.Tensor,
     logits_cube: torch.Tensor,
     *,
@@ -32,7 +32,7 @@ def colibri_prob_metrics(
     deadzone_prob_ceil: float = 1e-4,
     survivor_top_k: int = 16,
 ) -> Dict[str, float]:
-    """Compare original vs Q1-cube logits through Colibri survivor & deadzone optics."""
+    """Compare original vs Q1-cube logits through Quintessentia survivor & deadzone optics."""
     o = logits_orig.detach().float().reshape(-1)
     c = logits_cube.detach().float().reshape(-1)
 
@@ -130,7 +130,7 @@ def _project_hidden_to_logits(
     final_norm: Optional[nn.Module],
     lm_head: Optional[nn.Module],
 ) -> Optional[torch.Tensor]:
-    """Colibri Logit Lens projection of intermediate hidden state h_l -> vocabulary logits."""
+    """Quintessentia Logit Lens projection of intermediate hidden state h_l -> vocabulary logits."""
     if lm_head is None:
         return None
     w = getattr(lm_head, "weight", None)
@@ -150,7 +150,7 @@ def _project_hidden_to_logits(
 
 @dataclass
 class LayerTrajectory:
-    """Captured per-layer hidden states, Colibri Logit-Lens logits, router top-k, and projection inputs."""
+    """Captured per-layer hidden states, Quintessentia Logit-Lens logits, router top-k, and projection inputs."""
 
     num_layers: int
     layer_h_last: Dict[int, torch.Tensor] = field(default_factory=dict)
@@ -161,8 +161,8 @@ class LayerTrajectory:
 
 
 @dataclass
-class ColibriBlueprint:
-    """Actionable Method 1 -> Method 2 blueprint derived from Colibri dual-model tomography."""
+class QuintessentiaBlueprint:
+    """Actionable Method 1 -> Method 2 blueprint derived from Quintessentia dual-model tomography."""
 
     target_avg_cubes: float
     actual_param_weighted_avg_cubes: float
@@ -194,8 +194,8 @@ class ColibriBlueprint:
         }
 
 
-class ColibriCubeComparator:
-    """Runs Colibri probability optics on original vs Q1-cube models and builds Method 2 blueprints."""
+class QuintessentiaCubeComparator:
+    """Runs Quintessentia probability optics on original vs Q1-cube models and builds Method 2 blueprints."""
 
     @staticmethod
     @torch.no_grad()
@@ -207,7 +207,7 @@ class ColibriCubeComparator:
         capture_proj_inputs: bool = False,
         max_input_tokens: int = 16,
     ) -> LayerTrajectory:
-        """Capture per-layer hidden states, Colibri Logit-Lens logits, router top-k, and optional proj inputs."""
+        """Capture per-layer hidden states, Quintessentia Logit-Lens logits, router top-k, and optional proj inputs."""
         layers, final_norm, lm_head = _find_model_parts(model)
         traj = LayerTrajectory(num_layers=len(layers))
         handles: List[Any] = []
@@ -279,7 +279,7 @@ class ColibriCubeComparator:
         orig: LayerTrajectory,
         cube: LayerTrajectory,
     ) -> Dict[str, Any]:
-        """Produce 4-slice Colibri tomography comparing original vs Q1-cube layer trajectories."""
+        """Produce 4-slice Quintessentia tomography comparing original vs Q1-cube layer trajectories."""
         num_layers = orig.num_layers
         rows: List[Dict[str, Any]] = []
         prev_h_err = 0.0
@@ -301,7 +301,7 @@ class ColibriCubeComparator:
             }
 
             if l_idx in orig.layer_logits and l_idx in cube.layer_logits:
-                pm = colibri_prob_metrics(orig.layer_logits[l_idx], cube.layer_logits[l_idx])
+                pm = quintessentia_prob_metrics(orig.layer_logits[l_idx], cube.layer_logits[l_idx])
                 row.update(pm)
                 # Detect layer horizon: earliest layer in second half where survivors>=0.90 and top1 matches to end
                 if l_idx >= num_layers // 3 and pm["top1_match"] == 1.0 and pm["survivor_recall"] >= 0.85:
@@ -325,7 +325,7 @@ class ColibriCubeComparator:
             rows.append(row)
 
         final_metrics = (
-            colibri_prob_metrics(orig.final_logits, cube.final_logits)
+            quintessentia_prob_metrics(orig.final_logits, cube.final_logits)
             if (orig.final_logits is not None and cube.final_logits is not None)
             else {}
         )
@@ -335,7 +335,7 @@ class ColibriCubeComparator:
         top_amplifiers = [int(r["layer"]) for r in amps[: max(2, num_layers // 5)]]
         safe_dampers = [int(r["layer"]) for r in reversed(amps[-max(2, num_layers // 5):])]
 
-        # Rank Colibri deadzone-trauma layers (mid-to-late layers where deadzone intrusion or survivor drop spikes)
+        # Rank Quintessentia deadzone-trauma layers (mid-to-late layers where deadzone intrusion or survivor drop spikes)
         trauma_scored = []
         for r in rows:
             depth_factor = 0.35 + 0.65 * (r["layer"] / max(1, num_layers - 1))
@@ -351,7 +351,7 @@ class ColibriCubeComparator:
         return {
             "num_layers": num_layers,
             "layer_horizon": layer_horizon,
-            "final_colibri": final_metrics,
+            "final_quintessentia": final_metrics,
             "top_amplifier_layers": top_amplifiers,
             "safe_damper_layers": safe_dampers,
             "top_deadzone_trauma_layers": top_trauma,
@@ -408,15 +408,15 @@ class ColibriCubeComparator:
         target_avg_cubes: float = 3.5,
         k_min: int = 2,
         k_max: int = 6,
-    ) -> ColibriBlueprint:
-        """Allocate exact per-(layer, proj) Q1 cube depths maximizing Colibri fidelity per parameter.
+    ) -> QuintessentiaBlueprint:
+        """Allocate exact per-(layer, proj) Q1 cube depths maximizing Quintessentia fidelity per parameter.
 
         module_specs: list of (layer_idx, sub_name, num_params).
         """
         num_layers = int(tomography_report["num_layers"])
         rows_by_l = {int(r["layer"]): r for r in tomography_report["layers"]}
 
-        # Compute Colibri importance weight omega(l) for every layer from tomography
+        # Compute Quintessentia importance weight omega(l) for every layer from tomography
         raw_w: Dict[int, float] = {}
         for l_idx in range(num_layers):
             r = rows_by_l.get(l_idx, {})
@@ -488,7 +488,7 @@ class ColibriCubeComparator:
             hist[k] = hist.get(k, 0) + 1
 
         actual_avg = round(current_param_cubes / max(1.0, float(total_params)), 4)
-        return ColibriBlueprint(
+        return QuintessentiaBlueprint(
             target_avg_cubes=round(float(target_avg_cubes), 3),
             actual_param_weighted_avg_cubes=actual_avg,
             k_min=int(k_min),

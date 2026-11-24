@@ -1,4 +1,4 @@
-"""Unit tests for Colibri Dual-Model Probability Comparator & Cube Blueprint -> Method 2 pipeline."""
+"""Unit tests for Quintessentia Dual-Model Probability Comparator & Cube Blueprint -> Method 2 pipeline."""
 import copy
 import pytest
 import torch
@@ -10,9 +10,9 @@ from src.binary_halving_q1 import (
     BinaryHalvingModelSlicer,
     BinaryHalvingQ1Linear,
 )
-from src.colibri_cube_blueprint import (
-    ColibriCubeComparator,
-    colibri_prob_metrics,
+from src.quintessentia_cube_blueprint import (
+    QuintessentiaCubeComparator,
+    quintessentia_prob_metrics,
 )
 
 
@@ -57,14 +57,14 @@ class _ToyCausalLM(nn.Module):
         return self.lm_head(self.model(input_ids))
 
 
-def test_colibri_prob_metrics_detects_deadzone_and_false_confidence():
+def test_quintessentia_prob_metrics_detects_deadzone_and_false_confidence():
     vocab = 100
     orig = torch.full((vocab,), -10.0)
     orig[5] = 4.0
     orig[7] = 3.0  # runner-up survivor
 
     # Case 1: identical -> zero KL, 1.0 survivor recall, 0 deadzone intrusion
-    m_same = colibri_prob_metrics(orig, orig.clone())
+    m_same = quintessentia_prob_metrics(orig, orig.clone())
     assert m_same["kl_div"] == 0.0
     assert m_same["survivor_recall"] == 1.0
     assert m_same["deadzone_intrusion"] == 0.0
@@ -73,14 +73,14 @@ def test_colibri_prob_metrics_detects_deadzone_and_false_confidence():
     # Case 2: cube collapses sharply onto a deadzone token (token 50) -> false confidence + deadzone intrusion!
     bad_cube = torch.full((vocab,), -10.0)
     bad_cube[50] = 8.0
-    m_bad = colibri_prob_metrics(orig, bad_cube)
+    m_bad = quintessentia_prob_metrics(orig, bad_cube)
     assert m_bad["top1_match"] == 0.0
     assert m_bad["deadzone_intrusion"] > 0.95
     assert m_bad["survivor_recall"] < 0.01
     assert m_bad["false_confidence"] == 1.0
 
 
-def test_colibri_blueprint_drives_method2_airllm_runner_cpu():
+def test_quintessentia_blueprint_drives_method2_airllm_runner_cpu():
     torch.manual_seed(123)
     base_model = _ToyCausalLM(n_layers=4, h=128, vocab=64).to(torch.bfloat16).eval()
     m1_model = copy.deepcopy(base_model).eval()
@@ -88,7 +88,7 @@ def test_colibri_blueprint_drives_method2_airllm_runner_cpu():
     ids = torch.randint(0, 64, (1, 8))
 
     # 1. Capture original trajectory + projection activations
-    orig_traj = ColibriCubeComparator.capture_trajectory(
+    orig_traj = QuintessentiaCubeComparator.capture_trajectory(
         base_model, lambda x: base_model(x)[0, -1], ids, capture_proj_inputs=True
     )
     assert len(orig_traj.layer_logits) == 4
@@ -98,17 +98,17 @@ def test_colibri_blueprint_drives_method2_airllm_runner_cpu():
     slicer = BinaryHalvingModelSlicer(m1_model, root_bits=8, group_size=64, use_fwht=True)
     slicer.slice_all()
     slicer.set_uniform_cubes(3)
-    cube_traj = ColibriCubeComparator.capture_trajectory(
+    cube_traj = QuintessentiaCubeComparator.capture_trajectory(
         m1_model, lambda x: m1_model(x)[0, -1], ids, capture_proj_inputs=False
     )
 
-    tomo = ColibriCubeComparator.compare_trajectories(orig_traj, cube_traj)
+    tomo = QuintessentiaCubeComparator.compare_trajectories(orig_traj, cube_traj)
     assert tomo["num_layers"] == 4
     assert len(tomo["layers"]) == 4
     assert "survivor_recall" in tomo["layers"][-1]
     assert "deadzone_intrusion" in tomo["layers"][-1]
 
-    # 3. Measure activation-weighted errors & build Colibri blueprint for avg_k = 3.5
+    # 3. Measure activation-weighted errors & build Quintessentia blueprint for avg_k = 3.5
     slicer_mods = []
     specs = []
     for l_idx, layer in enumerate(m1_model.model.layers):
@@ -116,10 +116,10 @@ def test_colibri_blueprint_drives_method2_airllm_runner_cpu():
             if isinstance(sm, BinaryHalvingQ1Linear):
                 slicer_mods.append((l_idx, sn, sm))
                 specs.append((l_idx, sn, sm.in_features * sm.out_features))
-    act_errs = ColibriCubeComparator.measure_activation_projection_errors(
+    act_errs = QuintessentiaCubeComparator.measure_activation_projection_errors(
         slicer_mods, orig_traj.proj_inputs, k_min=2, k_max=6
     )
-    bp = ColibriCubeComparator.build_blueprint(
+    bp = QuintessentiaCubeComparator.build_blueprint(
         tomo, specs, act_errs, target_avg_cubes=3.5, k_min=2, k_max=6
     )
     assert 3.2 <= bp.actual_param_weighted_avg_cubes <= 3.8

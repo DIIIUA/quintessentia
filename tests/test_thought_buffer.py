@@ -1,12 +1,12 @@
-"""CPU-only unit tests for `ColibriThoughtBuffer` and `InitialProbabilityAnchor`."""
+"""CPU-only unit tests for `QuintessentiaThoughtBuffer` and `InitialProbabilityAnchor`."""
 from __future__ import annotations
 
 import torch
 import pytest
 from types import SimpleNamespace
 
-from aircolibri_cli.thought_buffer import (
-    ColibriThoughtBuffer,
+from quintessentia_cli.thought_buffer import (
+    QuintessentiaThoughtBuffer,
     InitialProbabilityAnchor,
     blend_recurrent_anchor,
     capture_cache_snapshot,
@@ -238,7 +238,7 @@ def test_ask_anchored_parses_stream_chat_events():
             }
 
     eng = _FakeUnifiedEngine()
-    tb = ColibriThoughtBuffer(eng)
+    tb = QuintessentiaThoughtBuffer(eng)
     res = tb.ask_anchored([{"role": "user", "content": "plan"}], enable_thinking=True)
     assert res["answer"] == "set_wifi(ON)"
     assert res["thinking"].strip() == "step 1"

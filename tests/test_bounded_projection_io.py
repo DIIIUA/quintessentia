@@ -3,7 +3,7 @@ import weakref
 import pytest
 import torch
 from safetensors.torch import save_file
-from aircolibri_cli.model_source import PreadSafetensorsReader, open_model_source
+from quintessentia_cli.model_source import PreadSafetensorsReader, open_model_source
 from src.quantized_projection import pack_weight, pack_weight_rows
 
 
@@ -39,14 +39,14 @@ def test_global_rows_and_norm_never_map_the_full_hf_shard(tmp_path,monkeypatch):
 def test_hf_runtime_globals_use_positioned_reader(tmp_path,monkeypatch):
     if not torch.cuda.is_available():pytest.skip('CUDA required')
     import safetensors
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
     write_checkpoint(tmp_path,'plain')
     source=open_model_source(tmp_path)
     reader=PreadSafetensorsReader(max_read_bytes=256)
     def no_mmap(*args,**kwargs):raise AssertionError('Runtime attempted a whole-file map')
     monkeypatch.setattr(safetensors,'safe_open',no_mmap)
     try:
-        with AirColibriModel(str(tmp_path),model_source=source,weight_reader=reader,
+        with QuintessentiaModel(str(tmp_path),model_source=source,weight_reader=reader,
                 weight_format='q4',universal_quantization=True,vram_resident_layers=4) as engine:
             logits,_=engine._forward_step(torch.tensor([[3,7,11]]),None,prefetch_next=False)
             assert torch.isfinite(logits).all()
@@ -144,14 +144,14 @@ def write_checkpoint(folder, method):
 def test_tiny_buffer_matches_full_source_through_ring(tmp_path, monkeypatch, method, bits):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
     from src import quantized_projection as quant
     write_checkpoint(tmp_path, method)
     reference_source = open_model_source(tmp_path)
     reference_source.read_weight_rows = None  # previous full-matrix path
     expected = []
     tokens = ([3,5,11], [7], [13])
-    with AirColibriModel(str(tmp_path), weight_format=f"q{bits}", universal_quantization=True,
+    with QuintessentiaModel(str(tmp_path), weight_format=f"q{bits}", universal_quantization=True,
                          vram_resident_layers=4, model_source=reference_source) as resident:
         past = None
         for ids in tokens:
@@ -168,7 +168,7 @@ def test_tiny_buffer_matches_full_source_through_ring(tmp_path, monkeypatch, met
         return read_full(path, key)
     monkeypatch.setattr(reader, "read_tensor", forbid_full_matrix)
     monkeypatch.setattr(quant, "TILE_ELEMENTS", 1024)
-    with AirColibriModel(str(tmp_path), weight_format=f"q{bits}", universal_quantization=True,
+    with QuintessentiaModel(str(tmp_path), weight_format=f"q{bits}", universal_quantization=True,
                          vram_resident_layers=1, num_slots=3, model_source=source,
                          weight_reader=reader) as ring:
         past = None
@@ -204,7 +204,7 @@ def test_transposed_hf_rows_preserve_conv1d_orientation(tmp_path):
 @pytest.mark.parametrize("method", ["fp8", "awq", "gptq"])
 def test_unaligned_rows_cross_source_blocks_and_reject_bad_metadata(tmp_path, method):
     from safetensors.torch import load_file
-    from aircolibri_cli.model_source import UnsupportedModelError
+    from quintessentia_cli.model_source import UnsupportedModelError
     write_checkpoint(tmp_path, method)
     source = open_model_source(tmp_path)
     try:

@@ -1,4 +1,4 @@
-# AirColibri 1.2.0 validation — 2026-11-18
+# Quintessentia 1.2.0 validation — 2026-11-18
 
 This release brings independent CPU execution, common CPU/GPU preparation, bounded
 streamed speculation, more conservative startup VRAM accounting and model-management

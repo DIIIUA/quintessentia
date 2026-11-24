@@ -1,4 +1,4 @@
-# Model support in AirColibri 1.2.0
+# Model support in Quintessentia 1.2.0
 
 **Support is checkpoint-specific.** The fresh 2026-11-18 local census attempted all 46
 remaining roster entries on the release implementation: **31 passed**, **15 failed**.
@@ -45,7 +45,7 @@ multimodal or all-feature certification. Exact outcomes and source fingerprints 
 | 32_hf_rwkv7-0.1B-g1 | failed | load: ValueError: The repository [project]\models\32_hf_rwkv7-0.1B-g1 contains custom code which must be executed to correctly load the model. You can inspect the repository content at [project]\models\32_hf_rwkv7-0.1B-g1 .  You can inspect the repository content at https://hf.co |
 | 33_hf_recurrentgemma-2b-it-8bit | failed | load: UnsupportedModelError: [project]\models\33_hf_recurrentgemma-2b-it-8bit: checkpoint misses global tensors ['model.norm.weight'] |
 | 34_hf_xlstm-german-wikipedia | failed | load: UnsupportedModelError: [project]\models\34_hf_xlstm-german-wikipedia: config has no decoder shape (num_hidden_layers, hidden_size) |
-| 35_hf_RWKV4-169m-bin | failed | load: UnsupportedModelError: [project]\models\35_hf_RWKV4-169m-bin: no Colibri container, Hugging Face safetensors checkpoint, or GGUF file found |
+| 35_hf_RWKV4-169m-bin | failed | load: UnsupportedModelError: [project]\models\35_hf_RWKV4-169m-bin: no Quintessentia container, Hugging Face safetensors checkpoint, or GGUF file found |
 | 36_hf_OpenELM-270M-Instruct | failed | load: UnsupportedModelError: [project]\models\36_hf_OpenELM-270M-Instruct: config has no decoder shape (num_hidden_layers, hidden_size) |
 | 37_hf_gpt2-124m | passed |  |
 | 38_hf_bloom-560m | passed |  |

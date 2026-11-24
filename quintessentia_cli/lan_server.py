@@ -1,10 +1,10 @@
-"""Lightweight Zero-Dependency LAN Server + UDP Self-Broadcaster for AirColibri.
+"""Lightweight Zero-Dependency LAN Server + UDP Self-Broadcaster for Quintessentia.
 
 Provides:
 - Automatic LAN IPv4 discovery (`detect_lan_ips`) + clear console Connection Passport
 - UDP LAN Beacon (`UDPLANBeacon` on port 8788): broadcasts JSON presence every 3s to
-  `<subnet>.255` + `255.255.255.255` and replies immediately to `AIRCOLIBRI_DISCOVER?`
-- `discover_lan_servers()` client scanner for `aircolibri discover`
+  `<subnet>.255` + `255.255.255.255` and replies immediately to `QUINTESSENTIA_DISCOVER?`
+- `discover_lan_servers()` client scanner for `quintessentia discover`
 - Multi-threaded `ThreadingHTTPServer` (`0.0.0.0:8787`) serving:
   - `GET /` — Built-in zero-CDN dark-mode LAN Web Chat UI (works offline on any phone/PC!)
   - `GET /api/info` & `GET /health` — Live node telemetry + connection credentials
@@ -47,7 +47,7 @@ class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-DISCOVER_MAGIC = b"AIRCOLIBRI_DISCOVER?"
+DISCOVER_MAGIC = b"QUINTESSENTIA_DISCOVER?"
 DEFAULT_HTTP_PORT = 8787
 DEFAULT_BEACON_PORT = 8788
 
@@ -110,7 +110,7 @@ def _subnet_broadcast_targets(lan_ips: list[str]) -> list[str]:
 
 
 class UDPLANBeacon:
-    """Broadcasts server presence over UDP and answers `AIRCOLIBRI_DISCOVER?` queries on the LAN."""
+    """Broadcasts server presence over UDP and answers `QUINTESSENTIA_DISCOVER?` queries on the LAN."""
 
     def __init__(
         self,
@@ -136,7 +136,7 @@ class UDPLANBeacon:
         sock.bind(("0.0.0.0", self.beacon_port))
         sock.settimeout(0.5)
         self._sock = sock
-        self._thread = threading.Thread(target=self._loop, name="aircolibri-lan-beacon", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="quintessentia-lan-beacon", daemon=True)
         self._thread.start()
 
     def _encode_packet(self) -> bytes:
@@ -184,7 +184,7 @@ class UDPLANBeacon:
 
 
 def discover_lan_servers(timeout_s: float = 2.0, beacon_port: int = DEFAULT_BEACON_PORT) -> list[dict[str, Any]]:
-    """Actively probes the LAN via UDP broadcast + listens for AirColibri beacons."""
+    """Actively probes the LAN via UDP broadcast + listens for Quintessentia beacons."""
     _, lan_ips = detect_lan_ips()
     targets = _subnet_broadcast_targets(lan_ips)
     targets.append("127.0.0.1")
@@ -209,7 +209,7 @@ def discover_lan_servers(timeout_s: float = 2.0, beacon_port: int = DEFAULT_BEAC
             try:
                 raw, addr = probe_sock.recvfrom(8192)
                 info = json.loads(raw.decode("utf-8", errors="replace"))
-                if info.get("service") == "aircolibri":
+                if info.get("service") == "quintessentia":
                     key = f"{info.get('lan_ip', addr[0])}:{info.get('http_port', DEFAULT_HTTP_PORT)}"
                     info["responder_ip"] = addr[0]
                     discovered[key] = info
@@ -235,7 +235,7 @@ def format_connection_passport(passport: dict[str, Any]) -> str:
     return (
         "\n"
         "================================================================================\n"
-        "  AIRCOLIBRI LAN NODE — READY FOR CONNECTIONS\n"
+        "  QUINTESSENTIA LAN NODE — READY FOR CONNECTIONS\n"
         "================================================================================\n"
         f"  Node Hostname   : {passport['hostname']} ({passport['gpu_name']}, mode={passport['vram_mode']})\n"
         f"  Model ID        : {model_id}\n"
@@ -243,10 +243,10 @@ def format_connection_passport(passport: dict[str, Any]) -> str:
         f"  LAN Web Chat    : {lan_url}{extra_line}\n"
         f"  OpenAI Base URL : {oai_url}\n"
         f"  API Key         : {api_key}  [{auth_mode}]\n"
-        f"  LAN UDP Beacon  : UDP :{passport['beacon_port']} (broadcast every 3s + `aircolibri discover`)\n"
+        f"  LAN UDP Beacon  : UDP :{passport['beacon_port']} (broadcast every 3s + `quintessentia discover`)\n"
         "--------------------------------------------------------------------------------\n"
         "  1) Find from any PC on the same Wi-Fi / LAN:\n"
-        "       aircolibri.cmd discover\n\n"
+        "       quintessentia.cmd discover\n\n"
         "  2) Quick curl test (streaming SSE):\n"
         f'       curl -N {oai_url}/chat/completions -H "Content-Type: application/json" '
         f'-H "Authorization: Bearer {api_key}" '
@@ -256,7 +256,7 @@ def format_connection_passport(passport: dict[str, Any]) -> str:
         "--------------------------------------------------------------------------------\n"
         "  Note (Windows Firewall): if other LAN devices cannot reach port "
         f"{passport['http_port']}, allow TCP {passport['http_port']} & UDP {passport['beacon_port']}:\n"
-        f'       netsh advfirewall firewall add rule name="AirColibri LAN" dir=in action=allow protocol=TCP localport={passport["http_port"]}\n'
+        f'       netsh advfirewall firewall add rule name="Quintessentia LAN" dir=in action=allow protocol=TCP localport={passport["http_port"]}\n'
         "================================================================================\n"
     )
 
@@ -266,7 +266,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AirColibri LAN Chat</title>
+<title>Quintessentia LAN Chat</title>
 <style>
   :root { --bg:#0b0f17; --panel:#131a26; --border:#233044; --txt:#e6edf7; --muted:#8b9bb4; --acc:#38bdf8; --ok:#34d399; }
   * { box-sizing:border-box; }
@@ -293,7 +293,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <div class="brand"><span class="dot"></span> AirColibri LAN Node</div>
+  <div class="brand"><span class="dot"></span> Quintessentia LAN Node</div>
   <div class="badges" id="badges">Загрузка паспорта узла...</div>
 </header>
 <main id="chat"></main>
@@ -411,8 +411,8 @@ async function sendPrompt() {
           fullAns += delta.content;
           ansBody.textContent = fullAns;
         }
-        if (j.aircolibri_metrics) {
-          const m = j.aircolibri_metrics;
+        if (j.quintessentia_metrics) {
+          const m = j.quintessentia_metrics;
           const acc = (m.spec_gate && m.spec_gate.overall_accept_rate_pct) || 0;
           const ec = m.expert_cache;
           const reuse = m.cached_prefix_tokens ? ` | Reused: ${m.cached_prefix_tokens} tok` : '';
@@ -463,8 +463,8 @@ class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
 
 def setup_server_logger(log_file: str | Path | None) -> logging.Logger:
-    """Creates the `aircolibri.server` logger writing to a rotating UTF-8 file (10 MB x 5)."""
-    log = logging.getLogger("aircolibri.server")
+    """Creates the `quintessentia.server` logger writing to a rotating UTF-8 file (10 MB x 5)."""
+    log = logging.getLogger("quintessentia.server")
     log.setLevel(logging.INFO)
     log.propagate = False
     for h in list(log.handlers):
@@ -610,8 +610,8 @@ class RequestError(Exception):
         self.err_type = err_type
 
 
-class AirColibriLANServer:
-    """Self-contained LAN HTTP/SSE server + UDP LAN broadcaster wrapping `AirColibriUnifiedEngine`."""
+class QuintessentiaLANServer:
+    """Self-contained LAN HTTP/SSE server + UDP LAN broadcaster wrapping `QuintessentiaUnifiedEngine`."""
 
     def __init__(
         self,
@@ -619,7 +619,7 @@ class AirColibriLANServer:
         host: str = "0.0.0.0",
         http_port: int = DEFAULT_HTTP_PORT,
         beacon_port: int = DEFAULT_BEACON_PORT,
-        api_key: str = "colibri-local",
+        api_key: str = "quintessentia-local",
         require_auth: bool = False,
         enable_beacon: bool = True,
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
@@ -651,7 +651,8 @@ class AirColibriLANServer:
         from . import __version__
         st = self.engine.status_snapshot()
         return {
-            "service": "aircolibri",
+            "service": "quintessentia",
+            "product": "Quintessentia",
             "version": __version__,
             "hostname": self.hostname,
             "lan_ip": self.lan_ip,
@@ -820,7 +821,7 @@ class AirColibriLANServer:
                                     "id": srv.engine.model_id,
                                     "object": "model",
                                     "created": srv.started_at,
-                                    "owned_by": "aircolibri-lan",
+                                    "owned_by": "quintessentia-lan",
                                     "context_length": None,
                                     "native_context_length": max_ctx,
                                     "context_limit_enforced": False,
@@ -990,7 +991,7 @@ class AirColibriLANServer:
                                         "completion_tokens": m["generated_tokens"],
                                         "total_tokens": m["prompt_tokens"] + m["generated_tokens"],
                                     },
-                                    "aircolibri_metrics": m,
+                                    "quintessentia_metrics": m,
                                 }
                             )
                             return
@@ -1014,7 +1015,7 @@ class AirColibriLANServer:
                                 elif ev["type"] == "done":
                                     m = ev["metrics"]
                                     req_metrics = m
-                                    _write_sse(chunk({}, m["finish_reason"], aircolibri_metrics=m))
+                                    _write_sse(chunk({}, m["finish_reason"], quintessentia_metrics=m))
                         finally:
                             gen.close()
                         try:
@@ -1025,7 +1026,7 @@ class AirColibriLANServer:
                 except GenerationCancelled as exc:
                     outcome = f"cancelled ({exc.phase}: {ticket.cancel_reason or exc.reason})"
                     if headers_sent:
-                        if _write_sse(chunk({}, "stop", aircolibri_cancelled=True)):
+                        if _write_sse(chunk({}, "stop", quintessentia_cancelled=True)):
                             try:
                                 self.wfile.write(b"data: [DONE]\n\n")
                                 self.wfile.flush()
@@ -1075,7 +1076,7 @@ class AirColibriLANServer:
             )
             self.beacon.start()
         self._http_thread = threading.Thread(
-            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.25}, name="aircolibri-lan-http", daemon=True
+            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.25}, name="quintessentia-lan-http", daemon=True
         )
         self._http_thread.start()
         self.log.info(
@@ -1092,7 +1093,7 @@ class AirColibriLANServer:
             while True:
                 time.sleep(0.5)
         except KeyboardInterrupt:
-            print("\n[AirColibri] Shutting down LAN server...", flush=True)
+            print("\n[Quintessentia] Shutting down LAN server...", flush=True)
         finally:
             self.stop()
 

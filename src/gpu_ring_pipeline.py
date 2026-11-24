@@ -1,4 +1,4 @@
-"""GPU Ring Pipeline for AirColibri (Stage 5 / Refactored):
+"""GPU Ring Pipeline for Quintessentia (Stage 5 / Refactored):
 Кольцевой конвейер VRAM-буферов с управлением состоянием, строгой семантикой READY/LOADING
 и межпоточной синхронизацией через CUDA Streams и Events.
 

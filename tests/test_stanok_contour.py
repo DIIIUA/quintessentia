@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aircolibri_cli import gpu_memory
+from quintessentia_cli import gpu_memory
 from src.binary_halving_q1 import LazyMoEBinaryHalvingCache
 from src.pure_mirror_agents_nvrtc import (
     EQ_EQUAL,
@@ -184,7 +184,7 @@ def test_method1_bridge_and_unified_silicon_registry(tmp_path):
         load_cube_blueprint(bp_file, expected_root_bits=8)
 
     survey_tools = get_method1_survey_tools()
-    assert {"ColibriBlueprint", "ColibriCubeComparator", "StreamingCubeSurvey", "projection_prefix_errors"} <= set(survey_tools)
+    assert {"QuintessentiaBlueprint", "QuintessentiaCubeComparator", "StreamingCubeSurvey", "projection_prefix_errors"} <= set(survey_tools)
 
     reg = get_unified_silicon_registry()
     assert {

@@ -1,4 +1,4 @@
-"""Bounded Colibri affine Q4/Q6 storage shared by streaming and compute.
+"""Bounded Quintessentia affine Q4/Q6 storage shared by streaming and compute.
 
 This is a runtime representation, not a GGUF block format. Source quantization
 is decoded by the source adapter before conversion. Routers and parameters
@@ -59,7 +59,7 @@ def pack_weight_rows(shape, read_rows, bits, group_size=64, device="cpu", tile_e
     resident/streaming slot budget.
     """
     if bits not in (1, 2, 4, 6, 8) or group_size not in (16, 32, 64):
-        raise ValueError("Colibri supports Q1/Q2/Q4/Q6/Q8 with groups of 16, 32 or 64")
+        raise ValueError("Quintessentia supports Q1/Q2/Q4/Q6/Q8 with groups of 16, 32 or 64")
     if bits == 1:
         from src.ideal_q1_engine import pack_ideal_q1_rows
         return pack_ideal_q1_rows(
@@ -96,7 +96,7 @@ def pack_weight_rows(shape, read_rows, bits, group_size=64, device="cpu", tile_e
     rows = max(alignment, (limit // k // alignment) * alignment)
     use_nvrtc_pack = dst.type == "cuda" and bits in (4, 6, 8)
     if use_nvrtc_pack:
-        from src.colibri_q1_cube_nvrtc import launch_colibri_pack_affine
+        from src.quintessentia_q1_cube_nvrtc import launch_quintessentia_pack_affine
     for start in range(0, n, rows):
         end = min(n, start + rows)
         tile = read_rows(start, end)
@@ -105,7 +105,7 @@ def pack_weight_rows(shape, read_rows, bits, group_size=64, device="cpu", tile_e
         if use_nvrtc_pack:
             t_in = tile if tile.dtype in (torch.bfloat16, torch.float32) else tile.to(dtype=torch.float32)
             t_in = t_in.to(device=dst).contiguous()
-            launch_colibri_pack_affine(
+            launch_quintessentia_pack_affine(
                 t_in,
                 result["packed_lo"][start:end],
                 result["packed_hi"][start:end] if bits == 6 else None,
@@ -162,10 +162,10 @@ def unpack_weight(packed, group_size=64, dtype=torch.bfloat16, *, active_planes=
     hi = packed.get("packed_hi")
     k_full = qs.shape[1] * group_size
     if lo.is_cuda and dtype in (torch.bfloat16, torch.float32) and group_size in (16, 32, 64):
-        from src.colibri_q1_cube_nvrtc import launch_colibri_unpack_affine
+        from src.quintessentia_q1_cube_nvrtc import launch_quintessentia_unpack_affine
         bits = 8 if (hi is None and half == k_full) else (6 if hi is not None else 4)
         out = torch.empty((n, k_full), dtype=dtype, device=lo.device)
-        launch_colibri_unpack_affine(lo, hi, qs, packed["qzero"], out, bits=bits, group_size=group_size)
+        launch_quintessentia_unpack_affine(lo, hi, qs, packed["qzero"], out, bits=bits, group_size=group_size)
         return out
     if hi is None and half == k_full:
         w = lo.float().reshape(n, -1, group_size)
@@ -216,7 +216,7 @@ class PackedLinear(nn.Module):
                 raise ValueError(f"active_planes ({p_act}) must be in [1, {total_p}]")
             flat = x.reshape(-1, self.in_features)
             if x.device.type == "cuda" and x.dtype == torch.bfloat16:
-                from src.colibri_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
+                from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
                 self.fused_calls += 1
                 y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=x.device)
                 if flat.shape[0] >= 8:
@@ -257,11 +257,11 @@ class PackedLinear(nn.Module):
                     raise ValueError(f"active_planes ({p_act}) must be in [1, 2]")
             flat = x.reshape(-1, self.in_features)
             if x.device.type == "cuda" and x.dtype == torch.bfloat16:
-                from src.colibri_q1_cube_nvrtc import launch_colibri_q2_fwht_gemv
+                from src.quintessentia_q1_cube_nvrtc import launch_quintessentia_q2_fwht_gemv
                 self.fused_calls += 1
                 y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=x.device)
                 if flat.shape[0] > 0:
-                    launch_colibri_q2_fwht_gemv(
+                    launch_quintessentia_q2_fwht_gemv(
                         flat.contiguous(), self.packed_lo, self.qscale, self.qzero,
                         self.row_scale, self.col_scale, y_out,
                         group_size=self.group_size, bias=self.bias,
@@ -295,14 +295,14 @@ class PackedLinear(nn.Module):
                 y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=x.device)
                 if flat.shape[0] > 0:
                     if p_act < 8:
-                        from src.colibri_q1_cube_nvrtc import launch_q1_packed_trunc_gemv
+                        from src.quintessentia_q1_cube_nvrtc import launch_q1_packed_trunc_gemv
                         launch_q1_packed_trunc_gemv(
                             flat.contiguous(), self.packed_lo, None, self.qscale, self.qzero, y_out,
                             group_size=self.group_size, bits=8, p_active=p_act, bias=self.bias, midpoint_correct=True,
                         )
                     else:
-                        from src.colibri_q1_cube_nvrtc import launch_colibri_q8_gemv
-                        launch_colibri_q8_gemv(
+                        from src.quintessentia_q1_cube_nvrtc import launch_quintessentia_q8_gemv
+                        launch_quintessentia_q8_gemv(
                             flat.contiguous(), self.packed_lo, self.qscale, self.qzero, y_out,
                             group_size=self.group_size, bias=self.bias,
                         )
@@ -333,7 +333,7 @@ class PackedLinear(nn.Module):
             if p_act < self.bits:
                 flat = x.reshape(-1, self.in_features)
                 if x.device.type == "cuda" and x.dtype == torch.bfloat16:
-                    from src.colibri_q1_cube_nvrtc import launch_q1_packed_trunc_gemv
+                    from src.quintessentia_q1_cube_nvrtc import launch_q1_packed_trunc_gemv
                     self.fused_calls += 1
                     y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=x.device)
                     if flat.shape[0] > 0:
@@ -372,7 +372,7 @@ class PackedLinear(nn.Module):
                     w = (q_trunc * sc_s + zr_s).reshape(end - start, self.in_features).to(x.dtype)
                     out[:, start:end] = F.linear(flat, w, None if self.bias is None else self.bias[start:end])
                 return out.view(*x.shape[:-1], self.out_features)
-        from src.colibri_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4, fused_dense_linear_q6
+        from src.quintessentia_nvrtc import can_use_fused_dense_q4, fused_dense_linear_q4, fused_dense_linear_q6
         if x.dtype == torch.bfloat16 and can_use_fused_dense_q4(x, self.packed_lo, self.qscale, self.qzero, self.group_size):
             self.fused_calls += 1
             if self.bits == 6:
@@ -392,7 +392,7 @@ class PackedLinear(nn.Module):
 
 def projection_map(model, layer_shapes, bits, group_size=64, replace=False, *, q1_planes=1):
     """Select actual module calls, never infer execution semantics from shapes alone."""
-    from aircolibri_cli.model_source import resolve_decoder_layers
+    from quintessentia_cli.model_source import resolve_decoder_layers
     from transformers.pytorch_utils import Conv1D
     result = {}
     for idx, layer in enumerate(resolve_decoder_layers(model)):

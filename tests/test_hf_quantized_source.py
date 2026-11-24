@@ -3,8 +3,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 from transformers import Qwen2Config, AutoModelForCausalLM
-from aircolibri_cli.hf_quantized_source import decode_fp8, decode_int4
-from aircolibri_cli.model_source import open_model_source
+from quintessentia_cli.hf_quantized_source import decode_fp8, decode_int4
+from quintessentia_cli.model_source import open_model_source
 
 
 def packed_fixture(n, k, method, group=16):
@@ -37,7 +37,7 @@ def packed_fixture(n, k, method, group=16):
 def test_int4_matches_original_integer_matrix(method, device, monkeypatch):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from aircolibri_cli import hf_quantized_source as codec
+    from quintessentia_cli import hf_quantized_source as codec
     monkeypatch.setattr(codec, "TILE_ELEMENTS", 512)  # multiple output tiles
     torch.manual_seed(81)
     packed, expected = packed_fixture(40, 64, method)
@@ -53,7 +53,7 @@ def test_int4_matches_original_integer_matrix(method, device, monkeypatch):
 def test_fp8_matches_transformers_reference_including_partial_blocks(device, monkeypatch):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from aircolibri_cli import hf_quantized_source as codec
+    from quintessentia_cli import hf_quantized_source as codec
     from transformers.integrations.finegrained_fp8 import _dequantize_fp8_weight
     monkeypatch.setattr(codec, "TILE_ELEMENTS", 256)
     torch.manual_seed(19)
@@ -70,7 +70,7 @@ def test_fp8_matches_transformers_reference_including_partial_blocks(device, mon
 def test_encoded_checkpoint_matches_native_model_through_ring(tmp_path, method):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from src.aircolibri_integrated import AirColibriModel
+    from src.quintessentia_integrated import QuintessentiaModel
     torch.manual_seed(934)
     cfg = Qwen2Config(vocab_size=64, hidden_size=64, intermediate_size=128,
                       num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
@@ -108,7 +108,7 @@ def test_encoded_checkpoint_matches_native_model_through_ring(tmp_path, method):
         for name, entry in entries.items():
             if entry in source._quantized:
                 assert torch.equal(source.read_decoded(entry), expected_state[name])
-    with AirColibriModel(str(tmp_path), weight_format="bf16", vram_resident_layers=1,
+    with QuintessentiaModel(str(tmp_path), weight_format="bf16", vram_resident_layers=1,
                          num_slots=3, model_source=source, device=torch.device("cuda")) as runtime:
         native_past = ring_past = None
         for tokens in ([3, 7, 11], [8], [14]):

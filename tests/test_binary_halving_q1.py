@@ -486,8 +486,8 @@ def test_runner_resident_head_plus_streamed_tail_parity():
 @torch.no_grad()
 def test_unified_engine_q1_cubes_cpu_only_and_cli(tmp_path, monkeypatch):
     """Unified q1_cubes mode works end-to-end via CLI, planner, Dense and MoE on CPU-only (zero CUDA)."""
-    from aircolibri_cli.cli import build_parser
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine, GiB, plan_for_checkpoint
+    from quintessentia_cli.cli import build_parser
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine, GiB, plan_for_checkpoint
     from test_cpu_independence import forbid_cuda
     from test_ideal_q1_and_modes import _make_tiny_llama, _make_tiny_olmoe
 
@@ -518,7 +518,7 @@ def test_unified_engine_q1_cubes_cpu_only_and_cli(tmp_path, monkeypatch):
 
     forbid_cuda(monkeypatch)
     for model_path, expect_moe in ((llama_dir, False), (moe_dir, True)):
-        with AirColibriUnifiedEngine(
+        with QuintessentiaUnifiedEngine(
             model_path,
             device="cpu",
             weight_format="q1_cubes",
@@ -552,7 +552,7 @@ def test_unified_engine_q1_cubes_cpu_only_and_cli(tmp_path, monkeypatch):
 @torch.no_grad()
 def test_unified_engine_q1_cubes_gpu_dense_and_moe_cuda(tmp_path):
     """Unified q1_cubes mode on GPU runs full-resident Method-1 speed for small models and L1/L2 MoE."""
-    from aircolibri_cli.unified_runtime import AirColibriUnifiedEngine
+    from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     from test_ideal_q1_and_modes import _make_tiny_llama, _make_tiny_olmoe
 
     llama_dir = tmp_path / "tiny_llama_gpu"
@@ -563,7 +563,7 @@ def test_unified_engine_q1_cubes_gpu_dense_and_moe_cuda(tmp_path):
     moe_dir.mkdir()
     _make_tiny_olmoe(moe_dir, hidden_size=128, intermediate_size=128, num_layers=2, num_experts=8)
 
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         llama_dir,
         weight_format="q1_cubes",
         q1_planes=4,
@@ -589,7 +589,7 @@ def test_unified_engine_q1_cubes_gpu_dense_and_moe_cuda(tmp_path):
         assert st["resident_layer_hits"] >= 6
         assert st["rotations"] == 0
 
-    with AirColibriUnifiedEngine(
+    with QuintessentiaUnifiedEngine(
         moe_dir,
         weight_format="q1_cubes",
         q1_planes=4,

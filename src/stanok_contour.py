@@ -1,11 +1,11 @@
 """Unified Stanok Containment Contour (`src/stanok_contour.py`).
 
-Single architectural spine unifying all 6 contours of Air-Colibri without
+Single architectural spine unifying all 6 contours of Quintessentia without
 duplicate VRAM limiters, duplicate A->B->C(0)->A relays, copy-pasted Mirror x UNI
 math, disconnected probability objects, or orphan AST islands:
 
   1. `StanokContainmentContour` — ONE unbreakable physical VRAM outer wall
-     backed by UUID-matched `PhysicalVRAMMonitor` (`aircolibri_cli.gpu_memory`):
+     backed by UUID-matched `PhysicalVRAMMonitor` (`quintessentia_cli.gpu_memory`):
        - Hard Floor (`0 OOM`, `0 WDDM Shared-RAM spill`) via proportional
          peripheral `Depth-Shedding` while protecting the hot core (`k >= 4`).
        - Hands-off Deadband Equilibrium ("Просто дай ему быть" inside the wall,
@@ -234,7 +234,7 @@ class StanokContainmentContour:
         self.reserve_ratio = max(0.02, min(0.40, float(reserve_ratio)))
         self._monitor = None
         if self.device.type == "cuda" and torch.cuda.is_available():
-            from aircolibri_cli.gpu_memory import PhysicalVRAMMonitor
+            from quintessentia_cli.gpu_memory import PhysicalVRAMMonitor
             self._monitor = PhysicalVRAMMonitor(self.device)
 
         if safety_reserve_bytes is not None:
@@ -2358,9 +2358,9 @@ def load_cube_blueprint(
     *,
     expected_root_bits: int = 16,
 ) -> Tuple[Dict[int, Dict[str, int]], Dict[int, Dict[int, Dict[str, int]]], int]:
-    """Canonical loader bridging Method 1 (`ColibriBlueprint` / `StreamingCubeSurvey`) -> Method 2.
+    """Canonical loader bridging Method 1 (`QuintessentiaBlueprint` / `StreamingCubeSurvey`) -> Method 2.
 
-    Accepts a file path (`str`/`Path`), a `ColibriBlueprint` instance, or a raw `dict`.
+    Accepts a file path (`str`/`Path`), a `QuintessentiaBlueprint` instance, or a raw `dict`.
     Returns `(layer_proj_cubes, layer_expert_cubes, max_depth)`.
     """
     if blueprint_source is None:
@@ -2412,13 +2412,13 @@ def load_cube_blueprint(
 
 
 def get_method1_survey_tools() -> Dict[str, Any]:
-    """Official bridge to Method 1 cartographer tools (`ColibriBlueprint` & `StreamingCubeSurvey`)."""
-    from src.colibri_cube_blueprint import ColibriBlueprint, ColibriCubeComparator
+    """Official bridge to Method 1 cartographer tools (`QuintessentiaBlueprint` & `StreamingCubeSurvey`)."""
+    from src.quintessentia_cube_blueprint import QuintessentiaBlueprint, QuintessentiaCubeComparator
     from src.streaming_cube_survey import StreamingCubeSurvey, projection_prefix_errors
 
     return {
-        "ColibriBlueprint": ColibriBlueprint,
-        "ColibriCubeComparator": ColibriCubeComparator,
+        "QuintessentiaBlueprint": QuintessentiaBlueprint,
+        "QuintessentiaCubeComparator": QuintessentiaCubeComparator,
         "StreamingCubeSurvey": StreamingCubeSurvey,
         "projection_prefix_errors": projection_prefix_errors,
     }
@@ -2426,7 +2426,7 @@ def get_method1_survey_tools() -> Dict[str, Any]:
 
 def get_unified_silicon_registry() -> Dict[str, Callable[..., Any]]:
     """Unified capability facade over all NVRTC Q1 / Mirror / Micro-Agent / 3D Fabric kernels."""
-    from src.colibri_q1_cube_nvrtc import (
+    from src.quintessentia_q1_cube_nvrtc import (
         launch_ideal_q1_b1_mma,
         launch_ideal_q1_fwht_gemv,
         launch_q1_multiplane_gemv,

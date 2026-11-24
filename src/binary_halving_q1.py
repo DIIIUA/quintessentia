@@ -319,6 +319,13 @@ class BinaryHalvingQ1Linear(nn.Module):
         self.cube_rel_contrib_sum = [0.0] * self.root_bits
         self.last_used_cubes = self.active_cubes
 
+    @torch.no_grad()
+    def seed_mirror_anchor(self, x_anchor: torch.Tensor, y_anchor: torch.Tensor) -> None:
+        """Seed physical (x_last, y_last) tensor anchor for differential Kernel #6 (e.g., from a recycled M7 draft scar)."""
+        dev = self.packed_lo.device
+        self._mirror_x_last = x_anchor.detach().reshape(-1, self.in_features)[-1].to(device=dev, dtype=torch.bfloat16).contiguous()
+        self._mirror_y_last = y_anchor.detach().reshape(-1, self.out_features)[-1].to(device=dev, dtype=torch.bfloat16).contiguous()
+
     def weight_bytes(self, cubes: Optional[int] = None) -> int:
         p = self.active_cubes if cubes is None else int(cubes)
         lo_per_cube = self.out_features * (self.in_features // 8)

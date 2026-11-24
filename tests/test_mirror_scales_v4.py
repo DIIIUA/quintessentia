@@ -586,3 +586,87 @@ def test_approach1_zero_sync_hot_decode_and_m0_m5_tails():
         assert rem_rel <= 0.125
     finally:
         cache.close()
+
+
+def test_m7_mirror_speculation_reversible_draft_scar_and_kernel6_anchor():
+    """M7: pure-math canonical L4 mirror depth, zero-FLOP/diff DraftScar recycling, and Kernel #6 anchor seeding."""
+    from src.binary_halving_q1 import BinaryHalvingQ1Linear, carve_trunk_mirror_q1
+    from src.general_speculation import MirrorSpeculationScale, _iter_q1_modules, eval_canonical_l4_mirror
+
+    # 0. Verify canonical 4-valued L4 logic (Sections 2-4 of pure-math pack, natural threshold 1/2 only)
+    assert eval_canonical_l4_mirror((0.0, 0.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0))[0] == "UNKNOWN"
+    assert eval_canonical_l4_mirror((1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0))[0] == "EQUAL"
+    assert eval_canonical_l4_mirror((1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (-1.0, -1.0), (-1.0, -1.0))[0] == "SPLIT"
+    assert eval_canonical_l4_mirror((1.0, 0.1), (1.0, 0.2), (0.8, 0.6), (0.3, 1.0), (0.2, 1.0))[0] == "TENSION"
+
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    gen = torch.Generator(device="cpu").manual_seed(303)
+
+    m7 = MirrorSpeculationScale(max_drafts=3, recycle_residual_tol=0.08)
+
+    # 1. Balanced EQUAL start allows full depth=3 on confident draft probs (pure canonical L4, threshold 1/2)
+    assert m7.pick_depth([0.92, 0.88, 0.85], 3) == 3
+
+    # 2. Sharp SPLIT rejection (high logp_gap) clamps depth to 1 and captures reversible DraftScar
+    w = (torch.randn((128, 128), generator=gen, dtype=torch.float32) * 0.08).to(device=dev, dtype=torch.bfloat16)
+    x_draft = (torch.randn((1, 128), generator=gen, dtype=torch.float32) * 0.5).to(device=dev, dtype=torch.bfloat16)
+    y_draft = F.linear(x_draft, w)
+    rej_logits = torch.zeros((1, 32), dtype=torch.float32, device=dev)
+    rej_logits[0, 5] = 4.5   # verified token
+    rej_logits[0, 12] = 0.0  # rejected draft token -> logp_gap = 4.5 >= 1.25 -> SPLIT!
+
+    st = m7.record_verification(
+        proposed=3,
+        accepted=0,
+        position=10,
+        drafts=[12, 13, 14],
+        verified_token=5,
+        reject_row_logits=rej_logits,
+        reject_hidden=x_draft,
+        reject_out=y_draft,
+    )
+    assert st == "SPLIT"
+    assert m7.split_events == 1
+    assert m7.scars_captured == 1
+    assert m7.pick_depth([0.92, 0.88, 0.85], 3) == 1
+
+    # 3. Reversible DraftScar recycling: zero-FLOP on collinear next input, exact diff on shifted input
+    calls = {"n": 0}
+
+    def _proj(x_in):
+        calls["n"] += 1
+        return F.linear(x_in, w)
+
+    x_col = (x_draft.float() * 1.25).to(dtype=torch.bfloat16)
+    y_col, recycled_col = m7.recycle_scar_for_projection(x_col, _proj)
+    assert recycled_col and calls["n"] == 0 and m7.zero_flop_recycles == 1
+    cos_col = float(F.cosine_similarity(y_col.float().reshape(-1), F.linear(x_col, w).float().reshape(-1), dim=0).item())
+    assert cos_col > 0.999
+
+    x_shift = (x_draft.float() * 1.1 + 0.15 * torch.randn((1, 128), generator=gen).to(dev)).to(dtype=torch.bfloat16)
+    y_shift, recycled_shift = m7.recycle_scar_for_projection(x_shift, _proj)
+    assert recycled_shift and calls["n"] == 1 and m7.diff_recycles == 1
+    cos_shift = float(F.cosine_similarity(y_shift.float().reshape(-1), F.linear(x_shift, w).float().reshape(-1), dim=0).item())
+    assert cos_shift > 0.999
+
+    # 4. Seed rejected DraftScar directly into BinaryHalvingQ1Linear for CUDA Kernel #6 + _iter_q1_modules detection
+    tensors, meta, k_opt, _ = carve_trunk_mirror_q1(w, 6, min_cubes=4, mirror_tol=0.04, root_bits=8, group_size=64, use_fwht=True, sinkhorn_iters=2)
+    q1_mod = BinaryHalvingQ1Linear(128, 128, tensors, meta, layer_idx=5, proj_name="q_proj")
+    q1_mod.active_cubes = k_opt
+    q1_mod.mirror_diff_tol = 0.015
+    assert q1_mod in _iter_q1_modules(torch.nn.Sequential(q1_mod))
+
+    scar = m7.latest_scar
+    assert scar is not None
+    q1_mod.seed_mirror_anchor(scar.x_draft, scar.y_draft)
+    y_k6 = q1_mod(x_col)
+    cos_k6 = float(F.cosine_similarity(y_k6.float().reshape(-1), F.linear(x_col, w).float().reshape(-1), dim=0).item())
+    assert cos_k6 > 0.985
+    if dev.type == "cuda":
+        assert q1_mod.mirror_diff_calls == 1
+
+    # 5. Recovery to EQUAL expands cap smoothly back toward max_drafts
+    for step in range(3):
+        st_rec = m7.record_verification(proposed=m7._current_cap, accepted=m7._current_cap, position=11 + step, drafts=[1, 2, 3][:m7._current_cap], verified_token=1)
+        assert st_rec == "EQUAL"
+    assert m7.pick_depth([0.92, 0.88, 0.85], 3) == 3

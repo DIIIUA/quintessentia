@@ -2603,7 +2603,13 @@ class QuintessentiaUnifiedEngine:
                     self.probability_bus.bind(route_exclusion=self._region_controller)
             if mode != "off" and self.max_drafts:
                 from src.general_speculation import GeneralSpeculation
-                self.speculator = GeneralSpeculation(self, mode, head_path, head_budget_mib*MiB)
+                self.speculator = GeneralSpeculation(
+                    self,
+                    mode,
+                    head_path,
+                    head_budget_mib*MiB,
+                    mirror_mode=(self.q1_graphify_feedback == "mirror_scales"),
+                )
                 self.mtp_enabled = self.speculator.native is not None
         except BaseException:
             self.close()

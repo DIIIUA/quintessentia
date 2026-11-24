@@ -212,10 +212,16 @@ class MirrorLoadDispatcher:
             from quintessentia_cli.gpu_memory import PhysicalVRAMMonitor
             self._monitor = PhysicalVRAMMonitor(self.device)
 
+        # Short hardware sensor cache (0.20s in calm headroom zone) avoids 40 NVML + memory_stats calls/token
+        self._hw_cache: Optional[Tuple[int, int, Optional[float], Optional[float], int, str]] = None
+        self._hw_cache_ts: float = 0.0
+        self._hw_poll_interval_s: float = 0.20
+        self.safety_reserve_bytes: int = 0
+
         if safety_reserve_bytes is not None:
             self.safety_reserve_bytes = max(1, int(safety_reserve_bytes))
         elif self.enabled:
-            _fb, total_b, _gu, _mu, _pf, _src = self._read_hardware()
+            _fb, total_b, _gu, _mu, _pf, _src = self._read_hardware(force=True)
             self.safety_reserve_bytes = max(1, int(total_b * self.reserve_ratio)) if total_b > 0 else 0
         else:
             self.safety_reserve_bytes = 0
@@ -258,12 +264,20 @@ class MirrorLoadDispatcher:
         self.max_observed_mem_util: Optional[float] = None
         self.last_mirror_state: str = "IDLE"
 
-    def _read_hardware(self) -> Tuple[int, int, Optional[float], Optional[float], int, str]:
+    def _read_hardware(self, *, force: bool = False) -> Tuple[int, int, Optional[float], Optional[float], int, str]:
         """Return `(free_bytes, total_bytes, gpu_util_pct, mem_util_pct, torch_pool_free, source)`."""
         if self._sensor_fn is not None:
             return self._sensor_fn()
         if self.device.type != "cuda" or not torch.cuda.is_available():
             return 0, 0, None, None, 0, "cpu"
+        now = time.perf_counter()
+        if (
+            not force
+            and self._hw_cache is not None
+            and (now - self._hw_cache_ts) < self._hw_poll_interval_s
+            and self._hw_cache[0] >= int(1.5 * self.safety_reserve_bytes)
+        ):
+            return self._hw_cache
         if self._monitor is not None:
             free_b, total_b, src = self._monitor.query()
             gpu_u, mem_u, _usrc = self._monitor.query_utilization()
@@ -274,7 +288,10 @@ class MirrorLoadDispatcher:
         reserved_b = int(torch.cuda.memory_reserved(self.device))
         allocated_b = int(torch.cuda.memory_allocated(self.device))
         pool_free = max(0, reserved_b - allocated_b)
-        return free_b, total_b, gpu_u, mem_u, pool_free, src
+        snap = (free_b, total_b, gpu_u, mem_u, pool_free, src)
+        self._hw_cache = snap
+        self._hw_cache_ts = now
+        return snap
 
     @property
     def sensor_source(self) -> str:
@@ -325,7 +342,7 @@ class MirrorLoadDispatcher:
         if free_b < reserve:
             if pool_free > 0 and self._sensor_fn is None and self.device.type == "cuda":
                 torch.cuda.empty_cache()
-                free_b, total_b, gpu_u, mem_u, pool_free, src = self._read_hardware()
+                free_b, total_b, gpu_u, mem_u, pool_free, src = self._read_hardware(force=True)
                 if self.min_observed_free_bytes is None or free_b < self.min_observed_free_bytes:
                     self.min_observed_free_bytes = free_b
             if free_b < reserve:
@@ -1789,7 +1806,13 @@ class MirrorIsolatedMoEOverlayV4:
         self.decode_norm_syncs_performed: int = 0
         self.decode_norm_syncs_avoided: int = 0
         self.decode_d2h_coalesced: int = 0
-        self._decode_tok_zero = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._decode_tok_zero = torch.zeros(
+            (1,),
+            dtype=(torch.int32 if self.device.type == "cuda" else torch.long),
+            device=self.device,
+        )
+        self._decode_line_metrics = torch.empty((1, 4), dtype=torch.float32, device=self.device)
+        self.decode_eager_overlaps: int = 0
         self.depth_sheds: int = 0
         self.shed_scars_saved: int = 0
         self.shed_scars_restored: int = 0
@@ -2570,13 +2593,45 @@ class MirrorIsolatedMoEOverlayV4:
                 cold_queue.append((e_int, k_pos, rw))
 
         line_spine = torch.zeros((1, h_dim), dtype=torch.float32, device=dev)
-        tok_t = self._decode_tok_zero if self._decode_tok_zero.device == dev else torch.zeros((1,), dtype=torch.long, device=dev)
+        tok_t = (
+            self._decode_tok_zero
+            if self._decode_tok_zero.device == dev
+            else torch.zeros((1,), dtype=(torch.int32 if dev.type == "cuda" else torch.long), device=dev)
+        )
+        line_metrics = (
+            self._decode_line_metrics
+            if self._decode_line_metrics.device == dev
+            else torch.empty((1, 4), dtype=torch.float32, device=dev)
+        )
         done_count = 0
         w_done = 0.0
         prev_y_ref: Optional[torch.Tensor] = None
         prev_y_rw: float = 0.0
         last_y_ref: Optional[torch.Tensor] = None
         last_y_rw: float = 0.0
+
+        # 2b. True GPU+NVMe Overlap: launch guaranteed-mandatory cold experts onto async O_DIRECT+DMA
+        #     BEFORE running hot_items so disk IO & H2D run concurrently with GPU Q1 GEMV compute!
+        in_entry_cone = li < self.entry_cone_layers
+        eager_fut = None
+        eager_eids: List[int] = []
+        if cold_queue and hot_items and self._warm_future is None:
+            sim_done_e = len(hot_items)
+            sim_w_e = sum(rw for _, _, rw in hot_items)
+            for e_int, _k_pos, rw in cold_queue:
+                rem_w_e = max(0.0, tok_total_w - sim_w_e)
+                if in_entry_cone or sim_done_e < eff_min or sim_w_e < rem_w_e:
+                    if not (in_entry_cone and ("cone_bf16", li, e_int) in self.region_pool._regions):
+                        eager_eids.append(e_int)
+                    sim_done_e += 1
+                    sim_w_e += rw
+                else:
+                    break
+            if eager_eids:
+                eager_fut = self._io_pool.submit(
+                    self._fetch_raw_region_async, li, eager_eids, self._next_io_stream()
+                )
+                self.decode_eager_overlaps += 1
 
         # 3. Execute resident hot experts via Kernel #6 Differential-Reversible Q1 GEMV (ZERO per-expert .item() syncs!)
         max_rw = max((rw for _, _, rw in valid), default=1.0) or 1.0
@@ -2615,7 +2670,7 @@ class MirrorIsolatedMoEOverlayV4:
             y_e = self._run_proj_diff_anchored(key, act, dn_t, p_use, x_dn_a, y_dn_a)
 
             w_t = top_k_weights[0:1, k_pos]
-            _, used_cuda = launch_pure_mirror_line_step(line_spine, y_e, tok_t, w_t)
+            _, used_cuda = launch_pure_mirror_line_step(line_spine, y_e, tok_t, w_t, out_metrics=line_metrics)
             if used_cuda:
                 self.line_cuda_launches += 1
 
@@ -2633,7 +2688,6 @@ class MirrorIsolatedMoEOverlayV4:
 
         # 4. Local M5 Mirror Equality on line_spine for remaining cold experts (strict `and` -> crisp spelling!)
         cold_to_run: List[Tuple[int, int, float, bool]] = []
-        in_entry_cone = li < self.entry_cone_layers
         line_norm = 0.0
         last_delta_norm = 0.0
         prev_delta_norm = 0.0
@@ -2727,19 +2781,39 @@ class MirrorIsolatedMoEOverlayV4:
                     need_fetch.append(item)
 
             raw_map: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-            reg_key = None
+            reg_keys_to_finish: List[Tuple[Any, ...]] = []
             io_ms = 0.0
             wait_ms = 0.0
-            if need_fetch:
-                eids_batch = [e for e, _, _, _ in need_fetch]
-                reg_key = ("decode", li, tuple(eids_batch))
+            fetched_cnt = 0
+            if eager_fut is not None:
                 tw0 = time.perf_counter()
-                fut = self._io_pool.submit(self._fetch_raw_region_async, li, eids_batch, self._next_io_stream())
-                raw_map_in, gpu_b, ready_ev, io_ms = fut.result()
-                wait_ms = (time.perf_counter() - tw0) * 1000.0
-                raw_map = self.region_pool.admit_region(
-                    reg_key, raw_map_in, gpu_bytes=gpu_b, ready_event=ready_ev, recurring_hint=False
+                e_map_in, e_gpu_b, e_ev, e_io_ms = eager_fut.result()
+                wait_ms += (time.perf_counter() - tw0) * 1000.0
+                io_ms += e_io_ms
+                eager_fut = None
+                e_reg_key = ("decode_eager", li, tuple(eager_eids))
+                admitted_e = self.region_pool.admit_region(
+                    e_reg_key, e_map_in, gpu_bytes=e_gpu_b, ready_event=e_ev, recurring_hint=False
                 )
+                raw_map.update(admitted_e)
+                reg_keys_to_finish.append(e_reg_key)
+                fetched_cnt += len(eager_eids)
+
+            if need_fetch:
+                extra_eids = [e for e, _, _, _ in need_fetch if e not in raw_map]
+                if extra_eids:
+                    reg_key = ("decode", li, tuple(extra_eids))
+                    tw0 = time.perf_counter()
+                    fut = self._io_pool.submit(self._fetch_raw_region_async, li, extra_eids, self._next_io_stream())
+                    raw_map_in, gpu_b, ready_ev, x_io_ms = fut.result()
+                    wait_ms += (time.perf_counter() - tw0) * 1000.0
+                    io_ms += x_io_ms
+                    admitted_x = self.region_pool.admit_region(
+                        reg_key, raw_map_in, gpu_bytes=gpu_b, ready_event=ready_ev, recurring_hint=False
+                    )
+                    raw_map.update(admitted_x)
+                    reg_keys_to_finish.append(reg_key)
+                    fetched_cnt += len(extra_eids)
 
             t_g0 = time.perf_counter()
             for e_int, k_pos, _rw, is_unclosed in cold_to_run:
@@ -2750,13 +2824,13 @@ class MirrorIsolatedMoEOverlayV4:
                     gu_raw, dn_raw = raw_map[e_int]
                     from_cone_pool = False
                     c.misses += 1
-                x_e = hidden_states.to(dtype=gu_raw.dtype)
+                x_e = hidden_states if hidden_states.dtype == gu_raw.dtype else hidden_states.to(dtype=gu_raw.dtype)
                 gu_out = F.linear(x_e, gu_raw)
                 g_part, u_part = gu_out.chunk(2, dim=-1)
                 act = act_fn(g_part) * u_part
                 y_e = F.linear(act, dn_raw)
                 w_t = top_k_weights[0:1, k_pos]
-                _, used_cuda = launch_pure_mirror_line_step(line_spine, y_e, tok_t, w_t)
+                _, used_cuda = launch_pure_mirror_line_step(line_spine, y_e, tok_t, w_t, out_metrics=line_metrics)
                 if used_cuda:
                     self.line_cuda_launches += 1
                 c.routed_slots_executed += 1
@@ -2784,11 +2858,17 @@ class MirrorIsolatedMoEOverlayV4:
                         self.decode_direct_oneoff += 1
 
             gpu_ms = (time.perf_counter() - t_g0) * 1000.0
-            if reg_key is not None:
-                self.region_pool.finish_region(reg_key, keep_if_reusable=False)
+            for rk in reg_keys_to_finish:
+                self.region_pool.finish_region(rk, keep_if_reusable=False)
+            if fetched_cnt > 0:
                 self.load_dispatcher.observe_dispatch_timing(
-                    t_gpu_ms=gpu_ms, t_io_ms=io_ms, t_wait_ms=wait_ms, items_dispatched=len(need_fetch)
+                    t_gpu_ms=gpu_ms, t_io_ms=io_ms, t_wait_ms=wait_ms, items_dispatched=fetched_cnt
                 )
+        elif eager_fut is not None:
+            try:
+                eager_fut.result()
+            except Exception:
+                pass
 
         if int(c.misses) == misses_before:
             self.zero_disk_spike_layers += 1
@@ -2875,6 +2955,7 @@ class MirrorIsolatedMoEOverlayV4:
                 "decode_norm_syncs_performed": self.decode_norm_syncs_performed,
                 "decode_norm_syncs_avoided": self.decode_norm_syncs_avoided,
                 "decode_d2h_coalesced": self.decode_d2h_coalesced,
+                "decode_eager_overlaps": self.decode_eager_overlaps,
                 "post_prefill_bg_adoptions": self.post_prefill_bg_adoptions,
                 "l3_enabled": self.l3_cache is not None,
                 "l3_spills": self.l3_cache.spills if self.l3_cache is not None else 0,

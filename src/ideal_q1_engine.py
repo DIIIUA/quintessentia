@@ -24,25 +24,9 @@ TILE_ELEMENTS_IDEAL = 1024 * 1024
 _FWHT_MATRIX_CACHE: Dict[Tuple[int, str, int], torch.Tensor] = {}
 
 
-def _fwht_orth_matrix(group_size: int, device: torch.device, dtype: torch.dtype = torch.float64) -> torch.Tensor:
-    key = (int(group_size), str(device), 64 if dtype == torch.float64 else 32)
-    cached = _FWHT_MATRIX_CACHE.get(key)
-    if cached is not None:
-        return cached
-    eye = torch.eye(group_size, dtype=torch.float64, device=device)
-    mat = fwht_block(eye, group_size).to(dtype=dtype)
-    _FWHT_MATRIX_CACHE[key] = mat
-    return mat
-
-
-def fwht_block(x: torch.Tensor, group_size: int) -> torch.Tensor:
-    """Orthogonal block Walsh-Hadamard transform H_bar = H / sqrt(GS) on the last dimension."""
-    if group_size <= 0 or (group_size & (group_size - 1)) != 0:
-        raise ValueError(f"group_size must be a positive power of 2, got {group_size}")
+def _fwht_block_butterfly(x: torch.Tensor, group_size: int) -> torch.Tensor:
     orig_shape = x.shape
     k = orig_shape[-1]
-    if k % group_size != 0:
-        raise ValueError(f"Last dimension {k} must be divisible by group_size={group_size}")
     orig_dtype = x.dtype
     n_groups = k // group_size
     y = x.to(torch.float32).reshape(*orig_shape[:-1], n_groups, group_size)
@@ -59,6 +43,35 @@ def fwht_block(x: torch.Tensor, group_size: int) -> torch.Tensor:
     return out if orig_dtype == torch.float32 else out.to(orig_dtype)
 
 
+def _fwht_orth_matrix(group_size: int, device: torch.device, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    key = (int(group_size), str(device), 64 if dtype == torch.float64 else 32)
+    cached = _FWHT_MATRIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    eye = torch.eye(group_size, dtype=torch.float32 if dtype == torch.float32 else torch.float64, device=device)
+    mat = _fwht_block_butterfly(eye, group_size).to(dtype=dtype).contiguous()
+    _FWHT_MATRIX_CACHE[key] = mat
+    return mat
+
+
+def fwht_block(x: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Orthogonal block Walsh-Hadamard transform H_bar = H / sqrt(GS) on the last dimension."""
+    if group_size <= 0 or (group_size & (group_size - 1)) != 0:
+        raise ValueError(f"group_size must be a positive power of 2, got {group_size}")
+    orig_shape = x.shape
+    k = orig_shape[-1]
+    if k % group_size != 0:
+        raise ValueError(f"Last dimension {k} must be divisible by group_size={group_size}")
+    # Fast CUDA cuBLAS GEMM against cached [GS, GS] Hadamard matrix (1 kernel vs 24 butterfly passes)
+    if x.is_cuda and group_size <= 128 and x.numel() >= 4096:
+        orig_dtype = x.dtype
+        y = x if orig_dtype == torch.float32 else x.to(torch.float32)
+        h_mat = _fwht_orth_matrix(group_size, x.device, torch.float32)
+        out = torch.matmul(y.reshape(-1, group_size), h_mat).reshape(orig_shape)
+        return out if orig_dtype == torch.float32 else out.to(orig_dtype)
+    return _fwht_block_butterfly(x, group_size)
+
+
 @torch.no_grad()
 def sinkhorn_equilibrate(
     w: torch.Tensor,
@@ -69,24 +82,27 @@ def sinkhorn_equilibrate(
     """Dual L2 Sinkhorn equilibration returning (row_scale bf16, col_scale bf16, w_eq fp32).
 
     Divides explicitly by BF16-rounded scales so `row_scale[:, None] * w_eq * col_scale[None, :] == w`
-    holds cleanly at BF16 precision.
+    holds cleanly at BF16 precision. Uses FP32 on CUDA (consumer GPUs have 1/64 FP64 throughput while
+    output scales are BF16) and FP64 on CPU.
     """
     if w.ndim != 2:
         raise ValueError(f"Expected 2D matrix, got {tuple(w.shape)}")
-    w_d = w.to(torch.float64)
+    work_dtype = torch.float32 if w.is_cuda else torch.float64
+    w_d = w if w.dtype == work_dtype else w.to(work_dtype)
     n, k = w_d.shape
 
     if col_scale_fixed is not None:
         col_scale = col_scale_fixed.to(device=w.device, dtype=torch.bfloat16)
-        w_c = w.to(torch.float32) / col_scale.to(torch.float32).unsqueeze(0).clamp_min(1e-8)
-        r_rms = (w_c.to(torch.float64).pow(2).mean(dim=1) + 1e-12).sqrt().clamp_min(1e-6)
+        w_f = w_d if work_dtype == torch.float32 else w.to(torch.float32)
+        w_c = w_f / col_scale.to(torch.float32).unsqueeze(0).clamp_min(1e-8)
+        r_rms = (w_c.to(work_dtype).pow(2).mean(dim=1) + 1e-12).sqrt().clamp_min(1e-6)
         row_scale = r_rms.to(torch.bfloat16)
         denom = row_scale.to(torch.float32).unsqueeze(1).clamp_min(1e-8) * col_scale.to(torch.float32).unsqueeze(0).clamp_min(1e-8)
-        w_eq = (w.to(torch.float32) / denom).to(torch.float32)
+        w_eq = w_f / denom
         return row_scale, col_scale, w_eq
 
-    dr = torch.ones((n,), dtype=torch.float64, device=w.device)
-    dc = torch.ones((k,), dtype=torch.float64, device=w.device)
+    dr = torch.ones((n,), dtype=work_dtype, device=w.device)
+    dc = torch.ones((k,), dtype=work_dtype, device=w.device)
     for _ in range(max(1, int(iters))):
         cur = w_d / (dr.unsqueeze(1) * dc.unsqueeze(0))
         r_rms = (cur.pow(2).mean(dim=1) + 1e-12).sqrt()
@@ -102,7 +118,8 @@ def sinkhorn_equilibrate(
     row_scale = dr.to(torch.bfloat16)
     col_scale = dc.to(torch.bfloat16)
     denom = row_scale.to(torch.float32).unsqueeze(1).clamp_min(1e-8) * col_scale.to(torch.float32).unsqueeze(0).clamp_min(1e-8)
-    w_eq = (w.to(torch.float32) / denom).to(torch.float32)
+    w_f = w_d if work_dtype == torch.float32 else w.to(torch.float32)
+    w_eq = w_f / denom
     return row_scale, col_scale, w_eq
 
 

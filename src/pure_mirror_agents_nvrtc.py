@@ -1757,10 +1757,19 @@ def launch_pure_mirror_diff_q1_gemv(
     tiles_per_row = (out_features + 7) // 8
 
     if dev.type == "cuda" and torch.cuda.is_available():
-        x_bf16 = flat.to(device=dev, dtype=torch.bfloat16).contiguous()
-        xl_bf16 = x_last.reshape(-1).to(device=dev, dtype=torch.bfloat16).contiguous() if x_last is not None else None
-        yl_bf16 = y_last.reshape(-1).to(device=dev, dtype=torch.bfloat16).contiguous() if y_last is not None else None
-        b_bf16 = bias.to(device=dev, dtype=torch.bfloat16).contiguous() if bias is not None else None
+        x_bf16 = flat if (flat.dtype == torch.bfloat16 and flat.is_contiguous()) else flat.to(device=dev, dtype=torch.bfloat16).contiguous()
+        if x_last is not None:
+            xl_bf16 = x_last if (x_last.ndim == 1 and x_last.dtype == torch.bfloat16 and x_last.device == dev and x_last.is_contiguous()) else x_last.reshape(-1).to(device=dev, dtype=torch.bfloat16).contiguous()
+        else:
+            xl_bf16 = None
+        if y_last is not None:
+            yl_bf16 = y_last if (y_last.ndim == 1 and y_last.dtype == torch.bfloat16 and y_last.device == dev and y_last.is_contiguous()) else y_last.reshape(-1).to(device=dev, dtype=torch.bfloat16).contiguous()
+        else:
+            yl_bf16 = None
+        if bias is not None:
+            b_bf16 = bias if (bias.dtype == torch.bfloat16 and bias.device == dev and bias.is_contiguous()) else bias.to(device=dev, dtype=torch.bfloat16).contiguous()
+        else:
+            b_bf16 = None
         out_is_bf16 = 1 if x.dtype == torch.bfloat16 else 0
         y_out = torch.empty((M, out_features), dtype=torch.bfloat16 if out_is_bf16 else torch.float32, device=dev)
         used_t = torch.empty((M, tiles_per_row), dtype=torch.int32, device=dev) if return_telemetry else None
@@ -1772,11 +1781,11 @@ def launch_pure_mirror_diff_q1_gemv(
         p_x = ctypes.c_void_p(x_bf16.data_ptr())
         p_xl = ctypes.c_void_p(0 if xl_bf16 is None else xl_bf16.data_ptr())
         p_yl = ctypes.c_void_p(0 if yl_bf16 is None else yl_bf16.data_ptr())
-        p_pk = ctypes.c_void_p(packed_lo.contiguous().data_ptr())
-        p_qs = ctypes.c_void_p(qscale.contiguous().data_ptr())
-        p_qz = ctypes.c_void_p(qzero.contiguous().data_ptr())
-        p_rs = ctypes.c_void_p(row_scale.contiguous().data_ptr())
-        p_cs = ctypes.c_void_p(col_scale.contiguous().data_ptr())
+        p_pk = ctypes.c_void_p((packed_lo if packed_lo.is_contiguous() else packed_lo.contiguous()).data_ptr())
+        p_qs = ctypes.c_void_p((qscale if qscale.is_contiguous() else qscale.contiguous()).data_ptr())
+        p_qz = ctypes.c_void_p((qzero if qzero.is_contiguous() else qzero.contiguous()).data_ptr())
+        p_rs = ctypes.c_void_p((row_scale if row_scale.is_contiguous() else row_scale.contiguous()).data_ptr())
+        p_cs = ctypes.c_void_p((col_scale if col_scale.is_contiguous() else col_scale.contiguous()).data_ptr())
         p_bs = ctypes.c_void_p(0 if b_bf16 is None else b_bf16.data_ptr())
         p_yo = ctypes.c_void_p(y_out.data_ptr())
         p_up = ctypes.c_void_p(0 if used_t is None else used_t.data_ptr())
@@ -1804,7 +1813,7 @@ def launch_pure_mirror_diff_q1_gemv(
         )
         if rc != 0:
             raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_gemv_f32) failed: {rc}")
-        y_res = y_out.to(dtype=x.dtype).view(*orig_shape, out_features)
+        y_res = (y_out if y_out.dtype == x.dtype else y_out.to(dtype=x.dtype)).view(*orig_shape, out_features)
         if return_telemetry:
             return y_res, used_t, def_t
         return y_res
@@ -1899,6 +1908,8 @@ def launch_pure_mirror_line_step(
     y_e: torch.Tensor,
     tok_indices: torch.Tensor,
     row_weights: torch.Tensor,
+    *,
+    out_metrics: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, bool]:
     """Execute fused Mirror Equality update on `line_spine`:
          Strategy_t = Outcome_(t-1) + ObservedBehavior_(t-1)
@@ -1911,12 +1922,12 @@ def launch_pure_mirror_line_step(
     if R == 0:
         return torch.empty((0, 4), dtype=torch.float32, device=dev), False
 
-    y_f32 = y_e.to(dtype=torch.float32).contiguous()
-    w_f32 = row_weights.to(device=dev, dtype=torch.float32).contiguous()
+    y_f32 = y_e if (y_e.dtype == torch.float32 and y_e.is_contiguous()) else y_e.to(dtype=torch.float32).contiguous()
+    w_f32 = row_weights if (row_weights.dtype == torch.float32 and row_weights.device == dev and row_weights.is_contiguous()) else row_weights.to(device=dev, dtype=torch.float32).contiguous()
 
     if dev.type == "cuda" and torch.cuda.is_available():
-        tok_i32 = tok_indices.to(device=dev, dtype=torch.int32).contiguous()
-        metrics = torch.empty((R, 4), dtype=torch.float32, device=dev)
+        tok_i32 = tok_indices if (tok_indices.dtype == torch.int32 and tok_indices.device == dev and tok_indices.is_contiguous()) else tok_indices.to(device=dev, dtype=torch.int32).contiguous()
+        metrics = out_metrics if (out_metrics is not None and out_metrics.shape == (R, 4) and out_metrics.device == dev) else torch.empty((R, 4), dtype=torch.float32, device=dev)
         nvcuda, fns = get_pure_mirror_kernels(dev)
         p_line = ctypes.c_void_p(line_spine.data_ptr())
         p_y = ctypes.c_void_p(y_f32.data_ptr())

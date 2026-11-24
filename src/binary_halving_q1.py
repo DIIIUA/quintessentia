@@ -1154,7 +1154,8 @@ class IncrementalCubeCarver:
         x_sum = x_rot_g.sum(dim=-1)
         rs_f = self.row_scale.float()
         y_cur = (self.qzero.float() * x_sum.unsqueeze(0)).sum(dim=-1) * rs_f
-        y_ref_norm = float(y_ref.norm().item()) + 1e-8
+        y_ref_norm_t = y_ref.norm()
+        y_ref_norm: Optional[float] = None
 
         step_rel = 1.0
         scar_rel = 1.0
@@ -1175,11 +1176,18 @@ class IncrementalCubeCarver:
 
             delta_y = ((sign_f * x_rot_g.unsqueeze(0)).sum(dim=-1) * scale_f).sum(dim=-1) * rs_f
             y_cur = y_cur + delta_y
-            # Only evaluate convergence once `target_min` planes exist (1 batched GPU->CPU transfer, not 3/plane!)
+            # Only sync GPU->CPU once `target_min` planes exist; fold `y_ref_norm_t` into the first
+            # batched `.tolist()` so we never burn a standalone `.item()` stall before carving!
             if (p + 1) >= target_min and (mirror_tol > 0.0 or (p + 1) == target_max):
-                n_cur, n_step, n_scar = torch.stack(
-                    [y_cur.norm(), delta_y.norm(), (y_ref - y_cur).norm()]
-                ).tolist()
+                if y_ref_norm is None:
+                    n_cur, n_step, n_scar, n_ref = torch.stack(
+                        [y_cur.norm(), delta_y.norm(), (y_ref - y_cur).norm(), y_ref_norm_t]
+                    ).tolist()
+                    y_ref_norm = float(n_ref) + 1e-8
+                else:
+                    n_cur, n_step, n_scar = torch.stack(
+                        [y_cur.norm(), delta_y.norm(), (y_ref - y_cur).norm()]
+                    ).tolist()
                 step_rel = n_step / (n_cur + 1e-8)
                 scar_rel = n_scar / y_ref_norm
                 if mirror_tol > 0.0 and step_rel < mirror_tol and scar_rel < mirror_tol:

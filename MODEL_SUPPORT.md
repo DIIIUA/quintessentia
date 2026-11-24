@@ -1,6 +1,6 @@
-# Model support in Quintessentia 2.0.0-dev
+# Model support in Quintessentia 2.0.0
 
-**Support is checkpoint-specific.** The fresh **2026-11-24** local census tested all **47** checkpoints in the test zoo on the **V4 pure Q1 cubes** runtime (`--weight-format auto` -> `q1_cubes`, `k=5`, `root_bits=8`) on an **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 native `ext4`): **37 passed**, **10 failed** (up from 31/46 in 1.2.0).
+**Support is checkpoint-specific.** The fresh **2026-11-24** local census tested all **47** checkpoints in the test zoo on the **V4 pure Q1 cubes** runtime (`--weight-format auto` -> `q1_cubes`, `k=5`, `root_bits=8`) on an **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 native `ext4`): **37 passed**, **10 failed** (up from 31/46 in 1.2.0). Machine-readable per-checkpoint outcomes are recorded in [benchmarks/model_support_2_0_0.json](benchmarks/model_support_2_0_0.json); full release validation is in [benchmarks/RELEASE_2_0_0.md](benchmarks/RELEASE_2_0_0.md).
 
 Each passing entry completed engine initialization, two sequential chat turns (`max_new_tokens=48`, `seed=42`: GPU cache explanation + Python binary search), and finite output generation with zero OOM. Base (non-instruct) models and ultra-aggressive source quantizations (`IQ1_S`, `IQ3_XXS`) are noted honestly in the remarks column.
 

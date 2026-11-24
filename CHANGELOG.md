@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (2.0.0-dev) — 2026-11-24
+## 2.0.0 — 2026-11-24
 
 ### Pure Q1 Cubes V4 as default CUDA runtime
 - **Default `--weight-format auto` promoted to pure `Q1` cubes V4 (`q1_cubes`, `k=5`, `root_bits=8`) on CUDA:** covers dense models, hybrid SSM/Attention models, and small/large MoE checkpoints automatically. `--feedback-mode off`, explicit `--weight-format q1|q2|q4|q6|q8|bf16`, and `--device cpu` opt-outs remain fully intact.

@@ -152,7 +152,7 @@ Measured live on **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 native `ext4`, two-t
 | 35B MoE | `Qwen3.6-35B-A3B` (256 experts) | 23.87 GiB | 40/40 trunk + Q1 MoE | **1.91 tok/s** | 5,567 MiB | Warm prefill `3.95 s`, 0 OOM |
 
 - **Reconstruction precision:** Q1 binary-halving cubes are progressive and lossy at low plane counts (`k=4..6`), converging monotonically toward source weights as `k` increases (single-layer cosine similarity on 9B BF16: `0.9961` at `k=4`, `0.9991` at `k=5`, `0.9998` at `k=6`, `1.0000` at `k=16`). Source quantization quality still caps final output quality (for example, ultra-low-bit source GGUFs like `IQ1_S` or `IQ3_XXS` cannot be recovered beyond their stored weights).
-- **Historical Q4/Q6 & streaming baselines (1.1.0 / 1.2.0):** see [RELEASE_1_1_0.md](benchmarks/RELEASE_1_1_0.md), [RELEASE_1_2_0.md](benchmarks/RELEASE_1_2_0.md), and [STREAMING_DECODE_20261118.md](benchmarks/STREAMING_DECODE_20261118.md).
+- **Release validation & historical baselines:** see [RELEASE_2_0_0.md](benchmarks/RELEASE_2_0_0.md) and [model_support_2_0_0.json](benchmarks/model_support_2_0_0.json) for 2.0.0, and [RELEASE_1_1_0.md](benchmarks/RELEASE_1_1_0.md), [RELEASE_1_2_0.md](benchmarks/RELEASE_1_2_0.md), and [STREAMING_DECODE_20261118.md](benchmarks/STREAMING_DECODE_20261118.md) for historical Q4/Q6 baselines.
 
 ## CPU execution, speculation, and optional modes
 

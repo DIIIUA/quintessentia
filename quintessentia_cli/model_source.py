@@ -1141,6 +1141,15 @@ class _ParallelSliceStagingPool:
                 self._all_handles.append(f)
             return f, q
 
+    @staticmethod
+    def _alloc_page_aligned(size: int) -> tuple[bytearray, int, int]:
+        """Allocates a 4096-byte page-aligned buffer without calling `mmap.mmap`."""
+        cap = max(4096, (int(size) + 4095) & ~4095)
+        raw = bytearray(cap + 4096)
+        base_ptr = ctypes.addressof(ctypes.c_char.from_buffer(raw))
+        pad = (-base_ptr) & 4095
+        return raw, pad, base_ptr + pad
+
     def _probe_direct_path(self, path: str) -> bool:
         with self._lock:
             cached = self._direct_supported.get(path)
@@ -1150,22 +1159,15 @@ class _ParallelSliceStagingPool:
         ok = False
         if pread_fn is not None and os.environ.get("QUINTESSENTIA_DISABLE_O_DIRECT", "0") != "1":
             fd = -1
-            buf = None
             try:
                 if os.path.getsize(path) >= 4096:
                     fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-                    buf = mmap.mmap(-1, 4096)
-                    ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+                    _raw, _pad, ptr = self._alloc_page_aligned(4096)
                     n = pread_fn(fd, ptr, 4096, 0)
                     ok = (n == 4096)
             except OSError:
                 ok = False
             finally:
-                if buf is not None:
-                    try:
-                        buf.close()
-                    except Exception:
-                        pass
                 if fd >= 0:
                     try:
                         os.close(fd)
@@ -1181,26 +1183,18 @@ class _ParallelSliceStagingPool:
         with self._lock:
             q = self._direct_queues[path]
         try:
-            fd, buf, ptr, cap = q.get_nowait()
+            fd, buf, pad, ptr, cap = q.get_nowait()
         except queue.Empty:
             fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
             cap = max(1024 * 1024, (min_aligned_bytes + 4095) & ~4095)
-            buf = mmap.mmap(-1, cap)
-            ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+            buf, pad, ptr = self._alloc_page_aligned(cap)
             with self._lock:
-                self._all_direct_resources.append((fd, buf))
+                self._all_direct_resources.append((fd, None))
         if min_aligned_bytes > cap:
             new_cap = max((min_aligned_bytes + 4095) & ~4095, cap * 2)
-            new_buf = mmap.mmap(-1, new_cap)
-            new_ptr = ctypes.addressof(ctypes.c_char.from_buffer(new_buf))
-            with self._lock:
-                self._all_direct_resources.append((-1, new_buf))
-            try:
-                buf.close()
-            except Exception:
-                pass
-            buf, ptr, cap = new_buf, new_ptr, new_cap
-        return fd, buf, ptr, cap, q
+            buf, pad, ptr = self._alloc_page_aligned(new_cap)
+            cap = new_cap
+        return fd, buf, pad, ptr, cap, q
 
     def _read_one_direct(self, path: str, abs_offset: int, dst_view: memoryview) -> bool:
         length = len(dst_view)
@@ -1212,7 +1206,7 @@ class _ParallelSliceStagingPool:
         a_off = abs_offset & ~4095
         head = abs_offset - a_off
         a_len = ((head + length + 4095) & ~4095)
-        fd, buf, ptr, cap, q = self._borrow_direct(path, a_len)
+        fd, buf, pad, ptr, cap, q = self._borrow_direct(path, a_len)
         try:
             done = 0
             while done < a_len:
@@ -1227,12 +1221,12 @@ class _ParallelSliceStagingPool:
                 _DIRECT_IO_STATS["fallbacks"] += 1
                 return False
             with memoryview(buf) as mv:
-                dst_view[:] = mv[head : head + length]
+                dst_view[:] = mv[pad + head : pad + head + length]
             _DIRECT_IO_STATS["calls"] += 1
             _DIRECT_IO_STATS["bytes"] += length
             return True
         finally:
-            q.put((fd, buf, ptr, cap))
+            q.put((fd, buf, pad, ptr, cap))
 
     def _read_one(self, task: tuple[str, int, int, int], view: memoryview) -> None:
         path, abs_offset, dst_offset, length = task
@@ -1765,6 +1759,10 @@ def _fast_moe_dispatch(
                 x_k = (sub_w.unsqueeze(-1) * x.unsqueeze(0)).to(dtype=comp_dtype)  # (K, D)
                 up_out = torch.bmm(up_w, x_k.unsqueeze(-1)).squeeze(-1)
                 gate_out = torch.bmm(gate_w, x_k.unsqueeze(-1)).squeeze(-1) if gate_w is not None else None
+            elif up_w.device.type == "cpu":
+                x_k = x.unsqueeze(0).expand(up_w.shape[0], -1).unsqueeze(-1)
+                up_out = torch.bmm(up_w, x_k).squeeze(-1)
+                gate_out = torch.bmm(gate_w, x_k).squeeze(-1) if gate_w is not None else None
             else:
                 up_out = torch.matmul(up_w, x)
                 gate_out = torch.matmul(gate_w, x) if gate_w is not None else None

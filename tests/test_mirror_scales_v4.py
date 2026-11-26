@@ -1250,3 +1250,121 @@ def test_native_c_batched_moe_ballot_carve_and_nonblocking_mirror():
             dim=0,
         )
         assert float((y_bat.float() - y_ref.float()).abs().max().item()) == 0.0
+
+
+def test_canonical_l4_math_axioms_and_anti_self_deception_m1_m2_m3_m4():
+    """Verify canonical L4 math axioms (UNKNOWN, non-commutativity, time arrow, scar reversibility,
+    non-average center) and anti-self-deception: M1/M2/M3/M4 MUST measurably change behavior when
+    eval_mirror_equality_step is stubbed to constant EQUAL, and M5 defaults to rest_tol=0.0."""
+    import random
+    from unittest.mock import patch
+    import src.mirror_scales_v4 as v4
+    from src.general_speculation import eval_canonical_l4_mirror
+    from src.mirror_scales_v4 import MirrorBalanceResult, eval_mirror_equality_step
+
+    # 1. UNKNOWN on unclosed past or future wing
+    assert eval_mirror_equality_step((1.0, 2.0), (1.0, 1.0), (0.0, 0.0), (0.0, 0.0)).state == "UNKNOWN"
+    assert eval_mirror_equality_step((0.0, 0.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0)).state == "UNKNOWN"
+
+    # 2. Non-average center, non-commutativity inside wing (no brackets), time-arrow asymmetry, exact scar
+    p0, p1, p2, p3 = (0.9, 0.2, 0.1), (0.3, 0.8, 0.4), (0.4, 0.7, 0.9), (0.1, 0.2, 0.95)
+    b_fwd = eval_mirror_equality_step(p0, p1, p2, p3)
+    b_swap = eval_mirror_equality_step(p1, p0, p2, p3)
+    b_rev = eval_mirror_equality_step(p3, p2, p1, p0)
+    naive_avg = tuple(0.5 * (a + b) for a, b in zip(p1, p2))
+    assert b_fwd.strategy != naive_avg
+    assert b_fwd.strategy != b_swap.strategy and b_fwd.tau_core != b_swap.tau_core
+    assert b_fwd.delta_res != b_rev.delta_res
+
+    rng = random.Random(2026)
+    for _ in range(300):
+        vecs = [tuple(rng.uniform(-2.0, 2.0) for _ in range(3)) for _ in range(4)]
+        res = eval_mirror_equality_step(*vecs)
+        ref_state, ref_tc, ref_tw, ref_dr = eval_canonical_l4_mirror(vecs[0], vecs[1], res.strategy, vecs[2], vecs[3])
+        assert res.state == ref_state
+        assert abs(res.tau_core - ref_tc) < 1e-11
+        assert abs(res.tau_wing - ref_tw) < 1e-11
+        assert abs(res.delta_res - ref_dr) < 1e-11
+        for k in range(3):
+            assert abs(res.scar_alpha * vecs[1][k] + res.scar_residual[k] - vecs[2][k]) < 1e-11
+
+    orig_eval = v4.eval_mirror_equality_step
+
+    def _stub_equal(*a, **kw):
+        r = orig_eval(*a, **kw)
+        return MirrorBalanceResult("EQUAL", r.strategy, 1.0, 1.0, 0.0, 0.0, 0.0, r.scar_alpha, r.scar_residual)
+
+    # 3. M1 anti-self-deception test on 2,000 random hardware readings
+    GiB = 1024 ** 3
+    total_b, reserve_b = 8 * GiB, int(0.10 * 8 * GiB)
+    samples = [
+        (int(rng.uniform(0.05, 0.90) * total_b), total_b, rng.uniform(0.0, 100.0), rng.uniform(0.0, 100.0), 0, "mock")
+        for _ in range(2000)
+    ]
+
+    def _run_m1(stub: bool):
+        i = {"k": 0}
+        def sensor():
+            r = samples[i["k"]]; i["k"] += 1; return r
+        m1 = MirrorLoadDispatcher(device="cpu", enabled=True, safety_reserve_bytes=reserve_b, sensor_fn=sensor)
+        budget, out = 2 * GiB, []
+        with patch.object(v4, "eval_mirror_equality_step", side_effect=_stub_equal if stub else orig_eval):
+            for _ in samples:
+                d = m1.evaluate_load(cached_bytes=1 * GiB, current_budget_bytes=budget)
+                budget = d.target_budget_bytes
+                out.append((d.dispatch_mode, d.budget_action))
+        return out
+
+    m1_real, m1_stub = _run_m1(False), _run_m1(True)
+    m1_diff = sum(1 for a, b in zip(m1_real, m1_stub) if a != b)
+    assert m1_diff > 400, f"M1 must genuinely depend on canonical L4 formula (got only {m1_diff}/2000 diffs)"
+    assert {"DIRECT_BURST", "OVERLAP_ASYNC", "THROTTLE_DAMP", "SHED_PROTECT"} <= {x[0] for x in m1_real}
+
+    # 3b. M1 predictive safety regression: approaching reserve with an idle bus MUST damp (never expand!)
+    safety_seq = iter([
+        (int(1.6 * GiB), 8 * GiB, 2.0, 2.0, 0, "mock"),
+        (int(1.0 * GiB), 8 * GiB, 2.0, 2.0, 0, "mock"),
+    ])
+    m1_safe = MirrorLoadDispatcher(
+        device="cpu", enabled=True, safety_reserve_bytes=int(0.8 * GiB), sensor_fn=lambda: next(safety_seq)
+    )
+    m1_safe._hw_poll_interval_s = m1_safe._hw_tight_poll_interval_s = 0.0
+    m1_safe.evaluate_load(cached_bytes=2 * GiB, current_budget_bytes=2 * GiB)
+    d_safe = m1_safe.evaluate_load(cached_bytes=2 * GiB, current_budget_bytes=2 * GiB)
+    assert d_safe.dispatch_mode == "THROTTLE_DAMP", f"Idle bus must never mask impending VRAM breach: {d_safe}"
+    assert d_safe.budget_action == "damp" and d_safe.target_budget_bytes <= 2 * GiB
+
+    # 4. M2 anti-self-deception test
+    def _run_m2(stub: bool):
+        r2 = random.Random(77)
+        m2 = MirrorRegionBreathingPool(device=torch.device("cpu"), max_pool_bytes=1000, max_warm_regions=8)
+        acts = []
+        with patch.object(v4, "eval_mirror_equality_step", side_effect=_stub_equal if stub else orig_eval):
+            for step in range(300):
+                sz, want, k = r2.randint(80, 350), r2.random() < 0.7, ("r", step % 12)
+                if m2.lookup_reuse(k) is None:
+                    m2.admit_region(k, {"s": step}, gpu_bytes=sz, recurring_hint=want)
+                acts.append(m2.finish_region(k, keep_if_reusable=want))
+        m2.close()
+        return acts
+
+    m2_real, m2_stub = _run_m2(False), _run_m2(True)
+    assert sum(1 for a, b in zip(m2_real, m2_stub) if a != b) > 50
+
+    # 5. M3 first step must be UNKNOWN, and M4 scars must depend on formula
+    m3 = MirrorColdWarmupScale(mode="plateau", min_layers_warm=2, plateau_confirm=2)
+    assert m3.evaluate_step(60.0, warmed_so_far=1, total_targets=10, elapsed_seconds=0.1).mirror_state == "UNKNOWN"
+
+    m4_r = MirrorPostPrefillRegionWarmupScale(num_layers=3, max_region_experts=6, initial_width=2, max_width=3)
+    m4_s = MirrorPostPrefillRegionWarmupScale(num_layers=3, max_region_experts=6, initial_width=2, max_width=3)
+    for m in (m4_r, m4_s):
+        for li in range(3):
+            m.record_prefill_layer(li, {0: 3.0, 1: 2.0}, {1: 2.0})
+    m4_r.observe_and_plan_next(0, [7, 8], [0.6, 0.4], lambda l, e: e in (0, 1))
+    with patch.object(v4, "eval_mirror_equality_step", side_effect=_stub_equal):
+        m4_s.observe_and_plan_next(0, [7, 8], [0.6, 0.4], lambda l, e: e in (0, 1))
+    assert m4_r.split_scar_updates == 1 and m4_s.split_scar_updates == 0
+
+    # 6. M5 defaults to exact rest_tol=0.0 (no silent unmeasured expert approximation)
+    import inspect
+    assert inspect.signature(MirrorIsolatedMoEOverlayV4.__init__).parameters["rest_tol"].default == 0.0

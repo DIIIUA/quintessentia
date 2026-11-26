@@ -173,6 +173,11 @@ class QuintessentiaModel:
             raise ValueError("Q4 group size must be 16, 32 or 64")
         if num_slots is not None and not 1 <= num_slots <= 4:
             raise ValueError("num_slots must be 1..4")
+        try:
+            from quintessentia_cli.kv_offload import enable_zero_copy_gqa_sdpa
+            enable_zero_copy_gqa_sdpa()
+        except Exception:
+            pass
         self.control_mode = control_mode
         self.ack_adapter = None
         self.trace_adapter = None

@@ -614,3 +614,39 @@ def test_unified_engine_q1_cubes_gpu_dense_and_moe_cuda(tmp_path):
         assert st["moe_cache"]["unique_experts_carved"] > 0
         assert st["moe_cache"]["cache_on_gpu"] is True
         assert u.expert_cache_stats()["unique_experts_carved"] > 0
+
+
+@pytest.mark.parametrize("law", ["positional_halving", "residual_halving"])
+def test_cuda_prefill_tiled_gemm_parity_and_no_anchor_storage_leak(law):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from src.binary_halving_q1 import clear_q1_prefill_scratch
+
+    torch.manual_seed(123)
+    dev = torch.device("cuda:0")
+    k_in, n_out, m_batch = 512, 1024, 128
+    w = torch.randn((n_out, k_in), dtype=torch.bfloat16, device=dev) * 0.1
+    bias = torch.randn((n_out,), dtype=torch.bfloat16, device=dev) * 0.05
+    x = torch.randn((1, m_batch, k_in), dtype=torch.bfloat16, device=dev)
+
+    tensors, meta = halve_weight_to_q1_tree(
+        w, root_bits=8, group_size=64, law=law, use_fwht=True, compute_diagnostics=False
+    )
+    mod = BinaryHalvingQ1Linear(k_in, n_out, tensors, meta, bias=bias)
+    mod.active_cubes = 5
+    mod.mirror_diff_tol = 0.05
+
+    with torch.no_grad():
+        y_fast = mod(x)
+        w_ref = mod.reconstruct_weight(5, dtype=torch.float32)
+        y_ref = F.linear(x.float(), w_ref, bias.float())
+
+    cos = F.cosine_similarity(y_fast.float().reshape(-1), y_ref.reshape(-1), dim=0).item()
+    assert cos > 0.9995, f"Prefill tiled BF16 GEMM mismatch for {law}: cos={cos}"
+    # Regression guard: 1-row mirror anchors must NOT pin the full [M, K]/[M, N] prefill buffer!
+    assert mod._mirror_x_last is not None and mod._mirror_y_last is not None
+    assert mod._mirror_x_last.untyped_storage().nbytes() == k_in * 2
+    assert mod._mirror_y_last.untyped_storage().nbytes() == n_out * 2
+    mod.clear_mirror_anchor()
+    assert mod._mirror_x_last is None and mod._mirror_y_last is None
+    clear_q1_prefill_scratch()

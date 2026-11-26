@@ -1,5 +1,7 @@
 @echo off
 setlocal
+set "PYTHONDONTWRITEBYTECODE=1"
+set "PYTHONUTF8=1"
 set "SCRIPT_DIR=%~dp0"
 if defined QUINTESSENTIA_PYTHON (
     set "PY=%QUINTESSENTIA_PYTHON%"
@@ -8,5 +10,5 @@ if defined QUINTESSENTIA_PYTHON (
 ) else (
     set "PY=python"
 )
-"%PY%" "%SCRIPT_DIR%quintessentia.py" %*
+"%PY%" -X utf8 -u "%SCRIPT_DIR%quintessentia.py" %*
 exit /b %errorlevel%

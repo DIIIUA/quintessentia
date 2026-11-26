@@ -8,11 +8,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache 2.0"></a>
 </p>
 
-**Quintessentia** is a local inference engine for **Hugging Face and GGUF language models** built around **pure Q1 binary-halving cubes (V4)**, self-contained **NVRTC CUDA kernels**, adaptive VRAM/RAM/disk streaming, and an OpenAI-compatible LAN server.
+**Quintessentia** is a local inference engine for **Hugging Face and GGUF language models** built around **pure Q1 binary-halving cubes (V4)**, unified **4-layer multi-scale balance (M0–M8 + KV)**, self-contained **NVRTC CUDA kernels**, hybrid VRAM/pinned-RAM KV caching, a live **Windows/WSL 2 Desktop HUD**, and an OpenAI-compatible LAN server.
 
-> **Default CUDA runtime (`V4` / `--weight-format auto`):** On NVIDIA GPUs, Quintessentia automatically runs checkpoints through pure **Q1 binary-halving cubes** (`q1_cubes`, default `k=5` bit-planes out of `root_bits=8`) with bank-conflict-free NVRTC CUDA kernels, a native C launch fast path, pure-Q1 large-vocabulary output heads, and conveyor-free adaptive streaming when weights exceed VRAM.
+> **Default CUDA runtime (`V4` / `--weight-format auto`):** On NVIDIA GPUs, Quintessentia automatically runs checkpoints through pure **Q1 binary-halving cubes** (`q1_cubes`, `root_bits=8`) with bidirectional mirror-balance depth auto-fit (`k=5` default, stepping down `4->3` under tight VRAM or refining up to `k=8` for compact models fitting inside `<= 35%` VRAM budget), 4-layer solver-free balance across all runtime scales (`M0–M8`, hybrid KV placement, and chunked prefill), bank-conflict-free NVRTC CUDA kernels, and zero-OOM adaptive streaming.
 >
-> **Validated across 37 / 47 local checkpoints (26 distinct model architectures)** on a single **8 GB RTX 3060 Ti** (WSL 2 native ext4): from **124M** (`74.3 tok/s`) and **1B** (`39.8 tok/s`) to **7B–9B BF16** fully resident in 6.0 GiB (`15.7–19.9 tok/s`), **20B MXFP4 MoE** in 3.8 GiB, and **35B 256-expert MoE** in 5.5 GiB with zero OOM. Explicit `q1`, `q2`, `q4`, `q6`, `q8`, `bf16`, `--feedback-mode off`, and `--device cpu` modes remain available; see [model support](MODEL_SUPPORT.md) for the complete per-checkpoint matrix.
+> **Validated across 39 / 45 present local checkpoints (3-turn isolated suite per model, 0 OOM, 0 crashes)** on a single **8 GB RTX 3060 Ti** (WSL 2 native ext4): from **124M–350M** (`48–106 tok/s`) and **1B** (`39–41 tok/s`) to **2B–4B MLA/BitNet/VLM** (`6.7–22.5 tok/s`), **7B–9B BF16** fully resident in 5.86–5.95 GiB (`18.9–19.8 tok/s`), **20B MXFP4 MoE** in 3.77 GiB, and **35B 256-expert MoE** in 5.40 GiB (`3.3 tok/s`). Explicit `q1`, `q2`, `q4`, `q6`, `q8`, `bf16`, `--feedback-mode off`, and `--device cpu` modes remain available; see [model support](MODEL_SUPPORT.md) for the complete 3x per-checkpoint matrix.
 
 <a href="https://buymeacoffee.com/silentfish">
   <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="217" height="60">
@@ -48,8 +48,8 @@ on demand rather than loading all experts into memory.
 
 Supported input weight encodings adapted on the fly into Q1 cubes (or explicit runtime formats):
 - **Hugging Face `.safetensors`:** BF16/FP16, block FP8, AWQ GEMM INT4, GPTQ INT4, bitsandbytes 8-bit (`SCB`, without requiring `bitsandbytes`), and packed MXFP4 MoE experts.
-- **GGUF (single or split shards):** standard and K/I-quant blocks (`Q2_K`, `Q3_K_M`, `Q4_0`, `Q4_1`, `Q4_K_M`, `Q5_*`, `Q6_K`, `Q8_*`, `IQ1_S`..`IQ4_NL`, `TQ1_0`/`TQ2_0`) across 35+ GGUF families without the external `gguf` PyPI package.
-- **Architectures covered:** Dense Transformers (`Llama`, `Qwen2/3/3.5`, `Gemma 2/3`, `Phi-3/4`, `Cohere2`, `OLMo2`, `Nemotron`, `Granite`, `SmolLM3`, `ERNIE-4.5`, `GPT-2 Conv1D`, `GPT-NeoX`, `BLOOM`), pure SSM (`Mamba`, `Mamba2`), hybrid SSM/Attention/Griffin (`Zamba2`, `Falcon-H1`, `RecurrentGemma`, `LFM2`), and sparse/hybrid MoE (`Qwen3.5/3.6-MoE`, `Granite-MoE`, `Granite-4.0-Hybrid`, `GPT-OSS MXFP4`).
+- **GGUF (single or split shards):** standard and K/I-quant blocks (`Q2_K`, `Q3_K_M`, `Q4_0`, `Q4_1`, `Q4_K_M`, `Q5_*`, `Q6_K`, `Q8_*`, `IQ1_S`..`IQ4_NL`, `TQ1_0`/`TQ2_0`, and native `bitnet.cpp` `I2_S` type 36) across 35+ GGUF families without the external `gguf` PyPI package.
+- **Architectures covered:** Dense Transformers (`Llama`, `Qwen2/3/3.5`, `Qwen2-VL` text, `Gemma 2/3`, `Phi-3/4`, `Cohere2`, `OLMo2`, `Nemotron`, `Granite`, `SmolLM3`, `ERNIE-4.5`, `BitNet-b1.58`, `GPT-2 Conv1D`, `GPT-NeoX`, `BLOOM`), MLA (`MiniCPM3`), pure SSM (`Mamba`, `Mamba2`), hybrid SSM/Attention/Griffin (`Zamba2`, `Falcon-H1`, `RecurrentGemma`, `LFM2`), and sparse/hybrid MoE (`Qwen3.5/3.6-MoE`, `Granite-MoE`, `Granite-4.0-Hybrid`, `GPT-OSS MXFP4`).
 
 An adapter or recognized architecture ID is not a blanket guarantee that every checkpoint
 of that family works. Multimodal checkpoints, where usable, expose only the language
@@ -65,14 +65,17 @@ repositories requiring `trust_remote_code` are outside the validated scope.
 One-button launchers pick the local environment automatically: `./quint` on Linux / WSL 2, `.\quint.cmd` or `.\quintessentia.cmd` on Windows, or `python quintessentia.py`.
 
 ```bash
-./quint doctor                                                # GPU, model, V4 Q1 plan, LAN addresses
+./quint doctor                                                # GPU, model, V4 Q1 + RSSF balance plan, HUD, LAN
 ./quint models                                                # numbered local model catalog
-./quint ask --model 1 "Hello"                                 # default V4 Q1 cubes (k=5) + anti-loop profile
-./quint ask --model 1 --q1-planes 6 --no-think "Explain..."   # higher Q1 depth, direct answer
+./quint ask --model 1 "Hello"                                 # default V4 Q1 cubes + anti-loop profile
+echo "Summarize this" | ./quint ask --model 1 --no-think      # piped stdin prompt support
+./quint ask --model 1 --q1-planes 6 --no-think "Explain..."   # explicit Q1 depth, direct answer
 ./quint ask --model 1 --mode custom --temperature 0 "Hi"      # manual greedy sampling control
-./quint ask --model 1 --weight-format q6 "Hello"              # explicit legacy Q6 format
-./quint chat                                                  # multi-turn chat (Ctrl+C stops current answer)
-./quint serve                                                 # web chat + OpenAI API on :8787, UDP beacon :8788
+./quint bench --model 1 --runs 3                              # multi-run throughput, KV reuse & balance benchmark
+./quint chat                                                  # multi-turn chat (/balance, /hud, /reset, /stats)
+./quint serve --hud                                           # web chat + OpenAI API on :8787 + live Desktop HUD
+./quint hud                                                   # launch Desktop HUD widget (Windows Native & WSL 2)
+./quint hud --status | --stop | --install-desktop             # HUD status JSON, instant stop, or Desktop install
 ./quint discover                                              # find Quintessentia servers on the LAN
 ```
 
@@ -134,25 +137,27 @@ default 512 tokens), projecting only the last position onto vocabulary logits wh
 
 ## Accuracy and speed
 
-### Q1 Cubes V4 (`--weight-format auto`, `k=5`) — 2026-11-24
+### Q1 Cubes V4 + 4-Layer RSSF Balance (`--weight-format auto`) — 2026-11-26
 
-Measured live on **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 native `ext4`, two-turn chat, `max_new_tokens=48`, `seed=42`, Turn 2 decode throughput & peak VRAM):
+Measured live on **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 native `ext4`, isolated 3-turn suite per checkpoint: cold factual `R1`, KV/SSM continuation `R2`, post-reset structured `R3`; peak decode throughput & peak VRAM):
 
-| Scale | Checkpoint | Disk | Placement | Decode (T2) | Peak VRAM | Notes |
+| Scale | Checkpoint | Disk | Q1 / Placement | Best Decode | Peak VRAM | Notes |
 |---|---|---:|---|---:|---:|---|
-| 124M | `37_hf_gpt2-124m` (`Conv1D`) | 0.51 GiB | 12/12 res | **74.31 tok/s** | 162 MiB | +30% faster than BF16 (`57.1 tok/s`) |
-| 1B | `01_gguf_Llama-3.2-1B-Instruct-Q4_K_M` | 0.75 GiB | 16/16 res | **39.79 tok/s** | 888 MiB | Clean English & Python |
-| 1.2B Hybrid | `31_hf_Zamba2-1.2B-instruct-v2` | 2.27 GiB | 38/38 res | **14.22 tok/s** | 1,185 MiB | Shared transformer + Mamba2 |
-| 2B Griffin | `33_hf_recurrentgemma-2b-it-8bit` | 3.15 GiB | 26/26 res | **15.89 tok/s** | 1,867 MiB | Direct 8-bit `SCB` -> Q1 cubes |
-| 4B | `11_gguf_Nemotron-Mini-4B-IQ3_M` | 2.03 GiB | 32/32 res | **14.07 tok/s** | 2,594 MiB | Clean English & Python |
-| 7B | `08_gguf_command-r7b-12-2024-IQ3_XS` | 3.47 GiB | 32/32 res | **15.68 tok/s** | 5,997 MiB | Fully resident in 6.0 GiB |
-| 9B BF16 | `Qwythos-9B-v2-MTP-BF16` (`k=5`) | 17.14 GiB | 32/32 res | **19.91 tok/s** | 6,044 MiB | Full 9B BF16 resident on 8 GB GPU |
-| 9B BF16 | `Qwythos-9B-v2-MTP-BF16` (`k=6`, streamed) | 17.14 GiB | 27/32 + 5 V4 | **5.99 tok/s** | ~6.4 GiB | Adaptive V4 streaming, 0 OOM |
-| 20B MoE | `45_hf_gpt-oss-20b-MXFP4` | 12.84 GiB | 24/24 trunk + MoE | **0.85 tok/s** | 3,793 MiB | Packed MXFP4 experts on demand |
-| 35B MoE | `Qwen3.6-35B-A3B` (256 experts) | 23.87 GiB | 40/40 trunk + Q1 MoE | **1.91 tok/s** | 5,567 MiB | Warm prefill `3.95 s`, 0 OOM |
+| 124M | `37_hf_gpt2-124m` (`Conv1D`) | 0.51 GiB | `k=8` 12/12 res | **106.3 tok/s** | 225 MiB | Auto-refined `k=8` native `Conv1D` |
+| 350M | `15_gguf_LFM2-350M-Q4_K_M` | 0.21 GiB | `k=8` 16/16 res | **48.2 tok/s** | 490 MiB | Clean 3/3, `kv2_hit=30` |
+| 1B | `01_gguf_Llama-3.2-1B-Instruct-Q4_K_M` | 0.75 GiB | `k=8` 16/16 res | **39.2 tok/s** | 1,391 MiB | Clean 3/3, `kv2_hit=56` |
+| 1.2B Hybrid | `31_hf_Zamba2-1.2B-instruct-v2` | 2.27 GiB | `k=8` 38/38 res | **17.1 tok/s** | 1,478 MiB | Shared transformer + Mamba2 (`kv2_hit=31`) |
+| 2B Ternary | `25_gguf_BitNet-b1.58-2B-i2_s` | 1.11 GiB | `k=6` 30/30 res | **17.0 tok/s** | 2,108 MiB | Native `bitnet.cpp` `I2_S` (type 36) |
+| 2B VLM Text | `41_hf_Qwen2-VL-2B-Instruct-AWQ` | 2.74 GiB | `k=8` 28/28 res | **21.2 tok/s** | 1,669 MiB | 1D-mRoPE-equivalent `Qwen2` AWQ text |
+| 2B Griffin | `33_hf_recurrentgemma-2b-it-8bit` | 3.15 GiB | `k=6` 26/26 res | **22.5 tok/s** | 2,372 MiB | Direct 8-bit `SCB` -> Q1 cubes |
+| 4B MLA | `10_gguf_MiniCPM3-4B-MLA-Q4_K_M` | 2.30 GiB | `k=5` 62/62 res | **6.7 tok/s** | 2,943 MiB | Full 62-layer compressed MLA KV (`kv2_hit=26`) |
+| 7B | `08_gguf_command-r7b-12-2024-IQ3_XS` | 3.47 GiB | `k=5` 32/32 res | **19.8 tok/s** | 5,953 MiB | Fully resident in 5.95 GiB, crisp EOS |
+| 9B BF16 | `Qwythos-9B-v2-MTP-BF16` (`k=5`) | 17.14 GiB | `k=5` 32/32 res | **18.9 tok/s** | 5,861 MiB | Full 9B BF16 resident; `60K` `13.06`, `80K` `10.17 tok/s` |
+| 20B MoE | `45_hf_gpt-oss-20b-MXFP4` | 12.84 GiB | `k=5` 24/24 + MoE | **1.0 tok/s** | 3,772 MiB | Packed MXFP4 experts on demand (`kv2_hit=127`) |
+| 35B MoE | `Qwen3.6-35B-A3B` (256 experts) | 23.87 GiB | `k=5` 40/40 + MoE | **3.3 tok/s** | 5,404 MiB | +73% vs 2.0.0 (`1.91 tok/s`), `kv2_hit=32`, 0 OOM |
 
-- **Reconstruction precision:** Q1 binary-halving cubes are progressive and lossy at low plane counts (`k=4..6`), converging monotonically toward source weights as `k` increases (single-layer cosine similarity on 9B BF16: `0.9961` at `k=4`, `0.9991` at `k=5`, `0.9998` at `k=6`, `1.0000` at `k=16`). Source quantization quality still caps final output quality (for example, ultra-low-bit source GGUFs like `IQ1_S` or `IQ3_XXS` cannot be recovered beyond their stored weights).
-- **Release validation & historical baselines:** see [RELEASE_2_0_0.md](benchmarks/RELEASE_2_0_0.md) and [model_support_2_0_0.json](benchmarks/model_support_2_0_0.json) for 2.0.0, and [RELEASE_1_1_0.md](benchmarks/RELEASE_1_1_0.md), [RELEASE_1_2_0.md](benchmarks/RELEASE_1_2_0.md), and [STREAMING_DECODE_20261118.md](benchmarks/STREAMING_DECODE_20261118.md) for historical Q4/Q6 baselines.
+- **Reconstruction precision:** Q1 binary-halving cubes are progressive and lossy at low plane counts (`k=4..6`), converging monotonically toward source weights as `k` increases (single-layer cosine similarity on 9B BF16: `0.9961` at `k=4`, `0.9991` at `k=5`, `0.9998` at `k=6`, `1.0000` at `k=16`). Source quantization quality still caps final output quality (for example, ultra-low-bit source GGUFs like `IQ1_S` cannot be recovered beyond their stored weights).
+- **Release validation & historical baselines:** see [model_support_2_1_0.json](benchmarks/model_support_2_1_0.json) for 2.1.0, [RELEASE_2_0_0.md](benchmarks/RELEASE_2_0_0.md) and [model_support_2_0_0.json](benchmarks/model_support_2_0_0.json) for 2.0.0, and [RELEASE_1_1_0.md](benchmarks/RELEASE_1_1_0.md), [RELEASE_1_2_0.md](benchmarks/RELEASE_1_2_0.md), and [STREAMING_DECODE_20261118.md](benchmarks/STREAMING_DECODE_20261118.md) for historical Q4/Q6 baselines.
 
 ## CPU execution, speculation, and optional modes
 

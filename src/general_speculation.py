@@ -13,6 +13,7 @@ from typing import Callable, Optional
 import torch
 
 from quintessentia_cli.thought_buffer import _auxiliary_forwards, capture_cache_snapshot, restore_cache_snapshot
+from src.rssf_dynamic_operators import DynamicBalanceSnapshot, observe_speculation_step_balance
 
 
 def _vec_dot(a: tuple[float, ...], b: tuple[float, ...]) -> float:
@@ -68,7 +69,11 @@ def eval_canonical_l4_mirror(
         return "UNKNOWN", 0.0, 0.0, 1.0
 
     # Contour A: inner bracketless central stem (ObservedBehavior_(t-1) ≍ Strategy_t ≍ ObservedBehavior_(t+1))
-    tau_core = min(_mirror_tie(p1_obs_prev, strategy, eps), _mirror_tie(strategy, p2_obs_next, eps))
+    tau_core = min(
+        _mirror_tie(p1_obs_prev, strategy, eps),
+        _mirror_tie(strategy, p2_obs_next, eps),
+        _mirror_tie(p1_obs_prev, p2_obs_next, eps),
+    )
 
     # Contour B: outer 4x4 non-commutative contact shell M_ij = alpha_{P_i -> P_j}, R_ij = r_{P_i -> P_j}
     m = [[0.0] * 4 for _ in range(4)]
@@ -155,6 +160,9 @@ class MirrorSpeculationScale:
         self.diff_recycles: int = 0
         self.q1_anchors_retained: int = 0
         self.last_logp_gap: float = 0.0
+        self._accept_ema: float = 1.0
+        self._last_balance: Optional[DynamicBalanceSnapshot] = None
+        self.balance_scale_breaks: int = 0
 
     def pick_depth(self, probs: list[float], max_allowed: int) -> int:
         """Pure-math canonical L4 depth selection using natural 1/2 survival & mirror wing balance."""
@@ -189,6 +197,18 @@ class MirrorSpeculationScale:
         self._last_tau_core = tau_core
         self._last_tau_wing = tau_wing
         self._last_delta_res = delta_res
+
+        # Solver-free 8-pair force balance on the speculative token scale (I = draft confidence & acceptance archive)
+        spec_bal = observe_speculation_step_balance(
+            depth_ratio=float(best_k) / float(self.max_drafts),
+            mean_prob=mean_p,
+            accept_ema=self._accept_ema,
+            logp_gap=self.last_logp_gap,
+        )
+        self._last_balance = spec_bal
+        if spec_bal.regime == "SCALE_BREAK":
+            self.balance_scale_breaks += 1
+            return 1
 
         if self._last_state == "SPLIT" or state == "SPLIT":
             return 1
@@ -226,6 +246,13 @@ class MirrorSpeculationScale:
                 # Exact log-probability ratio gap: log p(ver) - log p(draft) = logit(ver) - logit(draft)
                 logp_gap = max(0.0, float((flat_lg[ver_tok] - flat_lg[draft_tok]).item()))
         self.last_logp_gap = logp_gap
+        self._accept_ema = 0.7 * self._accept_ema + 0.3 * accept_ratio
+        self._last_balance = observe_speculation_step_balance(
+            depth_ratio=depth_ratio,
+            mean_prob=max(0.05, accept_ratio),
+            accept_ema=self._accept_ema,
+            logp_gap=logp_gap,
+        )
 
         # Capture reversible (x_draft, y_draft) tensor scar instead of discarding rejected compute
         if rejected and reject_hidden is not None and reject_out is not None:
@@ -342,6 +369,9 @@ class MirrorSpeculationScale:
         self._last_delta_res = 0.0
         self._scars.clear()
         self.last_logp_gap = 0.0
+        self._accept_ema = 1.0
+        self._last_balance = None
+        self.balance_scale_breaks = 0
 
     def stats(self) -> dict:
         return {
@@ -363,6 +393,8 @@ class MirrorSpeculationScale:
             "diff_recycles": self.diff_recycles,
             "q1_anchors_retained": self.q1_anchors_retained,
             "last_logp_gap": round(self.last_logp_gap, 4),
+            "balance_scale_breaks": self.balance_scale_breaks,
+            "rssf_balance": self._last_balance.as_dict() if self._last_balance is not None else None,
         }
 
 
@@ -589,6 +621,11 @@ class GeneralSpeculation:
             return 0
         total = 0
         for layer in getattr(past, "layers", ()):
+            if getattr(layer, "is_quintessentia_pinned_layer", False) or getattr(
+                layer, "is_quintessentia_prealloc_layer", False
+            ):
+                # Managed preallocated/pinned layers roll back in O(1) by decrementing `_seq_len` (zero copy).
+                continue
             seen.clear()
             state = vars(layer)
             # Append-only snapshots retain old KV storage even without cloning;
@@ -600,7 +637,14 @@ class GeneralSpeculation:
     @staticmethod
     def _crop_append_only(past, position):
         from transformers.cache_utils import DynamicLayer
-        if hasattr(past, "layers") and all(type(layer) is DynamicLayer for layer in past.layers):
+        if hasattr(past, "layers") and all(
+            (
+                type(layer) is DynamicLayer
+                or getattr(layer, "is_quintessentia_pinned_layer", False)
+                or getattr(layer, "is_quintessentia_prealloc_layer", False)
+            )
+            for layer in past.layers
+        ):
             remove = int(past.get_seq_length())-position
             if remove > 0:
                 past.crop(-remove)
@@ -612,7 +656,7 @@ class GeneralSpeculation:
         from quintessentia_cli.unified_runtime import QuintessentiaSpecGate, _eos_token_set
         u, eng = self.runtime, self.runtime.engine
         check = u._make_cancel_checker(cancel_check)
-        eos = _eos_token_set(u.tokenizer.eos_token_id)
+        eos = u._effective_eos_token_ids() if hasattr(u, "_effective_eos_token_ids") else _eos_token_set(u.tokenizer.eos_token_id)
         anchor = getattr(u, "_active_thought_anchor", None)
         gate = QuintessentiaSpecGate(max_drafts=u.max_drafts)
         before = self.counters.copy()
@@ -621,6 +665,19 @@ class GeneralSpeculation:
         sampling = getattr(u, "_active_sampling", None)
         stochastic_sampling = bool(sampling is not None and float(sampling.temperature) > 0.0)
         past = past_kv if cached_prefix_len else None
+        if past is None:
+            from quintessentia_cli.kv_offload import make_offloaded_kv_cache, plan_kv_cache
+            target_len = len(prompt_ids) + min(2048, max_new_tokens)
+            use_managed, n_offload, disable_pf = plan_kv_cache(u, target_len, device=eng.device)
+            if use_managed:
+                past = make_offloaded_kv_cache(
+                    eng.config,
+                    initial_capacity=target_len,
+                    chunk_pad=max(1, int(u.prefill_chunk_tokens)),
+                    device=eng.device,
+                    disable_prefetch=disable_pf,
+                    offload_layer_count=n_offload,
+                )
         native_ready = self.native is not None and self.native.resume(cached_prefix_len, prompt_ids[cached_prefix_len])
         cursor = cached_prefix_len
         native_rows = 0
@@ -631,22 +688,31 @@ class GeneralSpeculation:
                 u._reset_compute_peaks()
                 u._sync_compute()
                 started = time.perf_counter()
-                chunk = max(1, u.prefill_chunk_tokens)
-                for a in range(cached_prefix_len, len(prompt_ids), chunk):
+                hud_beacon = getattr(u, "_hud_beacon", None)
+                n_prompt = len(prompt_ids)
+                a = cached_prefix_len
+                while a < n_prompt:
                     check("prefill")
-                    b = min(len(prompt_ids), a+chunk)
+                    chunk = u._effective_prefill_chunk(n_prompt - a) if hasattr(u, "_effective_prefill_chunk") else max(1, u.prefill_chunk_tokens)
+                    b = min(n_prompt, a + chunk)
                     logits, past, hidden = self._run(prompt_ids[a:b], past, a,
-                        prefill=True, prefill_end=b == len(prompt_ids),
-                        prefetch=b < len(prompt_ids) or max_new_tokens > 1)
-                    if b == len(prompt_ids):
+                        prefill=True, prefill_end=b == n_prompt,
+                        prefetch=b < n_prompt or max_new_tokens > 1)
+                    if b == n_prompt:
                         if anchor is not None:
                             logits = anchor.on_prefill_end(u, past, logits)
                         picked = u._sample_next_token(logits[0], gen_history)
+                    del logits
                     if native_ready:
-                        next_tokens = prompt_ids[a+1:b+1] if b < len(prompt_ids) else prompt_ids[a+1:b]+[picked]
+                        next_tokens = prompt_ids[a+1:b+1] if b < n_prompt else prompt_ids[a+1:b]+[picked]
                         self.native.commit(hidden, next_tokens)
                         native_rows += len(next_tokens)
+                    del hidden
+                    self.hidden = None
                     cursor = b
+                    a = b
+                    if hud_beacon is not None and b < n_prompt:
+                        hud_beacon.on_prefill_progress(b, n_prompt)
                 all_ids.append(picked)
                 gen_history.append(picked)
                 u._sync_compute()
@@ -654,6 +720,13 @@ class GeneralSpeculation:
                 yield {"kind": "tokens", "new_ids": [picked]}
                 generated, passes = 1, 0
                 phase[0] = "decode"
+                from quintessentia_cli.kv_offload import transition_kv_cache_to_decode
+                transition_kv_cache_to_decode(
+                    past,
+                    u,
+                    decode_pad=max(1, int(u.max_drafts) + 1),
+                    extra_decode_tokens=min(2048, max(256, max_new_tokens)),
+                )
                 u._sync_compute()
                 started = time.perf_counter()
                 while generated < max_new_tokens and not (stop_on_eos and picked in eos):
@@ -673,6 +746,18 @@ class GeneralSpeculation:
                     if depth and not self.rowwise.supported:
                         depth = 0
                         self.counters["decoder_contract_plain_steps"] += 1
+                    # Guard state_budget BEFORE proposing Q1 skeleton drafts so long contexts
+                    # never clone a multi-hundred-MiB KV cache only to discard the draft right after.
+                    if depth:
+                        needed_pre = self._snapshot_bytes(past)
+                        contour_pre = getattr(u, "stanok_contour", None)
+                        while depth and (
+                            needed_pre * (depth + 1) > self.state_budget_bytes
+                            or (contour_pre is not None and not contour_pre.can_admit_bytes(needed_pre * (depth + 1)))
+                        ):
+                            depth -= 1
+                        if not depth:
+                            self.counters["state_budget_plain_steps"] += 1
                     t_draft = time.perf_counter()
                     self._draft_ctx = (past, cursor, gate)
                     try:
@@ -814,7 +899,11 @@ class GeneralSpeculation:
                     metrics["mirror_spec"] = self.mirror_spec.stats()
                 yield {"kind": "final_state", "all_ids": all_ids, "past": past, "last_fed_h": None,
                        "consumed_tokens": cursor, "prefill_ms": prefill_ms, "decode_s": decode_s,
-                       "decode_tokens": generated-1, "backbone_passes": passes, "spec_gate": metrics}
+                       "decode_tokens": generated-1, "backbone_passes": passes, "spec_gate": metrics,
+                       "kv_offloaded": bool(getattr(past, "is_quintessentia_offloaded", False)),
+                       "kv_gpu_layers": int(getattr(past, "gpu_kv_layer_count", 0)),
+                       "kv_offloaded_layers": int(getattr(past, "offloaded_kv_layer_count", 0)),
+                       "kv_promoted_layers": int(getattr(past, "promoted_layers_count", 0))}
         finally:
             eng._step_cancel_check = None
             self.capturing, self.hidden = False, None

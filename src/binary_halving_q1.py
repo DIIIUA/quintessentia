@@ -261,6 +261,21 @@ def halve_weight_to_q1_tree(
 
 
 _DIFF_Q1_GEMV_FN: Optional[Callable[..., Any]] = None
+_Q1_PREFILL_SCRATCH: Dict[int, torch.Tensor] = {}
+_Q1_PREFILL_SCRATCH_ELEMS = 16 * 1024 * 1024  # 32 MiB reusable BF16 tile buffer across all Q1 layers
+
+
+def _get_q1_prefill_scratch(device: torch.device) -> torch.Tensor:
+    dev_idx = 0 if device.index is None else int(device.index)
+    buf = _Q1_PREFILL_SCRATCH.get(dev_idx)
+    if buf is None or buf.device != device or int(buf.numel()) < _Q1_PREFILL_SCRATCH_ELEMS:
+        buf = torch.empty((_Q1_PREFILL_SCRATCH_ELEMS,), dtype=torch.bfloat16, device=device)
+        _Q1_PREFILL_SCRATCH[dev_idx] = buf
+    return buf
+
+
+def clear_q1_prefill_scratch() -> None:
+    _Q1_PREFILL_SCRATCH.clear()
 
 
 class BinaryHalvingQ1Linear(nn.Module):
@@ -328,8 +343,13 @@ class BinaryHalvingQ1Linear(nn.Module):
     def seed_mirror_anchor(self, x_anchor: torch.Tensor, y_anchor: torch.Tensor) -> None:
         """Seed physical (x_last, y_last) tensor anchor for differential Kernel #6 (e.g., from a recycled M7 draft scar)."""
         dev = self.packed_lo.device
-        self._mirror_x_last = x_anchor.detach().reshape(-1, self.in_features)[-1].to(device=dev, dtype=torch.bfloat16).contiguous()
-        self._mirror_y_last = y_anchor.detach().reshape(-1, self.out_features)[-1].to(device=dev, dtype=torch.bfloat16).contiguous()
+        # Always .clone() the single row so we never pin an entire [M, K]/[M, N] prefill buffer in VRAM.
+        self._mirror_x_last = x_anchor.detach().reshape(-1, self.in_features)[-1].to(device=dev, dtype=torch.bfloat16).clone()
+        self._mirror_y_last = y_anchor.detach().reshape(-1, self.out_features)[-1].to(device=dev, dtype=torch.bfloat16).clone()
+
+    def clear_mirror_anchor(self) -> None:
+        self._mirror_x_last = None
+        self._mirror_y_last = None
 
     def weight_bytes(self, cubes: Optional[int] = None) -> int:
         p = self.active_cubes if cubes is None else int(cubes)
@@ -362,14 +382,73 @@ class BinaryHalvingQ1Linear(nn.Module):
             w = u
         return w.to(dtype)
 
+    def _forward_cuda_prefill_gemm(self, flat: torch.Tensor, p_use: int) -> torch.Tensor:
+        """Fast batched prefill path: FWHT(X * col_scale) + 32 MiB tiled Q1->BF16 unpack + cuBLAS Tensor Core GEMM."""
+        from src.quintessentia_q1_cube_nvrtc import (
+            launch_ideal_q1_fwht_scale_x_bf16,
+            launch_ideal_q1_unpack_tile_bf16,
+        )
+        m, k = int(flat.shape[0]), self.in_features
+        n = self.out_features
+        dev = flat.device
+        x_in = flat if flat.is_contiguous() else flat.contiguous()
+        x_rot = torch.empty((m, k), dtype=torch.bfloat16, device=dev)
+        launch_ideal_q1_fwht_scale_x_bf16(x_in, self.col_scale, x_rot, group_size=self.group_size)
+
+        scratch = _get_q1_prefill_scratch(dev)
+        max_rows = max(1, int(scratch.numel()) // k)
+        tile_n = min(n, max(64, (max_rows // 64) * 64) if max_rows >= 64 else max_rows)
+
+        if tile_n >= n:
+            w_tile = scratch[: n * k].view(n, k)
+            launch_ideal_q1_unpack_tile_bf16(
+                self.packed_lo,
+                self.qscale,
+                self.qzero,
+                self.row_scale,
+                w_tile,
+                r0=0,
+                r_len=n,
+                group_size=self.group_size,
+                total_planes=self.root_bits,
+                active_planes=p_use,
+            )
+            y_out = F.linear(x_rot, w_tile, self.bias)
+            del x_rot
+            return y_out
+
+        y_out = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
+        for r0 in range(0, n, tile_n):
+            r1 = min(n, r0 + tile_n)
+            r_len = r1 - r0
+            w_tile = scratch[: r_len * k].view(r_len, k)
+            launch_ideal_q1_unpack_tile_bf16(
+                self.packed_lo,
+                self.qscale,
+                self.qzero,
+                self.row_scale,
+                w_tile,
+                r0=r0,
+                r_len=r_len,
+                group_size=self.group_size,
+                total_planes=self.root_bits,
+                active_planes=p_use,
+            )
+            b_tile = None if self.bias is None else self.bias[r0:r1]
+            y_tile = F.linear(x_rot, w_tile, b_tile)
+            y_out[:, r0:r1].copy_(y_tile)
+            del y_tile
+        del x_rot
+        return y_out
+
     def _forward_cuda_fast(self, flat: torch.Tensor, p_use: int) -> torch.Tensor:
         from src.quintessentia_q1_cube_nvrtc import launch_ideal_q1_b1_mma, launch_ideal_q1_fwht_gemv
-        y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=flat.device)
         if flat.shape[0] == 0:
-            return y_out
+            return torch.empty((0, self.out_features), dtype=torch.bfloat16, device=flat.device)
         if (self.micro_agent_tol is not None and flat.shape[0] == 1 and self.group_size == 64
                 and self.in_features >= 1024 and self.out_features >= 512):
             from src.mirror_micro_agents_nvrtc import launch_coupled_micro_agent_q1_reader
+            y_out = torch.empty((1, self.out_features), dtype=torch.bfloat16, device=flat.device)
             launch_coupled_micro_agent_q1_reader(
                 flat.contiguous(), self.packed_lo, self.qscale, self.qzero,
                 self.row_scale, self.col_scale, y_out, max_planes=p_use,
@@ -377,6 +456,9 @@ class BinaryHalvingQ1Linear(nn.Module):
             self.micro_agent_calls += 1
             return y_out
         if flat.shape[0] >= 8:
+            if self.in_features <= _Q1_PREFILL_SCRATCH_ELEMS and self.group_size in (16, 32, 64):
+                return self._forward_cuda_prefill_gemm(flat, p_use)
+            y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=flat.device)
             launch_ideal_q1_b1_mma(
                 flat.contiguous(),
                 self.packed_lo,
@@ -390,21 +472,22 @@ class BinaryHalvingQ1Linear(nn.Module):
                 active_planes=p_use,
                 bias=self.bias,
             )
-        else:
-            launch_ideal_q1_fwht_gemv(
-                flat.contiguous(),
-                self.packed_lo,
-                self.qscale,
-                self.qzero,
-                self.row_scale,
-                self.col_scale,
-                y_out,
-                group_size=self.group_size,
-                total_planes=self.root_bits,
-                plane_start=0,
-                plane_count=p_use,
-                bias=self.bias,
-            )
+            return y_out
+        y_out = torch.empty((flat.shape[0], self.out_features), dtype=torch.bfloat16, device=flat.device)
+        launch_ideal_q1_fwht_gemv(
+            flat.contiguous(),
+            self.packed_lo,
+            self.qscale,
+            self.qzero,
+            self.row_scale,
+            self.col_scale,
+            y_out,
+            group_size=self.group_size,
+            total_planes=self.root_bits,
+            plane_start=0,
+            plane_count=p_use,
+            bias=self.bias,
+        )
         return y_out
 
     def _forward_stepwise_cubes(self, flat: torch.Tensor, p_max: int) -> torch.Tensor:
@@ -538,8 +621,8 @@ class BinaryHalvingQ1Linear(nn.Module):
                             raise RuntimeError(f"cuLaunchKernel(pure_mirror_diff_q1_gemv_r2_f32) failed: {rc}")
                         self.mirror_diff_calls += 1
                         if xl is None:
-                            self._mirror_x_last = f_in[0].detach().contiguous()
-                            self._mirror_y_last = y[0].detach().contiguous()
+                            self._mirror_x_last = f_in[0].detach().clone()
+                            self._mirror_y_last = y[0].detach().clone()
                         return y.view(*x.shape[:-1], self.out_features)
                     global _DIFF_Q1_GEMV_FN
                     if _DIFF_Q1_GEMV_FN is None:
@@ -562,13 +645,15 @@ class BinaryHalvingQ1Linear(nn.Module):
                     )
                     self.mirror_diff_calls += 1
                     if self._mirror_x_last is None:
-                        self._mirror_x_last = flat[0].detach().contiguous()
-                        self._mirror_y_last = y[0].detach().contiguous()
+                        self._mirror_x_last = flat[0].detach().clone()
+                        self._mirror_y_last = y[0].detach().clone()
                     return y.view(*x.shape[:-1], self.out_features)
                 y = self._forward_cuda_fast(flat, p_use)
                 if flat.shape[0] > 0:
-                    self._mirror_x_last = flat[-1].detach().contiguous()
-                    self._mirror_y_last = y[-1].detach().contiguous()
+                    # CRITICAL: .clone() copies ONLY the 1-row anchor (~8-24 KiB) instead of
+                    # pinning the entire [M, K]/[M, N] prefill activation tensor (~2+ GiB across 248 projections)!
+                    self._mirror_x_last = flat[-1].detach().clone()
+                    self._mirror_y_last = y[-1].detach().clone()
                 return y.view(*x.shape[:-1], self.out_features)
             y = self._forward_cuda_fast(flat, p_use)
             return y.view(*x.shape[:-1], self.out_features)
@@ -1287,15 +1372,11 @@ class IncrementalCubeCarver:
         *,
         min_cubes: int = 3,
         mirror_tol: float = 0.045,
+        balance_out: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], BinaryHalvingTreeMeta, int, float]:
-        """Pure-math M0 Mirror Equality trunk carver (zero words, tensor norm invariants only).
+        """Pure-math M0 Mirror Equality trunk carver + 8-pair Q1-cube force balance."""
+        from src.rssf_dynamic_operators import observe_q1_cube_balance
 
-        Evaluates bracketless convergence directly on the rotated weight residual:
-            eps_p = ||W - W_p||_F / ||W||_F
-            delta_p = ||Delta_p||_F / (||W||_F + eps)
-            tau_p = |delta_p - delta_{p-1}| / (delta_p + delta_{p-1} + eps)
-        Stopping cleanly at `k_opt` once `eps_p <= mirror_tol and delta_p <= mirror_tol`.
-        """
         target_max = max(1, min(self.root_bits, int(max_cubes)))
         target_min = max(1, min(target_max, int(min_cubes)))
         ref_n = (
@@ -1305,6 +1386,9 @@ class IncrementalCubeCarver:
         ) + 1e-8
         rem_rel = 1.0
         prev_rem_rel: Optional[float] = None
+        last_q1_bal = None
+        scale_break_protected = False
+        info_exhausted_stop = False
 
         while len(self._carved_lo) < target_max:
             p = len(self._carved_lo)
@@ -1331,6 +1415,14 @@ class IncrementalCubeCarver:
                     if prev_rem_rel is not None
                     else 1.0
                 )
+                q1_bal = observe_q1_cube_balance(
+                    info_density=max(0.01, min(1.0, step_rel)),
+                    weight_mass_frac=float(p + 1) / float(max(1, target_max)),
+                    input_impulse=max(0.02, rem_rel),
+                    residual_entropy=max(0.02, rem_rel * (1.0 + max(0.0, 1.0 - rel_gain))),
+                    output_coherence=max(0.05, 1.0 - min(0.95, rem_rel)),
+                )
+                last_q1_bal = q1_bal
                 exact_converged = (rem_rel <= mirror_tol and step_rel <= mirror_tol)
                 plateau_converged = (
                     prev_rem_rel is not None
@@ -1338,10 +1430,24 @@ class IncrementalCubeCarver:
                     and rel_gain <= 0.12
                 )
                 prev_rem_rel = rem_rel
-                if mirror_tol > 0.0 and (exact_converged or plateau_converged):
+                if plateau_converged and q1_bal.regime == "SCALE_BREAK":
+                    scale_break_protected = True
+                    plateau_converged = False
+                if mirror_tol > 0.0 and (
+                    exact_converged
+                    or (plateau_converged and q1_bal.d3_margin > 0.0 and q1_bal.info_efficiency < 0.25)
+                ):
+                    if not exact_converged:
+                        info_exhausted_stop = True
                     break
 
         k_opt = len(self._carved_lo)
+        if balance_out is not None and last_q1_bal is not None:
+            balance_out.update(last_q1_bal.as_dict())
+            balance_out["scale_break_protected"] = scale_break_protected
+            balance_out["info_exhausted_stop"] = info_exhausted_stop
+            balance_out["k_opt"] = k_opt
+            balance_out["rem_rel"] = round(rem_rel, 5)
         tensors = {
             "packed_lo": torch.stack(self._carved_lo[:k_opt], dim=0).contiguous(),
             "qscale": self._carved_sc[0].unsqueeze(0).contiguous(),
@@ -1376,8 +1482,9 @@ def carve_trunk_mirror_q1(
     group_size: int = 64,
     use_fwht: bool = True,
     sinkhorn_iters: int = 3,
+    balance_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], BinaryHalvingTreeMeta, int, float]:
-    """Carve a dense trunk projection under pure-math M0 Mirror Equality.
+    """Carve a dense trunk projection under pure-math M0 Mirror Equality + 8-pair Q1 cube balance.
 
     Uses the single-pass CUDA Ballot Kernel #7 (~5 ms, 200x faster than Python loop)
     on CUDA with `group_size == 64`, preserving exact bit-faithful parity with
@@ -1394,6 +1501,7 @@ def carve_trunk_mirror_q1(
         and int(root_bits) in (2, 4, 8, 16)
     ):
         from src.pure_mirror_agents_nvrtc import launch_pure_mirror_carve_q1_ballot
+        from src.rssf_dynamic_operators import observe_q1_cube_balance
 
         dev = weight.device
         n, k = int(weight.shape[0]), int(weight.shape[1])
@@ -1427,6 +1535,9 @@ def carve_trunk_mirror_q1(
         k_opt = target_max
         rem_rel = 1.0
         prev_rem_rel: Optional[float] = None
+        last_q1_bal = None
+        scale_break_protected = False
+        info_exhausted_stop = False
         for p in range(target_max):
             n_rem = math.sqrt(max(0.0, float(vals[2 + p])))
             n_step = 8.0 * float(2.0 ** (-p)) * qs_norm
@@ -1438,6 +1549,14 @@ def carve_trunk_mirror_q1(
                     if prev_rem_rel is not None
                     else 1.0
                 )
+                q1_bal = observe_q1_cube_balance(
+                    info_density=max(0.01, min(1.0, step_rel)),
+                    weight_mass_frac=float(p + 1) / float(max(1, target_max)),
+                    input_impulse=max(0.02, rem_rel),
+                    residual_entropy=max(0.02, rem_rel * (1.0 + max(0.0, 1.0 - rel_gain))),
+                    output_coherence=max(0.05, 1.0 - min(0.95, rem_rel)),
+                )
+                last_q1_bal = q1_bal
                 exact_converged = (rem_rel <= mirror_tol and step_rel <= mirror_tol)
                 plateau_converged = (
                     prev_rem_rel is not None
@@ -1445,9 +1564,24 @@ def carve_trunk_mirror_q1(
                     and rel_gain <= 0.12
                 )
                 prev_rem_rel = rem_rel
-                if mirror_tol > 0.0 and (exact_converged or plateau_converged):
+                if plateau_converged and q1_bal.regime == "SCALE_BREAK":
+                    scale_break_protected = True
+                    plateau_converged = False
+                if mirror_tol > 0.0 and (
+                    exact_converged
+                    or (plateau_converged and q1_bal.d3_margin > 0.0 and q1_bal.info_efficiency < 0.25)
+                ):
                     k_opt = p + 1
+                    if not exact_converged:
+                        info_exhausted_stop = True
                     break
+
+        if balance_out is not None and last_q1_bal is not None:
+            balance_out.update(last_q1_bal.as_dict())
+            balance_out["scale_break_protected"] = scale_break_protected
+            balance_out["info_exhausted_stop"] = info_exhausted_stop
+            balance_out["k_opt"] = k_opt
+            balance_out["rem_rel"] = round(rem_rel, 5)
 
         packed_out = pk_all if k_opt == target_max else pk_all[:k_opt].contiguous().clone()
         tensors = {
@@ -1480,7 +1614,9 @@ def carve_trunk_mirror_q1(
         sinkhorn_iters=sinkhorn_iters,
         compute_diagnostics=False,
     )
-    return carver.carve_trunk_mirror(max_cubes, min_cubes=min_cubes, mirror_tol=mirror_tol)
+    return carver.carve_trunk_mirror(
+        max_cubes, min_cubes=min_cubes, mirror_tol=mirror_tol, balance_out=balance_out
+    )
 
 
 @torch.no_grad()
@@ -2576,6 +2712,12 @@ class AirLLMLazyBinaryHalvingRunner:
         self.layer_tensor_keys = layer_tensor_keys
         self.trunk_projections_carved: int = 0
         self.trunk_early_stops: int = 0
+        self._m0_rssf_obs: int = 0
+        self._m0_rssf_d3_sum: float = 0.0
+        self._m0_rssf_ie_sum: float = 0.0
+        self._m0_rssf_scale_breaks: int = 0
+        self._m0_rssf_info_stops: int = 0
+        self._m0_rssf_last: Optional[Dict[str, Any]] = None
         self._trunk_q1_modules: List[BinaryHalvingQ1Linear] = []
         self._relay = None
         self._relay_pool = None
@@ -2995,6 +3137,7 @@ class AirLLMLazyBinaryHalvingRunner:
                 b_gpu = None if b_raw is None else b_raw.to(device=self.device, dtype=torch.bfloat16).contiguous()
                 eff_max = max(2, n_cubes - int(plane_shed)) if not in_cone else n_cubes
                 min_k = eff_max if in_cone else max(3, eff_max - 1)
+                _m0_b: Dict[str, Any] = {}
                 t_gpu, meta, k_used, _ = carve_trunk_mirror_q1(
                     w_raw,
                     eff_max,
@@ -3004,7 +3147,10 @@ class AirLLMLazyBinaryHalvingRunner:
                     group_size=self.group_size,
                     use_fwht=self.use_fwht,
                     sinkhorn_iters=self.sinkhorn_iters,
+                    balance_out=_m0_b,
                 )
+                if _m0_b:
+                    self._record_m0_rssf_balance(_m0_b)
                 del w_raw
                 carved_cubes += int(k_used)
                 pkg["q1"][sub_name] = {"tensors": t_gpu, "bias": b_gpu, "meta": meta, "k_used": int(k_used)}
@@ -3249,6 +3395,7 @@ class AirLLMLazyBinaryHalvingRunner:
                     in_cone = (self.num_layers >= 8 and layer_idx < 4)
                     if self.mirror_v4_trunk:
                         min_k = n_cubes if in_cone else max(3, n_cubes - 1)
+                        _m0_b: Dict[str, Any] = {}
                         t_gpu, meta, k_used, _ = carve_trunk_mirror_q1(
                             w_raw,
                             n_cubes,
@@ -3258,7 +3405,10 @@ class AirLLMLazyBinaryHalvingRunner:
                             group_size=self.group_size,
                             use_fwht=self.use_fwht,
                             sinkhorn_iters=self.sinkhorn_iters,
+                            balance_out=_m0_b,
                         )
+                        if _m0_b:
+                            self._record_m0_rssf_balance(_m0_b)
                         self.trunk_projections_carved += 1
                         if k_used < n_cubes:
                             self.trunk_early_stops += 1
@@ -3447,6 +3597,7 @@ class AirLLMLazyBinaryHalvingRunner:
             b_gpu = None if b_raw is None else b_raw.to(device=self.device, dtype=torch.bfloat16).contiguous()
             if self.mirror_v4_trunk:
                 min_k = n_cubes if in_cone else max(3, n_cubes - 1)
+                _m0_b: Dict[str, Any] = {}
                 t_gpu, meta, k_used, _ = carve_trunk_mirror_q1(
                     w_raw,
                     n_cubes,
@@ -3456,7 +3607,10 @@ class AirLLMLazyBinaryHalvingRunner:
                     group_size=self.group_size,
                     use_fwht=self.use_fwht,
                     sinkhorn_iters=self.sinkhorn_iters,
+                    balance_out=_m0_b,
                 )
+                if _m0_b:
+                    self._record_m0_rssf_balance(_m0_b)
                 self.trunk_projections_carved += 1
                 if k_used < n_cubes:
                     self.trunk_early_stops += 1
@@ -3506,6 +3660,16 @@ class AirLLMLazyBinaryHalvingRunner:
                 self.peak_vram_bytes = cur_v
         return True
 
+    def _record_m0_rssf_balance(self, bdict: Dict[str, Any]) -> None:
+        self._m0_rssf_obs += 1
+        self._m0_rssf_d3_sum += float(bdict.get("d3_margin", 0.0))
+        self._m0_rssf_ie_sum += float(bdict.get("info_efficiency_t4", 0.0))
+        if bdict.get("scale_break_protected"):
+            self._m0_rssf_scale_breaks += 1
+        if bdict.get("info_exhausted_stop"):
+            self._m0_rssf_info_stops += 1
+        self._m0_rssf_last = dict(bdict)
+
     def stats(self) -> Dict[str, Any]:
         return {
             "mode": "unified_q1_cubes" if self.resident_layers > 0 else "method_2_airllm_lazy_binary_halving",
@@ -3537,6 +3701,18 @@ class AirLLMLazyBinaryHalvingRunner:
                 "early_stops": self.trunk_early_stops,
                 "diff_q1_calls": sum(int(m.mirror_diff_calls) for m in self._trunk_q1_modules),
                 "anchored_projections": sum(1 for m in self._trunk_q1_modules if m._mirror_x_last is not None),
+                "rssf_balance": (
+                    {
+                        "projections_observed": self._m0_rssf_obs,
+                        "mean_d3_margin": round(self._m0_rssf_d3_sum / max(1, self._m0_rssf_obs), 4),
+                        "mean_info_efficiency_t4": round(self._m0_rssf_ie_sum / max(1, self._m0_rssf_obs), 4),
+                        "scale_break_protections": self._m0_rssf_scale_breaks,
+                        "info_exhausted_stops": self._m0_rssf_info_stops,
+                        "last": self._m0_rssf_last,
+                    }
+                    if self._m0_rssf_obs > 0
+                    else None
+                ),
                 "v4_trunk_breather": None if self._v4_m2 is None else {
                     "window_depth": self._v4_window_depth,
                     "plane_shed": self._v4_plane_shed,
@@ -3559,7 +3735,13 @@ class AirLLMLazyBinaryHalvingRunner:
             },
         }
 
+    def clear_mirror_anchors(self) -> None:
+        for mod in self._trunk_q1_modules:
+            mod.clear_mirror_anchor()
+        clear_q1_prefill_scratch()
+
     def close(self) -> None:
+        self.clear_mirror_anchors()
         if self._v4_pool is not None:
             for fut in list(self._v4_futures.values()):
                 try:
@@ -3608,6 +3790,7 @@ def _install_q1_cubes_lm_head(
     root_bits: int,
     group_size: int = 64,
     min_bf16_bytes: int = 256 * 1024**2,
+    lm_head_cubes: Optional[int] = None,
 ) -> bool:
     """Carve a large BF16 `lm_head` (>= 256 MiB) into chunked pure-Q1 cubes (`BinaryHalvingQ1Linear`).
 
@@ -3638,7 +3821,10 @@ def _install_q1_cubes_lm_head(
         launch_pure_mirror_sinkhorn_l2,
     )
 
-    lm_cubes = max(1, min(int(root_bits), max(5, int(cubes_per_proj))))
+    if lm_head_cubes is not None:
+        lm_cubes = max(1, min(int(root_bits), int(lm_head_cubes)))
+    else:
+        lm_cubes = max(1, min(int(root_bits), max(5, int(cubes_per_proj))))
     w_bf16 = w_param.detach().to(device=device, dtype=torch.bfloat16).contiguous()
     lm_bias = None if head_mod.bias is None else head_mod.bias.detach().to(device=device, dtype=torch.bfloat16).contiguous()
     row_scale, col_scale, _ = launch_pure_mirror_sinkhorn_l2(w_bf16, iters=3, apply=False)
@@ -3731,6 +3917,7 @@ def attach_q1_cubes_to_engine(
     stanok_contour: Any = None,
     graphify_feedback: Any = False,
     mirror_v4_trunk: bool = False,
+    lm_head_cubes: Optional[int] = None,
 ) -> AirLLMLazyBinaryHalvingRunner:
     """Attach the unified Binary Halving Q1 Cube runner (resident head + AirLLM streamed tail + L1/L2 MoE)
     onto an existing `QuintessentiaModel` instance without altering disk streaming invariants.
@@ -3767,6 +3954,7 @@ def attach_q1_cubes_to_engine(
         cubes_per_proj=cubes_per_proj,
         root_bits=root_bits,
         group_size=group_size,
+        lm_head_cubes=lm_head_cubes,
     )
 
     src = getattr(wm, "model_source", None) if wm is not None else None

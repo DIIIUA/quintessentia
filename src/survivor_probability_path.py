@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import partial
+import math
 from typing import Any
 
 import torch
@@ -82,6 +83,8 @@ class SurvivorProbabilityTracker:
         self.mirror_mode = bool(mirror_mode)
         self.split_protected_count: int = 0
         self.last_entropy_floor: float | None = None
+        self._last_rssf_balance: Any = None
+        self.rssf_scale_breaks: int = 0
 
         layers = _resolve_layers(engine)
         n_layers = len(layers)
@@ -345,10 +348,46 @@ class SurvivorProbabilityTracker:
             entropy = float((-(p_last * lp_last).sum()).clamp_min(1.0).item())
             peak_lp = float(lp_last.max().item())
             dyn_floor = peak_lp - 2.0 * entropy
+
+            # 8-pair probability-path balance (M6): I = survivor concentration, Q = late surge, S = entropy
+            from src.rssf_dynamic_operators import observe_probability_path_balance
+
+            max_ent = max(1.0, math.log(max(2, int(cand.numel()))))
+            top_k_m = min(8, int(p_last.numel()))
+            top_mass = float(p_last.topk(top_k_m).values.sum().item()) if top_k_m > 0 else 0.0
+            late_surge = float(d_last.clamp_min(0.0).max().item()) / max(1.0, entropy)
+            ckpt_agree = (
+                float(
+                    F.cosine_similarity(
+                        lp_stack[0].unsqueeze(0), lp_last.unsqueeze(0), dim=-1
+                    ).clamp(0.0, 1.0).item()
+                )
+                if c_cnt >= 2
+                else 1.0
+            )
+            base_alive = lp_max >= dyn_floor
+            alive_frac = float(base_alive.float().mean().item())
+            rssf_m6 = observe_probability_path_balance(
+                top_mass=top_mass,
+                entropy=entropy,
+                max_entropy=max_ent,
+                late_surge=late_surge,
+                checkpoint_agreement=ckpt_agree,
+                alive_frac=alive_frac,
+            )
+            self._last_rssf_balance = rssf_m6
+
+            split_tau_thresh = 0.5
+            if rssf_m6.regime == "SCALE_BREAK":
+                self.rssf_scale_breaks += 1
+                # Strong late probability surge under high entropy: widen split protection gently
+                split_tau_thresh = 0.35
+                dyn_floor = peak_lp - 2.25 * entropy
+                base_alive = lp_max >= dyn_floor
+
             self.last_entropy_floor = round(dyn_floor, 4)
 
-            split_rising = (tau_split > 0.5) & (d_last > 0.0)
-            base_alive = lp_max >= dyn_floor
+            split_rising = (tau_split > split_tau_thresh) & (d_last > 0.0)
             self.split_protected_count = int((split_rising & (~base_alive)).sum().item())
             alive = base_alive | split_rising
             score = s_prob + 0.5 * tau_split * d_last.clamp_min(0.0)
@@ -454,4 +493,12 @@ class SurvivorProbabilityTracker:
             "anchor_applications": self.anchor_applications,
             "draft_vocab_syncs": self.draft_vocab_syncs,
             "max_log_odds_shift": self.max_log_odds_shift,
+            "rssf_balance": (
+                {
+                    **self._last_rssf_balance.as_dict(),
+                    "scale_breaks": self.rssf_scale_breaks,
+                }
+                if self._last_rssf_balance is not None
+                else None
+            ),
         }

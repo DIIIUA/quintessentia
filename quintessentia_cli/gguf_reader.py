@@ -61,6 +61,7 @@ GGML_TYPE_IQ1_M = 29
 GGML_TYPE_BF16 = 30
 GGML_TYPE_TQ1_0 = 34
 GGML_TYPE_TQ2_0 = 35
+GGML_TYPE_I2_S = 36
 GGML_TYPE_MXFP4 = 39
 GGML_TYPE_NVFP4 = 40
 GGML_TYPE_Q1_0 = 41
@@ -115,6 +116,7 @@ for _id, (_name, _bytes) in GGML_TYPE_RAW.items():
     _GGML_TYPE_NAMES[_id] = _name
 for _id, (_name, _block, _bytes) in GGML_TYPE_BLOCK.items():
     _GGML_TYPE_NAMES[_id] = _name
+_GGML_TYPE_NAMES[GGML_TYPE_I2_S] = "I2_S"
 
 GGML_TYPE_NAMES = dict(_GGML_TYPE_NAMES)
 
@@ -171,6 +173,14 @@ def _tensor_bytes(dims, ggml_type):
     numel = 1
     for dim in dims:
         numel *= dim
+    if ggml_type == GGML_TYPE_I2_S:
+        # Microsoft BitNet.cpp I2_S: 128-element interleaved 32-byte blocks + 32-byte trailing f32 scale
+        row = dims[0] if dims else 1
+        if row % 128 != 0 or numel % 4 != 0:
+            raise GGUFError(
+                "ggml type I2_S requires dims[0] (%d) to be a multiple of 128" % row
+            )
+        return (numel // 4) + 32, numel
     block_elems, block_bytes = ggml_block_spec(ggml_type)
     row = dims[0] if dims else 1
     if block_elems > 1:

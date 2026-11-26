@@ -22,6 +22,7 @@ from contextlib import contextmanager
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import inspect
 import ipaddress
 import json
 import logging
@@ -34,7 +35,13 @@ import time
 import traceback
 from typing import Any
 import uuid
-from .runtime_config import model_context_limit
+from .runtime_config import compute_runtime_limits, model_context_limit
+from .tool_calling import (
+    StreamingToolCallGuard,
+    is_tool_choice_none,
+    normalize_inline_tool_calls,
+    parse_tool_calls,
+)
 
 
 class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
@@ -231,6 +238,24 @@ def format_connection_passport(passport: dict[str, Any]) -> str:
     auth_mode = "REQUIRED (Bearer)" if passport.get("require_auth") else "Optional (accepts any Bearer key)"
     extra_ips = [ip for ip in passport.get("all_lan_ips", []) if ip != passport["lan_ip"]]
     extra_line = f"\n  Alt LAN IPs     : {', '.join(f'http://{ip}:{passport['http_port']}' for ip in extra_ips)}" if extra_ips else ""
+    lim = passport.get("limits") if isinstance(passport.get("limits"), dict) else None
+    limits_line = ""
+    if lim and lim.get("effective_context_length"):
+        fast_str = f" | fast_vram={lim['fast_vram_context_length']}" if lim.get("fast_vram_context_length") else ""
+        limits_line = (
+            f"  Auto Limits     : ctx={lim['effective_context_length']}{fast_str} "
+            f"(native={lim.get('native_context_length') or '?'}) | "
+            f"max_in={lim.get('max_input_tokens')} | max_out={lim.get('max_output_tokens')} "
+            f"[{lim.get('context_limit_source', 'auto')}]\n"
+        )
+    cal = passport.get("calibration") if isinstance(passport.get("calibration"), dict) else None
+    cal_line = ""
+    if cal and cal.get("ok"):
+        pcie_s = f" | PCIe={cal['pcie_h2d_gb_s']} GB/s" if cal.get("pcie_h2d_gb_s") else ""
+        cal_line = (
+            f"  Calibration     : chunk_ws={cal.get('chunk_workspace_mib')} MiB | "
+            f"prefill={cal.get('prefill_tok_per_s')} tok/s | decode={cal.get('decode_tok_per_s')} tok/s{pcie_s}\n"
+        )
 
     return (
         "\n"
@@ -241,7 +266,9 @@ def format_connection_passport(passport: dict[str, Any]) -> str:
         f"  Model ID        : {model_id}"
         + (f" [{passport['backend']} / {passport['weight_format']}]" if passport.get("weight_format") else "")
         + "\n"
-        f"  Local Browser   : {local_url}\n"
+        + limits_line
+        + cal_line
+        + f"  Local Browser   : {local_url}\n"
         f"  LAN Web Chat    : {lan_url}{extra_line}\n"
         f"  OpenAI Base URL : {oai_url}\n"
         f"  API Key         : {api_key}  [{auth_mode}]\n"
@@ -321,12 +348,17 @@ async function refreshInfo() {
     const st = d.engine || {};
     const lm = st.last_metrics || {};
     const tps = lm.decode_tok_per_s ? `${lm.decode_tok_per_s} tok/s` : 'ready';
+    const rb = lm.rssf_generation_balance || {};
+    const tb = rb.turn_end_balance || {};
+    const kvBadge = (lm.kv_gpu_layers || lm.kv_offloaded_layers) ? `<span class="badge">KV: ${lm.kv_gpu_layers || 0}G/${lm.kv_offloaded_layers || 0}R</span>` : '';
+    const balBadge = (tb.d3_margin !== undefined) ? `<span class="badge">Balance: d3=${tb.d3_margin} (${tb.regime || 'OK'})</span>` : '';
     badges.innerHTML = `
       <span class="badge">Model: ${d.model_id}</span>
       <span class="badge">Format: ${d.weight_format || 'auto'}</span>
       <span class="badge">GPU: ${d.gpu_name} (${d.vram_mode})</span>
       <span class="badge">VRAM: ${st.allocated_vram_mib || 0} MiB</span>
       <span class="badge">Speed: ${tps}</span>
+      ${kvBadge}${balBadge}
       <span class="badge">OpenAI API: ${d.openai_base_url}</span>`;
   } catch (e) {}
 }
@@ -450,7 +482,7 @@ async function sendPrompt() {
 """
 
 
-DEFAULT_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 DEFAULT_LOG_FILE = "logs/server.log"
 
 
@@ -677,9 +709,19 @@ class QuintessentiaLANServer:
             "started_at": self.started_at,
         }
 
+    def runtime_limits(self) -> dict[str, Any]:
+        busy = bool(self.coordinator.snapshot().get("busy", False))
+        limits = compute_runtime_limits(self.engine, busy=busy)
+        limits["max_request_bytes"] = self.max_request_bytes
+        return limits
+
     def full_passport_for_console(self) -> dict[str, Any]:
         p = self.passport()
         p["api_key"] = self.api_key
+        p["limits"] = self.runtime_limits()
+        cal = getattr(self.engine, "calibration", None)
+        if isinstance(cal, dict) and cal.get("ok"):
+            p["calibration"] = cal
         return p
 
     def _build_handler(self):
@@ -785,6 +827,8 @@ class QuintessentiaLANServer:
                     info = srv.passport()
                     info["engine"] = srv.engine.status_snapshot()
                     info["generation"] = srv.coordinator.snapshot()
+                    info["limits"] = srv.runtime_limits()
+                    info["capabilities"] = {"tool_calling": True, "reasoning": True, "streaming": True}
                     info["max_request_bytes"] = srv.max_request_bytes
                     if srv.beacon is not None:
                         info["beacon_stats"] = {
@@ -797,8 +841,11 @@ class QuintessentiaLANServer:
                 if path in ("/v1/models", "/api/v0/models"):
                     if not self._check_auth():
                         return
-                    snap = srv.engine.status_snapshot() if hasattr(srv.engine, "status_snapshot") else {}
-                    max_ctx = model_context_limit(getattr(srv.engine, "engine", srv.engine))
+                    lim = srv.runtime_limits()
+                    eff_ctx = lim["effective_context_length"]
+                    native_ctx = lim["native_context_length"]
+                    max_out = lim["max_output_tokens"]
+                    max_in = lim["max_input_tokens"]
                     if path == "/api/v0/models":
                         self._send_json(
                             {
@@ -809,10 +856,16 @@ class QuintessentiaLANServer:
                                         "object": "model",
                                         "type": "llm",
                                         "state": "loaded",
-                                        "max_context_length": None,
-                                        "native_context_length": max_ctx,
+                                        "max_context_length": eff_ctx,
+                                        "loaded_context_length": eff_ctx,
+                                        "context_length": eff_ctx,
+                                        "native_context_length": native_ctx,
+                                        "max_output_tokens": max_out,
+                                        "max_input_tokens": max_in,
+                                        "prefill_chunk_tokens": lim["prefill_chunk_tokens"],
+                                        "context_limit_source": lim["context_limit_source"],
                                         "context_limit_enforced": False,
-                                        "loaded_context_length": None,
+                                        "capabilities": ["tool_use", "reasoning"],
                                     }
                                 ],
                             }
@@ -827,10 +880,27 @@ class QuintessentiaLANServer:
                                     "object": "model",
                                     "created": srv.started_at,
                                     "owned_by": "quintessentia-lan",
-                                    "context_length": None,
-                                    "native_context_length": max_ctx,
+                                    "context_length": eff_ctx,
+                                    "max_model_len": eff_ctx,
+                                    "max_context_length": eff_ctx,
+                                    "loaded_context_length": eff_ctx,
+                                    "context_window": eff_ctx,
+                                    "n_ctx": eff_ctx,
+                                    "num_ctx": eff_ctx,
+                                    "native_context_length": native_ctx,
+                                    "max_output_tokens": max_out,
+                                    "max_completion_tokens": max_out,
+                                    "max_input_tokens": max_in,
+                                    "max_prompt_tokens": max_in,
+                                    "prefill_chunk_tokens": lim["prefill_chunk_tokens"],
+                                    "kv_bytes_per_token": lim["kv_bytes_per_token"],
+                                    "context_limit_source": lim["context_limit_source"],
                                     "context_limit_enforced": False,
-                                    "max_model_len": None,
+                                    "capabilities": {
+                                        "tool_calling": True,
+                                        "reasoning": True,
+                                        "streaming": True,
+                                    },
                                 }
                             ],
                         }
@@ -840,15 +910,33 @@ class QuintessentiaLANServer:
                 if path in ("/props", "/api/extra/true_max_context_length"):
                     if not self._check_auth():
                         return
-                    snap = srv.engine.status_snapshot() if hasattr(srv.engine, "status_snapshot") else {}
-                    max_ctx = model_context_limit(getattr(srv.engine, "engine", srv.engine))
+                    lim = srv.runtime_limits()
+                    eff_ctx = lim["effective_context_length"]
+                    native_ctx = lim["native_context_length"]
+                    max_out = lim["max_output_tokens"]
+                    max_in = lim["max_input_tokens"]
                     if path == "/api/extra/true_max_context_length":
-                        self._send_json({"value": None, "native_context_length": max_ctx, "context_limit_enforced": False})
+                        self._send_json(
+                            {
+                                "value": eff_ctx,
+                                "native_context_length": native_ctx,
+                                "max_output_tokens": max_out,
+                                "max_input_tokens": max_in,
+                                "context_limit_enforced": False,
+                            }
+                        )
                         return
                     self._send_json(
                         {
+                            "n_ctx": eff_ctx,
+                            "max_output_tokens": max_out,
+                            "max_input_tokens": max_in,
+                            "prefill_chunk_tokens": lim["prefill_chunk_tokens"],
+                            "native_context_length": native_ctx,
+                            "context_limit_enforced": False,
                             "default_generation_settings": {
-                                "n_ctx": None,
+                                "n_ctx": eff_ctx,
+                                "n_predict": max_out,
                                 "model": srv.engine.model_id,
                             },
                             "total_slots": 1,
@@ -860,7 +948,7 @@ class QuintessentiaLANServer:
 
             def do_POST(self) -> None:
                 path = self.path.split("?", 1)[0]
-                if path not in ("/v1/chat/completions", "/v1/chat/stop", "/api/stop", "/api/reset"):
+                if path not in ("/v1/chat/completions", "/v1/chat/stop", "/api/stop", "/api/reset", "/api/show"):
                     self._send_error(HTTPStatus.NOT_FOUND, f"Unknown endpoint {path}", "not_found", close=True)
                     return
                 if not self._check_auth():
@@ -874,6 +962,35 @@ class QuintessentiaLANServer:
                 except (TimeoutError, OSError) as exc:
                     srv.log.warning("%s %s body read failed: %r", self.address_string(), path, exc)
                     self.close_connection = True
+                    return
+
+                if path == "/api/show":
+                    lim = srv.runtime_limits()
+                    eff_ctx = lim["effective_context_length"]
+                    max_out = lim["max_output_tokens"]
+                    arch = lim.get("architecture") or "llm"
+                    params_lines = []
+                    if eff_ctx is not None:
+                        params_lines.append(f"num_ctx {eff_ctx}")
+                    if max_out is not None:
+                        params_lines.append(f"num_predict {max_out}")
+                    model_info: dict[str, Any] = {
+                        "general.architecture": arch,
+                        "general.context_length": eff_ctx,
+                        f"{arch}.context_length": eff_ctx,
+                        "quintessentia.native_context_length": lim["native_context_length"],
+                        "quintessentia.max_output_tokens": max_out,
+                        "quintessentia.max_input_tokens": lim["max_input_tokens"],
+                        "quintessentia.prefill_chunk_tokens": lim["prefill_chunk_tokens"],
+                    }
+                    self._send_json(
+                        {
+                            "modelfile": f"FROM {srv.engine.model_id}",
+                            "parameters": "\n".join(params_lines),
+                            "model_info": model_info,
+                            "capabilities": ["completion", "tools", "thinking"],
+                        }
+                    )
                     return
 
                 if path in ("/v1/chat/stop", "/api/stop"):
@@ -899,19 +1016,64 @@ class QuintessentiaLANServer:
                 if not isinstance(messages, list) or not messages or not all(isinstance(m, dict) and "role" in m for m in messages):
                     self._send_error(HTTPStatus.BAD_REQUEST, "`messages` must be a non-empty array of {role, content}")
                     return
+                clean_messages: list[dict[str, Any]] = []
                 for m in messages:
-                    if isinstance(m.get("content"), list):
-                        m["content"] = "".join(
-                            str(part.get("text", "")) for part in m["content"] if isinstance(part, dict)
+                    mc = dict(m)
+                    if isinstance(mc.get("content"), list):
+                        mc["content"] = "".join(
+                            str(part.get("text", "")) for part in mc["content"] if isinstance(part, dict)
                         )
-                try:
-                    max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024)
-                except (TypeError, ValueError):
-                    self._send_error(HTTPStatus.BAD_REQUEST, "`max_tokens` must be an integer")
+                    clean_messages.append(mc)
+
+                raw_tools = body.get("tools")
+                if raw_tools is not None:
+                    if not isinstance(raw_tools, list) or not all(isinstance(t, dict) for t in raw_tools):
+                        self._send_error(HTTPStatus.BAD_REQUEST, "`tools` must be an array of tool objects")
+                        return
+                tool_choice = body.get("tool_choice")
+                if tool_choice is not None and not isinstance(tool_choice, (str, dict)):
+                    self._send_error(HTTPStatus.BAD_REQUEST, "`tool_choice` must be a string or an object")
                     return
+                tools_active = bool(raw_tools) and not is_tool_choice_none(tool_choice)
+
+                raw_max_tokens = body.get("max_tokens")
+                if raw_max_tokens is None:
+                    raw_max_tokens = body.get("max_completion_tokens")
+                if raw_max_tokens is None:
+                    lim_out = srv.runtime_limits().get("max_output_tokens")
+                    max_tokens = min(4096, int(lim_out)) if lim_out else 1024
+                else:
+                    try:
+                        if isinstance(raw_max_tokens, bool):
+                            raise TypeError("bool")
+                        max_tokens = int(raw_max_tokens)
+                    except (TypeError, ValueError):
+                        self._send_error(HTTPStatus.BAD_REQUEST, "`max_tokens` must be an integer")
+                        return
                 if max_tokens < 1:
                     self._send_error(HTTPStatus.BAD_REQUEST, "`max_tokens` must be positive")
                     return
+
+                extra_engine_kw: dict[str, Any] = {}
+                if raw_tools is not None:
+                    extra_engine_kw["tools"] = raw_tools
+                if tool_choice is not None:
+                    extra_engine_kw["tool_choice"] = tool_choice
+                for float_key in ("temperature", "top_p", "repetition_penalty", "presence_penalty"):
+                    if body.get(float_key) is not None:
+                        try:
+                            extra_engine_kw[float_key] = float(body[float_key])
+                        except (TypeError, ValueError):
+                            self._send_error(HTTPStatus.BAD_REQUEST, f"`{float_key}` must be a number")
+                            return
+                for int_key in ("top_k", "seed"):
+                    if body.get(int_key) is not None:
+                        try:
+                            extra_engine_kw[int_key] = int(body[int_key])
+                        except (TypeError, ValueError):
+                            self._send_error(HTTPStatus.BAD_REQUEST, f"`{int_key}` must be an integer")
+                            return
+
                 stream = bool(body.get("stream", False))
                 enable_thinking = bool(body.get("enable_thinking", True))
                 use_session = bool(body.get("use_session_cache", True))
@@ -922,8 +1084,9 @@ class QuintessentiaLANServer:
                 ticket = srv.coordinator.new_ticket(req_id)
                 t0 = time.perf_counter()
                 srv.log.info(
-                    "%s start %s stream=%s messages=%d max_tokens=%d", req_id, self.address_string(), stream,
-                    len(messages), max_tokens,
+                    "%s start %s stream=%s messages=%d max_tokens=%d tools=%d tool_choice=%s",
+                    req_id, self.address_string(), stream, len(clean_messages), max_tokens,
+                    len(raw_tools) if raw_tools else 0, tool_choice,
                 )
 
                 def cancel_check() -> bool:
@@ -946,16 +1109,40 @@ class QuintessentiaLANServer:
                     return obj
 
                 headers_sent = False
+                sse_write_lock = threading.Lock()
 
                 def _write_sse(payload_obj: dict[str, Any]) -> bool:
                     line = f"data: {json.dumps(payload_obj, ensure_ascii=False)}\n\n".encode("utf-8")
                     try:
-                        self.wfile.write(line)
-                        self.wfile.flush()
+                        with sse_write_lock:
+                            self.wfile.write(line)
+                            self.wfile.flush()
                         return True
                     except OSError:
                         ticket.cancel("client disconnected (write failed)")
                         return False
+
+                def _write_sse_comment(text: str) -> bool:
+                    try:
+                        with sse_write_lock:
+                            self.wfile.write(f": {text}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                        return True
+                    except OSError:
+                        ticket.cancel("client disconnected (keepalive failed)")
+                        return False
+
+                def _supported_engine_kwargs(extra: dict[str, Any]) -> dict[str, Any]:
+                    if not extra:
+                        return {}
+                    try:
+                        sig = inspect.signature(srv.engine.stream_chat)
+                        params = sig.parameters
+                        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                            return dict(extra)
+                        return {k: v for k, v in extra.items() if k in params}
+                    except (TypeError, ValueError):
+                        return {}
 
                 outcome = "ok"
                 req_metrics: dict[str, Any] = {}
@@ -963,12 +1150,13 @@ class QuintessentiaLANServer:
                 try:
                     with srv.coordinator.gpu(ticket):
                         gen = srv.engine.stream_chat(
-                            messages,
+                            clean_messages,
                             max_new_tokens=max_tokens,
                             enable_thinking=enable_thinking,
                             use_session_cache=use_session,
                             stop_on_eos=True,
                             cancel_check=cancel_check,
+                            **_supported_engine_kwargs(extra_engine_kw),
                         )
                         if not stream:
                             done_ev = None
@@ -981,7 +1169,27 @@ class QuintessentiaLANServer:
                             assert done_ev is not None
                             m = done_ev["metrics"]
                             req_metrics = m
-                            msg_out: dict[str, Any] = {"role": "assistant", "content": done_ev["answer_text"]}
+                            raw_answer = done_ev["answer_text"]
+                            finish_reason = m["finish_reason"]
+                            parsed_calls: list[dict[str, Any]] = []
+                            if tools_active:
+                                clean_text, parsed_calls = parse_tool_calls(
+                                    raw_answer, tools=raw_tools, allow_bare_json=True
+                                )
+                                if parsed_calls:
+                                    msg_out: dict[str, Any] = {
+                                        "role": "assistant",
+                                        "content": clean_text if clean_text else None,
+                                        "tool_calls": parsed_calls,
+                                    }
+                                    finish_reason = "tool_calls"
+                                else:
+                                    msg_out = {"role": "assistant", "content": raw_answer}
+                            else:
+                                msg_out = {
+                                    "role": "assistant",
+                                    "content": normalize_inline_tool_calls(raw_answer),
+                                }
                             if done_ev["thinking_text"]:
                                 msg_out["reasoning_content"] = done_ev["thinking_text"]
                             self._send_json(
@@ -990,7 +1198,7 @@ class QuintessentiaLANServer:
                                     "object": "chat.completion",
                                     "created": created_ts,
                                     "model": model_id,
-                                    "choices": [{"index": 0, "message": msg_out, "finish_reason": m["finish_reason"]}],
+                                    "choices": [{"index": 0, "message": msg_out, "finish_reason": finish_reason}],
                                     "usage": {
                                         "prompt_tokens": m["prompt_tokens"],
                                         "completion_tokens": m["generated_tokens"],
@@ -1011,17 +1219,70 @@ class QuintessentiaLANServer:
                         headers_sent = True
                         if not _write_sse(chunk({"role": "assistant"})):
                             return
+                        stop_keepalive = threading.Event()
+                        tc_guard = StreamingToolCallGuard(
+                            tools=raw_tools if tools_active else None,
+                            structured_mode=tools_active,
+                        )
+
+                        def _prefill_keepalive() -> None:
+                            while not stop_keepalive.wait(8.0):
+                                if ticket.cancel_event.is_set() or srv._shutdown.is_set():
+                                    break
+                                if not _write_sse_comment("prefill"):
+                                    break
+
+                        ka_thread = threading.Thread(
+                            target=_prefill_keepalive, name="quintessentia-sse-ka", daemon=True
+                        )
+                        ka_thread.start()
                         try:
                             for ev in gen:
+                                if not stop_keepalive.is_set():
+                                    stop_keepalive.set()
                                 if ev["type"] == "delta":
-                                    field = "reasoning_content" if ev["phase"] == "thinking" else "content"
-                                    if not _write_sse(chunk({field: ev["text"]})):
-                                        break
+                                    if ev["phase"] == "thinking":
+                                        if not _write_sse(chunk({"reasoning_content": ev["text"]})):
+                                            break
+                                    else:
+                                        broken = False
+                                        for piece in tc_guard.push(ev["text"]):
+                                            if piece and not _write_sse(chunk({"content": piece})):
+                                                broken = True
+                                                break
+                                        if broken:
+                                            break
                                 elif ev["type"] == "done":
                                     m = ev["metrics"]
                                     req_metrics = m
-                                    _write_sse(chunk({}, m["finish_reason"], quintessentia_metrics=m))
+                                    rem_text, parsed_calls = tc_guard.finish()
+                                    if rem_text:
+                                        _write_sse(chunk({"content": rem_text}))
+                                    finish_reason = m["finish_reason"]
+                                    if parsed_calls:
+                                        delta_calls = [
+                                            {
+                                                "index": idx,
+                                                "id": tc["id"],
+                                                "type": "function",
+                                                "function": {
+                                                    "name": tc["function"]["name"],
+                                                    "arguments": tc["function"]["arguments"],
+                                                },
+                                            }
+                                            for idx, tc in enumerate(parsed_calls)
+                                        ]
+                                        _write_sse(chunk({"tool_calls": delta_calls}))
+                                        finish_reason = "tool_calls"
+                                    usage_obj = {
+                                        "prompt_tokens": m["prompt_tokens"],
+                                        "completion_tokens": m["generated_tokens"],
+                                        "total_tokens": m["prompt_tokens"] + m["generated_tokens"],
+                                    }
+                                    _write_sse(chunk({}, finish_reason, usage=usage_obj, quintessentia_metrics=m))
                         finally:
+                            stop_keepalive.set()
+                            ka_thread.join(timeout=0.2)
                             gen.close()
                         try:
                             self.wfile.write(b"data: [DONE]\n\n")

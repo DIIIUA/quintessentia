@@ -2094,6 +2094,138 @@ extern "C" __global__ void quintessentia_quant_dequant_affine_q46(
         reinterpret_cast<float*>(dst_ptr)[elem_idx] = out_f;
     }
 }
+
+/* 15. Fused col_scale + Block-FWHT on activations X [M, K] -> X_rot [M, K] (BF16, zero FP32 temp) */
+extern "C" __global__ void ideal_q1_fwht_scale_x_bf16(
+    const unsigned short* __restrict__ x_bf16,
+    const unsigned short* __restrict__ col_scale,
+    unsigned short* __restrict__ x_rot_bf16,
+    int M, int K, int GS
+) {
+    int warp_id = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int ng = K / GS;
+    long long total_groups = (long long)M * ng;
+    if (GS == 64) {
+        long long g_all = (long long)blockIdx.x * 8 + warp_id;
+        if (g_all >= total_groups) return;
+        long long m = g_all / ng;
+        int g = (int)(g_all - m * ng);
+        int c0 = g * 64 + lane;
+        int c1 = c0 + 32;
+        long long row_off = m * (long long)K;
+        float v0 = bf16_to_f32(x_bf16[row_off + c0]) * bf16_to_f32(col_scale[c0]);
+        float v1 = bf16_to_f32(x_bf16[row_off + c1]) * bf16_to_f32(col_scale[c1]);
+        #pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            float p0 = __shfl_xor_sync(0xffffffffu, v0, d);
+            float p1 = __shfl_xor_sync(0xffffffffu, v1, d);
+            v0 = (lane & d) ? (p0 - v0) : (v0 + p0);
+            v1 = (lane & d) ? (p1 - v1) : (v1 + p1);
+        }
+        float a = (v0 + v1) * 0.125f;
+        float b = (v0 - v1) * 0.125f;
+        x_rot_bf16[row_off + c0] = f32_to_bf16_rne(a);
+        x_rot_bf16[row_off + c1] = f32_to_bf16_rne(b);
+    } else if (GS == 32) {
+        long long g_all = (long long)blockIdx.x * 8 + warp_id;
+        if (g_all >= total_groups) return;
+        long long m = g_all / ng;
+        int g = (int)(g_all - m * ng);
+        int c0 = g * 32 + lane;
+        long long row_off = m * (long long)K;
+        float v = bf16_to_f32(x_bf16[row_off + c0]) * bf16_to_f32(col_scale[c0]);
+        #pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            float p = __shfl_xor_sync(0xffffffffu, v, d);
+            v = (lane & d) ? (p - v) : (v + p);
+        }
+        x_rot_bf16[row_off + c0] = f32_to_bf16_rne(v * 0.176776695f);
+    } else {
+        long long g_all = ((long long)blockIdx.x * 8 + warp_id) * 2 + (lane >> 4);
+        bool valid = (g_all < total_groups);
+        int sub = lane & 15;
+        long long row_off = 0;
+        int c0 = 0;
+        float v = 0.0f;
+        if (valid) {
+            long long m = g_all / ng;
+            int g = (int)(g_all - m * ng);
+            c0 = g * 16 + sub;
+            row_off = m * (long long)K;
+            v = bf16_to_f32(x_bf16[row_off + c0]) * bf16_to_f32(col_scale[c0]);
+        }
+        #pragma unroll
+        for (int d = 1; d < 16; d <<= 1) {
+            float p = __shfl_xor_sync(0xffffffffu, v, d);
+            v = (lane & d) ? (p - v) : (v + p);
+        }
+        if (valid) {
+            x_rot_bf16[row_off + c0] = f32_to_bf16_rne(v * 0.25f);
+        }
+    }
+}
+
+/* 16. Coalesced 128-bit-vectorized Q1 bit-plane tile unpacker -> BF16 [r_len, K] (with fused row_scale) */
+extern "C" __global__ void ideal_q1_unpack_tile_bf16(
+    const unsigned char* __restrict__ packed_lo,
+    const unsigned short* __restrict__ qscale,
+    const unsigned short* __restrict__ qzero,
+    const unsigned short* __restrict__ row_scale,
+    unsigned short* __restrict__ out_bf16,
+    int r0, int r_len, int N, int K, int GS,
+    int P_active, int shared_scale
+) {
+    int k8 = K >> 3;
+    long long total_bytes = (long long)r_len * k8;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_bytes) return;
+
+    int local_r = (int)(idx / k8);
+    int b_col = (int)(idx - (long long)local_r * k8);
+    int row = r0 + local_r;
+    int ng = K / GS;
+    int g = (b_col << 3) / GS;
+
+    float rs = bf16_to_f32(row_scale[row]);
+    long long gz_idx = (long long)row * ng + g;
+    float acc_base = bf16_to_f32(qzero[gz_idx]) * rs;
+
+    float vals[8];
+    #pragma unroll
+    for (int b = 0; b < 8; ++b) vals[b] = acc_base;
+
+    long long plane_byte_stride = (long long)N * k8;
+    long long plane_grp_stride = (long long)N * ng;
+    long long row_byte_off = (long long)row * k8 + b_col;
+
+    if (shared_scale) {
+        float sc = bf16_to_f32(qscale[gz_idx]) * rs;
+        for (int p = 0; p < P_active; ++p) {
+            unsigned int byte_v = (unsigned int)packed_lo[(long long)p * plane_byte_stride + row_byte_off];
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                vals[b] += ((byte_v & (1u << b)) ? sc : -sc);
+            }
+            sc *= 0.5f;
+        }
+    } else {
+        for (int p = 0; p < P_active; ++p) {
+            unsigned int byte_v = (unsigned int)packed_lo[(long long)p * plane_byte_stride + row_byte_off];
+            float sc = bf16_to_f32(qscale[(long long)p * plane_grp_stride + gz_idx]) * rs;
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                vals[b] += ((byte_v & (1u << b)) ? sc : -sc);
+            }
+        }
+    }
+
+    unsigned int p0 = (unsigned int)f32_to_bf16_rne(vals[0]) | (((unsigned int)f32_to_bf16_rne(vals[1])) << 16);
+    unsigned int p1 = (unsigned int)f32_to_bf16_rne(vals[2]) | (((unsigned int)f32_to_bf16_rne(vals[3])) << 16);
+    unsigned int p2 = (unsigned int)f32_to_bf16_rne(vals[4]) | (((unsigned int)f32_to_bf16_rne(vals[5])) << 16);
+    unsigned int p3 = (unsigned int)f32_to_bf16_rne(vals[6]) | (((unsigned int)f32_to_bf16_rne(vals[7])) << 16);
+    reinterpret_cast<uint4*>(out_bf16)[idx] = make_uint4(p0, p1, p2, p3);
+}
 """
 
 _KERNEL_NAMES = (
@@ -2113,6 +2245,8 @@ _KERNEL_NAMES = (
     b"quintessentia_pack_affine_q46",
     b"quintessentia_unpack_affine_q46",
     b"quintessentia_quant_dequant_affine_q46",
+    b"ideal_q1_fwht_scale_x_bf16",
+    b"ideal_q1_unpack_tile_bf16",
 )
 
 _LOCK = threading.Lock()
@@ -2957,4 +3091,93 @@ def launch_quintessentia_quant_dequant_affine(
     )
     if rc != 0:
         raise RuntimeError(f"cuLaunchKernel(quintessentia_quant_dequant_affine_q46) failed with CUresult={rc}")
+
+
+def launch_ideal_q1_fwht_scale_x_bf16(
+    x_bf16: torch.Tensor,
+    col_scale: torch.Tensor,
+    x_rot_out: torch.Tensor,
+    *,
+    group_size: int = 64,
+) -> None:
+    """Fused col_scale + Block-FWHT on BF16 activations [M, K] -> [M, K] (#15)."""
+    M, K = int(x_bf16.shape[0]), int(x_bf16.shape[1])
+    if M == 0:
+        return
+    if group_size not in (16, 32, 64) or K % group_size != 0:
+        raise ValueError(f"Unsupported group_size={group_size} for K={K}")
+    dev = x_bf16.device
+    nvcuda, fns = get_q1_kernels(dev)
+
+    p_x = ctypes.c_void_p(x_bf16.data_ptr())
+    p_cs = ctypes.c_void_p(col_scale.data_ptr())
+    p_out = ctypes.c_void_p(x_rot_out.data_ptr())
+    c_M, c_K, c_gs = ctypes.c_int(M), ctypes.c_int(K), ctypes.c_int(group_size)
+    args = (ctypes.c_void_p * 6)(
+        ctypes.addressof(p_x), ctypes.addressof(p_cs), ctypes.addressof(p_out),
+        ctypes.addressof(c_M), ctypes.addressof(c_K), ctypes.addressof(c_gs),
+    )
+    total_groups = M * (K // group_size)
+    groups_per_block = 16 if group_size == 16 else 8
+    grid_x = (total_groups + groups_per_block - 1) // groups_per_block
+    stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
+    rc = nvcuda.cuLaunchKernel(
+        fns[b"ideal_q1_fwht_scale_x_bf16"],
+        grid_x, 1, 1, 256, 1, 1, 0, stream, args, None,
+    )
+    if rc != 0:
+        raise RuntimeError(f"cuLaunchKernel(ideal_q1_fwht_scale_x_bf16) failed with CUresult={rc}")
+
+
+def launch_ideal_q1_unpack_tile_bf16(
+    packed_lo: torch.Tensor,
+    qscale: torch.Tensor,
+    qzero: torch.Tensor,
+    row_scale: torch.Tensor,
+    out_bf16: torch.Tensor,
+    *,
+    r0: int,
+    r_len: int,
+    group_size: int,
+    total_planes: int,
+    active_planes: int | None = None,
+) -> None:
+    """Coalesced 128-bit Q1 bit-plane tile unpacker -> BF16 [r_len, K] with fused row_scale (#16)."""
+    if r_len <= 0:
+        return
+    N = int(packed_lo.shape[1])
+    k8 = int(packed_lo.shape[2])
+    K = k8 * 8
+    p_act = total_planes if active_planes is None else int(active_planes)
+    shared_sc = 1 if (qscale.ndim == 2 or (qscale.ndim == 3 and int(qscale.shape[0]) == 1 and total_planes > 1)) else 0
+
+    dev = packed_lo.device
+    nvcuda, fns = get_q1_kernels(dev)
+
+    p_lo = ctypes.c_void_p(packed_lo.data_ptr())
+    p_s = ctypes.c_void_p(qscale.data_ptr())
+    p_z = ctypes.c_void_p(qzero.data_ptr())
+    p_rs = ctypes.c_void_p(row_scale.data_ptr())
+    p_out = ctypes.c_void_p(out_bf16.data_ptr())
+    c_r0, c_rl = ctypes.c_int(int(r0)), ctypes.c_int(int(r_len))
+    c_N, c_K, c_gs = ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(int(group_size))
+    c_pa, c_ss = ctypes.c_int(p_act), ctypes.c_int(shared_sc)
+
+    args = (ctypes.c_void_p * 12)(
+        ctypes.addressof(p_lo), ctypes.addressof(p_s), ctypes.addressof(p_z),
+        ctypes.addressof(p_rs), ctypes.addressof(p_out),
+        ctypes.addressof(c_r0), ctypes.addressof(c_rl),
+        ctypes.addressof(c_N), ctypes.addressof(c_K), ctypes.addressof(c_gs),
+        ctypes.addressof(c_pa), ctypes.addressof(c_ss),
+    )
+    total_bytes = int(r_len) * k8
+    grid_x = (total_bytes + 255) // 256
+    stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
+    rc = nvcuda.cuLaunchKernel(
+        fns[b"ideal_q1_unpack_tile_bf16"],
+        grid_x, 1, 1, 256, 1, 1, 0, stream, args, None,
+    )
+    if rc != 0:
+        raise RuntimeError(f"cuLaunchKernel(ideal_q1_unpack_tile_bf16) failed with CUresult={rc}")
+
 

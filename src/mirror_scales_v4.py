@@ -69,25 +69,79 @@ from src.pure_mirror_agents_nvrtc import (
     launch_pure_mirror_diff_q1_moe_batch,
     launch_pure_mirror_line_step,
 )
+from src.rssf_dynamic_operators import (
+    DynamicBalanceSnapshot,
+    RSSFCollapseDetector,
+    StrategyCollapseReport,
+    VolterraFDSMonitor,
+    observe_hardware_load_balance,
+    observe_post_prefill_region_balance,
+    observe_q1_cube_balance,
+    observe_region_breathing_balance,
+    observe_warmup_fds_balance,
+)
 
 
 # ---------------------------------------------------------------------------
-# Pure Stateless Bracketless Mirror Equality Primitive (Read from the Center)
+# Canonical Stateless Bracketless Mirror Equality Primitive (L4 Pure Math)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class MirrorBalanceResult:
-    """Result of one stateless center-read Mirror Equality evaluation."""
+    """Result of one canonical 2-contour bracketless Mirror Equality evaluation (L4).
 
-    state: str                    # "EQUAL" | "ALIGN" | "SPLIT" | "PROTECT"
-    strategy: Tuple[float, ...]   # S_t = 0.5 * (ObservedBehavior_(t-1) + ObservedBehavior_(t+1))
-    d_core: float                 # ||Obs_(t-1) - Obs_(t+1)|| / (||Obs_(t-1)|| + ||Obs_(t+1)|| + eps)
-    d_wings: float                # ||(Out_(t-1)+Obs_(t-1)) - (Obs_(t+1)+Out_(t+1))|| / denom
-    tension: float                # max(d_core, 0.5 * d_wings)
-    contra_core: bool             # True when past & future ObservedBehavior oppose each other
+    Zero hand-tuned magic thresholds — uses ONLY the natural mirror threshold 1/2 (0.5)
+    and sign of Tie(a, b) with non-commutative directed contacts alpha_{u->v}, r_{u->v}:
+      - UNKNOWN : any wing role or center has zero norm (unclosed time step)
+      - SPLIT   : tau_core <= 0 or tau_wing <= 0 (phase break / leaf branching)
+      - EQUAL   : tau_core > 0 and tau_wing >= 0.5 and delta_res < 0.5 (stable rest)
+      - TENSION : otherwise (live non-equilibrium -> targeted step along scar r)
+    """
+
+    state: str                        # "UNKNOWN" | "EQUAL" | "TENSION" | "SPLIT"
+    strategy: Tuple[float, ...]       # S_t = (w1 * P1 + w2 * P2) / (w1 + w2) (non-commutative center)
+    tau_core: float                   # min(Tie(P1, S_t), Tie(S_t, P2)) in [0, 1]
+    tau_wing: float                   # Tie(S_left, S_right) in [0, 1]
+    d_core: float                     # D_core = delta(P1->S_t)+delta(S_t->P2)+delta(P2->S_t)+delta(S_t->P1)
+    delta_res: float                  # Non-commutative cross-wing residual (past -> future)
+    action_energy: float              # Variational functional E_t(Sigma_t)
+    scar_alpha: float                 # Directed contact alpha_{P1 -> P2}
+    scar_residual: Tuple[float, ...]  # Exact reversible scar r_{P1->P2} = P2 - alpha * P1
+
+    @property
+    def d_wings(self) -> float:
+        return self.delta_res
+
+    @property
+    def tension(self) -> float:
+        return self.action_energy
+
+    @property
+    def contra_core(self) -> bool:
+        return self.state == "SPLIT"
 
 
 def _vec_norm(v: Sequence[float]) -> float:
     return math.sqrt(sum(float(x) * float(x) for x in v))
+
+
+def _directed_contact(
+    u: Sequence[float], v: Sequence[float], eps: float = 1e-12
+) -> Tuple[float, Tuple[float, ...], float]:
+    """Non-commutative directed contact u -> v: alpha = <u,v>/(||u||^2+eps), r = v - alpha*u."""
+    uu = sum(float(a) * float(a) for a in u)
+    uv = sum(float(a) * float(b) for a, b in zip(u, v))
+    alpha = uv / (uu + eps)
+    res = tuple(float(b) - alpha * float(a) for a, b in zip(u, v))
+    delta = _vec_norm(res) / (_vec_norm(v) + eps)
+    return alpha, res, delta
+
+
+def _mirror_tie(a: Sequence[float], b: Sequence[float], eps: float = 1e-12) -> float:
+    """Canonical symmetric convergence measure Tie(a, b) in [0, 1]."""
+    n_sum = math.sqrt(sum((float(x) + float(y)) ** 2 for x, y in zip(a, b)))
+    n_diff = math.sqrt(sum((float(x) - float(y)) ** 2 for x, y in zip(a, b)))
+    val = (n_sum - n_diff) / (n_sum + n_diff + eps)
+    return val if val > 0.0 else 0.0
 
 
 def eval_mirror_equality_step(
@@ -96,55 +150,133 @@ def eval_mirror_equality_step(
     obs_next: Sequence[float],
     outcome_next: Sequence[float],
     *,
-    equal_tol: float = 0.125,
-    split_tol: float = 0.375,
+    strategy: Optional[Sequence[float]] = None,
+    eps: float = 1e-12,
+    equal_tol: Optional[float] = None,   # deprecated compatibility arg (canonical threshold is always 0.5)
+    split_tol: Optional[float] = None,   # deprecated compatibility arg (canonical SPLIT is tau <= 0.0)
 ) -> MirrorBalanceResult:
-    """Evaluate bracketless Mirror Equality from the center on local physical observables.
+    """Evaluate canonical 2-contour bracketless Mirror Equality from the center (L4).
 
-    Central stem (Stone Law):
+    Ordered non-commutative 4-wing tuple:
+        P = (P0, P1, P2, P3) = (Outcome_(t-1), ObservedBehavior_(t-1), ObservedBehavior_(t+1), Outcome_(t+1))
+    Contour A (inner bracketless Stone-Law stem):
         ObservedBehavior_(t-1) = Strategy_t = ObservedBehavior_(t+1)
-    Full mirror wings:
-        Outcome_(t-1) + ObservedBehavior_(t-1) = Strategy_t = ObservedBehavior_(t+1) + Outcome_(t+1)
-
-    Pure function: holds ZERO state and ZERO references to any scale.
+    Contour B (outer 4x4 non-commutative contact shell with FuturePressure):
+        M_ij = alpha_{P_i -> P_j}, R_ij = r_{P_i -> P_j}
+        w0, w1 reweight immutable past via FuturePressure (2,3 -> 0,1) without mutating P0, P1
+        w2, w3 ground future wing via past support (0,1 -> 2,3)
+    Center S_t (non-commutative equilibrium, NOT 0.5 average):
+        S_t = (w1 * P1 + w2 * P2) / (w1 + w2) when not explicitly supplied.
+    4-valued logic L4 (ZERO magic constants — only natural 1/2 threshold and Tie sign):
+        UNKNOWN | SPLIT | EQUAL | TENSION.
     """
+    del equal_tol, split_tol
     n = len(obs_prev)
     if not (len(outcome_prev) == n == len(obs_next) == len(outcome_next)) or n == 0:
         raise ValueError("All four mirror vectors must share the same positive length")
+    if strategy is not None and len(strategy) != n:
+        raise ValueError("Explicit strategy vector must share the same length as wing vectors")
 
-    eps = 1e-8
-    strategy = tuple(0.5 * (float(a) + float(b)) for a, b in zip(obs_prev, obs_next))
+    p0 = tuple(float(x) for x in outcome_prev)
+    p1 = tuple(float(x) for x in obs_prev)
+    p2 = tuple(float(x) for x in obs_next)
+    p3 = tuple(float(x) for x in outcome_next)
+    roles = (p0, p1, p2, p3)
+    norms = tuple(_vec_norm(r) for r in roles)
+    zero_vec = tuple(0.0 for _ in range(n))
 
-    norm_p = _vec_norm(obs_prev)
-    norm_n = _vec_norm(obs_next)
-    diff_core = _vec_norm([float(a) - float(b) for a, b in zip(obs_prev, obs_next)])
-    d_core = diff_core / (norm_p + norm_n + eps)
+    # UNKNOWN: unclosed step whenever any role (or explicit strategy) has zero norm
+    if any(nm <= eps for nm in norms) or (strategy is not None and _vec_norm(strategy) <= eps):
+        return MirrorBalanceResult(
+            state="UNKNOWN",
+            strategy=tuple(float(x) for x in strategy) if strategy is not None else zero_vec,
+            tau_core=0.0,
+            tau_wing=0.0,
+            d_core=1.0,
+            delta_res=1.0,
+            action_energy=float("inf"),
+            scar_alpha=0.0,
+            scar_residual=p2,
+        )
 
-    dot_core = sum(float(a) * float(b) for a, b in zip(obs_prev, obs_next))
-    contra_core = bool(norm_p > 1e-6 and norm_n > 1e-6 and dot_core < -1e-6)
+    # Contour B: full 4x4 non-commutative directed contact matrix M_ij and residual norms ||R_ij||
+    m = [[0.0] * 4 for _ in range(4)]
+    r_vecs: List[List[Optional[Tuple[float, ...]]]] = [[None] * 4 for _ in range(4)]
+    r_norms = [[0.0] * 4 for _ in range(4)]
+    for i in range(4):
+        for j in range(4):
+            if i == j:
+                continue
+            a_ij, r_ij, _ = _directed_contact(roles[i], roles[j], eps)
+            m[i][j] = a_ij
+            r_vecs[i][j] = r_ij
+            r_norms[i][j] = _vec_norm(r_ij)
 
-    left_wing = [float(o) + float(b) for o, b in zip(outcome_prev, obs_prev)]
-    right_wing = [float(b) + float(o) for b, o in zip(obs_next, outcome_next)]
-    diff_wings = _vec_norm([a - b for a, b in zip(left_wing, right_wing)])
-    d_wings = diff_wings / (_vec_norm(left_wing) + _vec_norm(right_wing) + eps)
+    # FuturePressure weights on immutable past wing (P0, P1)
+    w0 = 1.0 + abs(m[1][0]) + max(0.0, m[3][0]) + max(0.0, m[2][0])
+    w1 = 1.0 + abs(m[0][1]) + max(0.0, m[2][1]) + max(0.0, m[3][1])
+    s_left = tuple((w0 * a + w1 * b) / (w0 + w1) for a, b in zip(p0, p1))
 
-    tension = max(d_core, 0.5 * d_wings)
-    if contra_core:
-        state = "PROTECT"
-    elif tension <= float(equal_tol):
-        state = "EQUAL"
-    elif tension <= float(split_tol):
-        state = "ALIGN"
+    # Past-grounded weights on future wing (P2, P3)
+    w2 = 1.0 + abs(m[3][2]) + max(0.0, m[1][2]) + max(0.0, m[0][2])
+    w3 = 1.0 + abs(m[2][3]) + max(0.0, m[0][3]) + max(0.0, m[1][3])
+    s_right = tuple((w2 * a + w3 * b) / (w2 + w3) for a, b in zip(p2, p3))
+
+    # Born center object S_t (non-commutative equilibrium weighted by FuturePressure vs past support)
+    if strategy is not None:
+        s_center = tuple(float(x) for x in strategy)
     else:
+        s_center = tuple((w1 * a + w2 * b) / (w1 + w2) for a, b in zip(p1, p2))
+
+    # Exact reversible scar Gamma_scar for P1 -> P2: alpha * P1 + r == P2 identically
+    scar_alpha = m[1][2]
+    scar_res = r_vecs[1][2] if r_vecs[1][2] is not None else zero_vec
+
+    # Contour A: inner bracketless central stem (P1 ≍ S_t ≍ P2)
+    if _vec_norm(s_center) <= eps:
+        # Exact opposite cancellation of P1 and P2 in center -> SPLIT
+        tau_core = 0.0
+        d_core = 4.0
+        d_sl_s = 1.0
+        d_sr_s = 1.0
+    else:
+        tau_core = min(
+            _mirror_tie(p1, s_center, eps),
+            _mirror_tie(s_center, p2, eps),
+            _mirror_tie(p1, p2, eps),
+        )
+        d_core = (
+            _directed_contact(p1, s_center, eps)[2]
+            + _directed_contact(s_center, p2, eps)[2]
+            + _directed_contact(p2, s_center, eps)[2]
+            + _directed_contact(s_center, p1, eps)[2]
+        )
+        d_sl_s = _directed_contact(s_left, s_center, eps)[2]
+        d_sr_s = _directed_contact(s_right, s_center, eps)[2]
+
+    tau_wing = _mirror_tie(s_left, s_right, eps)
+    delta_res = (r_norms[0][3] + r_norms[1][2] + r_norms[0][2] + r_norms[1][3]) / (
+        2.0 * (norms[2] + norms[3]) + eps
+    )
+    action_energy = d_core + (1.0 - tau_wing) + d_sl_s + d_sr_s + delta_res
+
+    if tau_core <= 0.0 or tau_wing <= 0.0:
         state = "SPLIT"
+    elif tau_wing >= 0.5 and delta_res < 0.5:
+        state = "EQUAL"
+    else:
+        state = "TENSION"
 
     return MirrorBalanceResult(
         state=state,
-        strategy=strategy,
+        strategy=s_center,
+        tau_core=tau_core,
+        tau_wing=tau_wing,
         d_core=d_core,
-        d_wings=d_wings,
-        tension=tension,
-        contra_core=contra_core,
+        delta_res=delta_res,
+        action_energy=action_energy,
+        scar_alpha=scar_alpha,
+        scar_residual=scar_res,
     )
 
 
@@ -243,10 +375,15 @@ class MirrorLoadDispatcher:
         self._prev_free_bytes: Optional[int] = None
         self._prev_used_frac: Optional[float] = None
         self._prev_load_frac: Optional[float] = None
+        self._prev_headroom_frac: Optional[float] = None
+        self._prev_calm_frac: Optional[float] = None
         self._prev_gpu_share: float = 0.5
         self._prev_io_share: float = 0.5
         self._prev_wait_share: float = 0.0
         self._last_source: str = "cpu"
+        # Own scale-invariant RSSF / EC-Volterra / FDS / 8-force balance state (M1 ONLY)
+        self._ec_fds = VolterraFDSMonitor(archive_decay=0.85)
+        self._collapse_det = RSSFCollapseDetector(drift_horizon_steps=4.0)
 
         # Own telemetry
         self.evaluations: int = 0
@@ -255,6 +392,9 @@ class MirrorLoadDispatcher:
         self.overlap_async_steps: int = 0
         self.throttle_damp_steps: int = 0
         self.shed_protect_steps: int = 0
+        self.ec_fds_damp_steps: int = 0
+        self.balance_scale_break_steps: int = 0
+        self.collapse_events: int = 0
         self.equal_holds: int = 0
         self.expansions: int = 0
         self.span_shrinks: int = 0
@@ -270,6 +410,11 @@ class MirrorLoadDispatcher:
         self.max_observed_gpu_util: Optional[float] = None
         self.max_observed_mem_util: Optional[float] = None
         self.last_mirror_state: str = "IDLE"
+        self.last_scar_norm: float = 0.0
+        self.last_fds_t_end_steps: Optional[float] = None
+        self.last_volterra_archive: float = 0.0
+        self.last_balance: Optional[DynamicBalanceSnapshot] = None
+        self.last_collapse: Optional[StrategyCollapseReport] = None
 
     def _read_hardware(self, *, force: bool = False) -> Tuple[int, int, Optional[float], Optional[float], int, str]:
         """Return `(free_bytes, total_bytes, gpu_util_pct, mem_util_pct, torch_pool_free, source)`."""
@@ -348,6 +493,16 @@ class MirrorLoadDispatcher:
             self.max_observed_mem_util = mem_u
 
         reserve = self.safety_reserve_bytes
+        ec_diag = self._ec_fds.update(free_bytes=free_b, total_bytes=total_b, reserve_bytes=reserve)
+        collapse = self._collapse_det.evaluate(free_bytes=free_b, total_bytes=total_b, ec_fds=ec_diag)
+        self.last_fds_t_end_steps = (
+            ec_diag.fds_t_end_steps if math.isfinite(ec_diag.fds_t_end_steps) else None
+        )
+        self.last_volterra_archive = ec_diag.volterra_archive
+        self.last_collapse = collapse
+        if collapse.any_collapse:
+            self.collapse_events += 1
+
         # 1. Hard physical wall contact -> SHED_PROTECT (0 OOM, 0 WDDM spill)
         if free_b < reserve:
             if pool_free > 0 and self._sensor_fn is None and self.device.type == "cuda":
@@ -367,43 +522,102 @@ class MirrorLoadDispatcher:
                 self._prev_free_bytes = free_b
                 self._prev_used_frac = max(0.0, min(1.0, 1.0 - free_b / max(1, total_b)))
                 self._prev_load_frac = self._combine_load_frac(gpu_u, mem_u, self._prev_used_frac)
+                self._prev_headroom_frac = 1e-4
+                self._prev_calm_frac = max(1e-4, 1.0 - self._prev_load_frac)
                 return LoadDispatchDecision(
                     "SHED_PROTECT", "protect", target, deficit, emergency,
                     self.batch_span, self.in_flight_cap, "PROTECT", free_b, total_b, gpu_u, mem_u,
                 )
 
-        # 2. Local physical wings for center-read Mirror Equality
+        # 2. Restored non-degenerate 2D canonical L4 contour `(headroom_frac, calm_frac)` with
+        #    Enhanced Calculus Volterra projection + FDS T_end horizon + solver-free 8-force balance.
         used_frac = max(0.0, min(1.0, 1.0 - free_b / max(1, total_b)))
         load_frac = self._combine_load_frac(gpu_u, mem_u, used_frac)
-        prev_free = free_b if self._prev_free_bytes is None else self._prev_free_bytes
-        prev_used = used_frac if self._prev_used_frac is None else self._prev_used_frac
+        usable_span = max(1, total_b - reserve)
+        headroom = free_b - reserve
+        headroom_frac = max(1e-4, headroom / usable_span)
+        calm_frac = max(1e-4, 1.0 - load_frac)
+
+        is_first_step = self._prev_free_bytes is None
+        prev_free = free_b if is_first_step else self._prev_free_bytes
         prev_load = load_frac if self._prev_load_frac is None else self._prev_load_frac
+        prev_headroom_frac = headroom_frac if self._prev_headroom_frac is None else self._prev_headroom_frac
+        prev_calm_frac = calm_frac if self._prev_calm_frac is None else self._prev_calm_frac
 
         delta_free_drop = max(0, prev_free - free_b)
         projected_free_next = free_b - delta_free_drop
-        safe_used_ceiling = max(0.0, 1.0 - self.reserve_ratio)
+        proj_headroom = ec_diag.projected_headroom_ec
+        load_rise = max(0.0, load_frac - prev_load)
+        proj_calm = calm_frac - load_rise
 
-        out_prev = (prev_used, prev_load)
-        obs_prev = (used_frac - prev_used, load_frac - prev_load)
-        if projected_free_next < reserve:
-            safe_next_used = min(used_frac, safe_used_ceiling)
-            obs_next = (safe_next_used - used_frac, min(0.85, load_frac) - load_frac)
+        # Direct solver-free 8-pair force balance observation (~4 us, 0 iterations)
+        bal8 = observe_hardware_load_balance(
+            used_frac=used_frac,
+            headroom_frac=headroom_frac,
+            load_frac=load_frac,
+            calm_frac=calm_frac,
+            drop_frac=delta_free_drop / float(usable_span),
+            load_rise=load_rise,
+            sustained_drain=ec_diag.sustained_drain_rate,
+        )
+        self.last_balance = bal8
+
+        # Feed EC/FDS horizon, 8-force scale break, and physical wall projection INTO the future wing P2
+        # so canonical 2D L4 itself evaluates the true coupled trajectory (an idle bus cannot stay "calm"
+        # when VRAM is projected to breach reserve or enter sustained FDS/Term-3 scale break).
+        physical_pred_breach = (not is_first_step) and (projected_free_next <= reserve)
+        ec_fds_drift_breach = (self.evaluations >= 3) and collapse.unbounded_result_drift
+        scale_break = bal8.regime == "SCALE_BREAK"
+
+        p2_h = proj_headroom
+        p2_c = proj_calm
+        if physical_pred_breach:
+            p2_h = min(p2_h, (projected_free_next - reserve) / usable_span, -1e-3)
+            p2_c = min(p2_c, p2_h)
+        if ec_fds_drift_breach:
+            fds_pull = -max(1e-3, headroom_frac * (4.0 / max(0.1, ec_diag.fds_t_end_steps) - 1.0) + 1e-3)
+            p2_h = min(p2_h, fds_pull)
+            p2_c = min(p2_c, p2_h)
+            self.ec_fds_damp_steps += 1
+        if scale_break:
+            p2_h = min(p2_h, bal8.d3_margin - 1e-3)
+            p2_c = min(p2_c, p2_h)
+            self.balance_scale_break_steps += 1
+
+        # Non-degenerate 2D L4 Mirror Equality (genuine non-zero reversible scar r_{P1->P2}!)
+        p0 = (0.0, 0.0) if is_first_step else (prev_headroom_frac, prev_calm_frac)
+        bal_2d = eval_mirror_equality_step(p0, (headroom_frac, calm_frac), (p2_h, p2_c), (1.0, 1.0))
+        self.last_scar_norm = _vec_norm(bal_2d.scar_residual)
+        # Strict 2-contour rest requires BOTH inner stem (tau_core >= 0.5) AND outer wings (tau_wing >= 0.5)
+        bal_2d_state = "TENSION" if (bal_2d.state == "EQUAL" and bal_2d.tau_core < 0.5) else bal_2d.state
+
+        if bal_2d_state == "SPLIT":
+            # Ample VRAM headroom + no memory breach/drift: pure GPU/bus burst is OVERLAP_ASYNC
+            if (
+                not physical_pred_breach
+                and not ec_fds_drift_breach
+                and not scale_break
+                and headroom_frac >= 0.45
+                and ec_diag.sustained_drain_rate < 0.005
+            ):
+                joint_state = "TENSION"
+            else:
+                joint_state = "SPLIT"
         else:
-            obs_next = (0.0, 0.0)
-        out_next = (min(used_frac, safe_used_ceiling), min(load_frac, 0.85))
+            joint_state = bal_2d_state
+        joint_tau_wing = bal_2d.tau_wing
 
-        bal = eval_mirror_equality_step(out_prev, obs_prev, obs_next, out_next)
-        self.last_mirror_state = bal.state
+        self.last_mirror_state = joint_state
         self._prev_free_bytes = free_b
         self._prev_used_frac = used_frac
         self._prev_load_frac = load_frac
+        self._prev_headroom_frac = headroom_frac
+        self._prev_calm_frac = calm_frac
 
-        headroom = free_b - reserve
         physical_ceiling = cached_b + headroom
 
-        # 3. Preventive Mirror Damping BEFORE floor impact -> THROTTLE_DAMP
-        bus_saturated = bool(mem_u is not None and mem_u >= 90.0 and delta_free_drop > 0)
-        if projected_free_next < reserve or bus_saturated or bal.state == "PROTECT":
+        # 3. Canonical L4 SPLIT on either physical contour -> preventive Mirror Damping BEFORE floor impact
+        if joint_state == "SPLIT":
             damp_target = max(cached_b, cached_b + (headroom // 2))
             target = damp_target if cur_budget > damp_target else cur_budget
             self.dispatch_mode = "THROTTLE_DAMP"
@@ -411,21 +625,22 @@ class MirrorLoadDispatcher:
             self.throttle_damp_steps += 1
             return LoadDispatchDecision(
                 "THROTTLE_DAMP", "damp", target, 0, False,
-                self.batch_span, self.in_flight_cap, bal.state, free_b, total_b, gpu_u, mem_u,
+                self.batch_span, self.in_flight_cap, joint_state, free_b, total_b, gpu_u, mem_u,
             )
 
-        # 4. Ample headroom & calm bus -> DIRECT_BURST or OVERLAP_ASYNC
+        # 4. Canonical L4 TENSION -> OVERLAP_ASYNC; EQUAL / UNKNOWN -> DIRECT_BURST
         self.in_flight_cap = self.max_in_flight
-        if headroom >= 2 * reserve and (gpu_u is None or gpu_u < 65.0) and (mem_u is None or mem_u < 65.0):
-            self.dispatch_mode = "DIRECT_BURST"
-            self.direct_burst_steps += 1
-        else:
+        if joint_state == "TENSION":
             self.dispatch_mode = "OVERLAP_ASYNC"
             self.overlap_async_steps += 1
+        else:
+            self.dispatch_mode = "DIRECT_BURST"
+            self.direct_burst_steps += 1
 
         if physical_ceiling > cur_budget + self.deadband_bytes:
-            if mem_u is not None and mem_u >= 80.0:
-                target = cur_budget + max(self.deadband_bytes, (physical_ceiling - cur_budget) // 2)
+            if joint_state == "TENSION":
+                step_scale = max(0.25, min(1.0, joint_tau_wing))
+                target = cur_budget + max(self.deadband_bytes, int((physical_ceiling - cur_budget) * step_scale))
             else:
                 target = physical_ceiling
             self.expansions += 1
@@ -433,13 +648,13 @@ class MirrorLoadDispatcher:
                 self.max_observed_budget_bytes = target
             return LoadDispatchDecision(
                 self.dispatch_mode, "expand", target, 0, False,
-                self.batch_span, self.in_flight_cap, bal.state, free_b, total_b, gpu_u, mem_u,
+                self.batch_span, self.in_flight_cap, joint_state, free_b, total_b, gpu_u, mem_u,
             )
 
         self.equal_holds += 1
         return LoadDispatchDecision(
             self.dispatch_mode, "hold", cur_budget, 0, False,
-            self.batch_span, self.in_flight_cap, bal.state, free_b, total_b, gpu_u, mem_u,
+            self.batch_span, self.in_flight_cap, joint_state, free_b, total_b, gpu_u, mem_u,
         )
 
     def observe_dispatch_timing(
@@ -450,7 +665,7 @@ class MirrorLoadDispatcher:
         t_wait_ms: float,
         items_dispatched: int,
     ) -> Tuple[int, int, str]:
-        """Update `(batch_span, in_flight_cap, mirror_state)` purely from physical GPU-vs-IO timings."""
+        """Update `(batch_span, in_flight_cap, mirror_state)` purely from physical GPU-vs-IO timings via canonical L4."""
         tg = max(0.0, float(t_gpu_ms))
         ti = max(0.0, float(t_io_ms))
         tw = max(0.0, float(t_wait_ms))
@@ -465,22 +680,19 @@ class MirrorLoadDispatcher:
         cur_w = min(1.0, tw / max(tg + tw, ti, 1e-6))
 
         bal = eval_mirror_equality_step(
-            (self._prev_gpu_share, self._prev_io_share, self._prev_wait_share),
-            (cur_i - cur_g, cur_w, cur_g - self._prev_gpu_share),
-            (0.0, 0.0, 0.0),
-            (0.5, 0.5, 0.0),
-            equal_tol=0.15,
-            split_tol=0.40,
+            (self._prev_gpu_share - self._prev_io_share, 0.5 - self._prev_wait_share),
+            (cur_g - cur_i, 0.5 - cur_w),
+            (0.0, 0.5),
+            (0.0, 0.5),
         )
         self._prev_gpu_share = cur_g
         self._prev_io_share = cur_i
         self._prev_wait_share = cur_w
 
-        # Only adapt burst span on multi-item prefill bursts (single-token decode misses stay untouched)
-        if items_dispatched >= self.min_batch_span and bal.state != "EQUAL":
+        # Adapt burst span strictly when canonical L4 reports non-rest (TENSION / SPLIT)
+        if items_dispatched >= self.min_batch_span and bal.state in ("TENSION", "SPLIT"):
             old_span = self.batch_span
-            if ti > tg * 1.15 and tw > 0.25:
-                # IO lagged behind GPU compute -> tighten burst span and deepen async overlap (up to 2)
+            if cur_i > cur_g and cur_w > 0.0:
                 ratio = max(0.5, min(0.875, tg / max(ti, 1e-6)))
                 new_span = max(self.min_batch_span, min(old_span - 1, int(round(old_span * ratio))))
                 if new_span < old_span:
@@ -488,8 +700,7 @@ class MirrorLoadDispatcher:
                     self.span_shrinks += 1
                 if self.dispatch_mode != "THROTTLE_DAMP" and self.dispatch_mode != "SHED_PROTECT":
                     self.in_flight_cap = self.max_in_flight
-            elif tg > ti * 1.25 and tw <= 0.25 and items_dispatched >= old_span:
-                # GPU compute dominated while IO finished with ~0 wait -> widen direct burst span
+            elif cur_g > cur_i and cur_w <= 0.1 and items_dispatched >= old_span:
                 ratio = min(1.5, 0.5 * (1.0 + tg / max(ti, 1e-6)))
                 new_span = min(self.max_batch_span, max(old_span + 1, int(round(old_span * ratio))))
                 if new_span > old_span:
@@ -554,6 +765,18 @@ class MirrorLoadDispatcher:
             "max_observed_gpu_util_pct": self.max_observed_gpu_util,
             "max_observed_mem_util_pct": self.max_observed_mem_util,
             "last_mirror_state": self.last_mirror_state,
+            "rssf_balance": {
+                "last_scar_norm": round(self.last_scar_norm, 5),
+                "fds_t_end_steps": (
+                    None if self.last_fds_t_end_steps is None else round(self.last_fds_t_end_steps, 3)
+                ),
+                "volterra_archive": round(self.last_volterra_archive, 5),
+                "ec_fds_damp_steps": self.ec_fds_damp_steps,
+                "balance_scale_break_steps": self.balance_scale_break_steps,
+                "collapse_events": self.collapse_events,
+                "last_balance": self.last_balance.as_dict() if self.last_balance is not None else None,
+                "last_collapse": self.last_collapse.as_dict() if self.last_collapse is not None else None,
+            },
         }
 
     def close(self) -> None:
@@ -616,6 +839,9 @@ class MirrorRegionBreathingPool:
         self._prev_reuse_rate: float = 0.0
         self._prev_occ_frac: float = 0.0
         self._recent_outcomes: deque[int] = deque(maxlen=16)
+        self._volterra_fds = VolterraFDSMonitor(archive_decay=0.80)
+        self._last_rssf_balance: Optional[DynamicBalanceSnapshot] = None
+        self.rssf_scale_breaks: int = 0
 
         # Own telemetry
         self.admits_direct: int = 0
@@ -758,24 +984,47 @@ class MirrorRegionBreathingPool:
         )
         want_warm = bool(keep_if_reusable or reg.recurring_hint or reg.reuse_count > 0)
 
-        # Center-read Mirror Equality on region persistence vs memory breathing headroom
-        out_prev = (self._prev_reuse_rate, self._prev_occ_frac)
-        obs_prev = (reuse_rate - self._prev_reuse_rate, occ_frac - self._prev_occ_frac)
-        obs_next = (1.0 - reuse_rate if want_warm else -reuse_rate, -occ_frac)
-        out_next = (1.0 if want_warm else 0.0, 0.5 * occ_frac)
-        bal = eval_mirror_equality_step(out_prev, obs_prev, obs_next, out_next, equal_tol=0.18, split_tol=0.45)
+        # Canonical L4 center-read Mirror Equality on real reuse density vs breathing headroom (natural 1/2 threshold)
+        # coupled with local EC Volterra archive + FDS horizon + 8-pair force balance (ZERO cross-scale refs!).
+        free_frac = max(0.05, 1.0 - occ_frac)
+        prev_free_frac = max(0.05, 1.0 - self._prev_occ_frac)
+        reuse_obs = max(0.05, reuse_rate if reg.reuse_count == 0 else max(0.5, reuse_rate))
+        reuse_prev = max(0.05, self._prev_reuse_rate)
+        reg_frac = reg.gpu_bytes / max(1, self.max_pool_bytes)
+        warm_count = sum(1 for r in self._regions.values() if r.state == "WARM")
+
+        ec_m2 = self._volterra_fds.update(
+            free_bytes=max(0, self.max_pool_bytes - self._live_bytes),
+            total_bytes=self.max_pool_bytes,
+            reserve_bytes=max(1, int(self.max_pool_bytes * 0.15)),
+        )
+        rssf_m2 = observe_region_breathing_balance(
+            occ_frac=occ_frac,
+            reuse_rate=reuse_rate,
+            reg_frac=reg_frac,
+            sustained_drain=ec_m2.sustained_drain_rate,
+            warm_fill_frac=float(warm_count) / float(max(1, self.max_warm_regions)),
+        )
+        self._last_rssf_balance = rssf_m2
+
+        proj_free = (free_frac - reg_frac) if occ_frac <= 0.5 else -2.0 * (occ_frac - 0.5)
+        if rssf_m2.regime == "SCALE_BREAK":
+            self.rssf_scale_breaks += 1
+            proj_free = min(proj_free, -max(0.25, occ_frac))
+        elif ec_m2.sustained_drain_rate >= 0.015 and ec_m2.fds_t_end_steps <= 3.0:
+            proj_free = min(proj_free, -max(0.15, ec_m2.sustained_drain_rate * 4.0))
+
+        out_prev = (0.0, 0.0) if self._step_clock <= 1 else (reuse_prev, prev_free_frac)
+        obs_prev = (reuse_obs, free_frac)
+        obs_next = (reuse_obs if want_warm else -reuse_obs, proj_free)
+        out_next = (max(0.5, reuse_obs) if want_warm else 0.05, 1.0)
+        bal = eval_mirror_equality_step(out_prev, obs_prev, obs_next, out_next)
 
         self.last_mirror_state = bal.state
-        self._prev_reuse_rate = reuse_rate
+        self._prev_reuse_rate = reuse_obs
         self._prev_occ_frac = occ_frac
 
-        warm_count = sum(1 for r in self._regions.values() if r.state == "WARM")
-        if (
-            want_warm
-            and bal.state != "PROTECT"
-            and occ_frac < 0.75
-            and warm_count < self.max_warm_regions
-        ):
+        if want_warm and bal.state != "SPLIT" and warm_count < self.max_warm_regions:
             reg.state = "WARM"
             self.warm_holds += 1
             return "HOLD_WARM_REGION"
@@ -822,6 +1071,14 @@ class MirrorRegionBreathingPool:
             "exhales_immediate": self.exhales_immediate,
             "exhales_reaped": self.exhales_reaped,
             "last_mirror_state": self.last_mirror_state,
+            "rssf_balance": (
+                {
+                    **self._last_rssf_balance.as_dict(),
+                    "scale_breaks": self.rssf_scale_breaks,
+                }
+                if self._last_rssf_balance is not None
+                else None
+            ),
         }
 
     def close(self) -> None:
@@ -874,6 +1131,11 @@ class MirrorColdWarmupScale:
         self.max_warmup_seconds = max(0.0, float(max_warmup_seconds))
 
         self._prev_ms: Optional[float] = None
+        self._ema_ms: Optional[float] = None
+        self._volterra_latency_drift: float = 0.0
+        self._last_rssf_balance: Optional[DynamicBalanceSnapshot] = None
+        self.fds_equilibrium_confirmations: int = 0
+        self.rssf_scale_breaks: int = 0
         self._plateau_streak: int = 0
         self.kernels_warmed: int = 0
         self.kernel_warmup_ms: float = 0.0
@@ -897,28 +1159,52 @@ class MirrorColdWarmupScale:
 
         if self._prev_ms is None:
             self._prev_ms = dt
-            self.last_mirror_state = "ALIGN"
+            self._ema_ms = dt
+            self._volterra_latency_drift = 0.0
+            bal0 = eval_mirror_equality_step((0.0, 0.0), (1.0, max(1e-4, done_frac)), (1.0, max(1e-4, done_frac)), (1.0, 1.0))
+            self.last_mirror_state = bal0.state  # canonical UNKNOWN on unclosed first step
             if warmed_so_far >= total_targets:
                 return ColdWarmupStepDecision(False, "EQUAL", dt, 1, "all_warm")
             if self.max_warmup_seconds > 0.0 and elapsed_seconds >= self.max_warmup_seconds:
-                return ColdWarmupStepDecision(False, "ALIGN", dt, 0, "time_budget")
-            return ColdWarmupStepDecision(True, "ALIGN", dt, 0, "warming")
+                return ColdWarmupStepDecision(False, bal0.state, dt, 0, "time_budget")
+            return ColdWarmupStepDecision(True, bal0.state, dt, 0, "warming")
 
         scale_ref = max(self._prev_ms, dt, 1e-4)
         p_norm = self._prev_ms / scale_ref
         c_norm = dt / scale_ref
+        ratio = dt / max(self._prev_ms, 1e-4)
+        # EC Volterra latency drift + FDS power + 8-pair balance confirmation
+        inst_rel = (dt - self._prev_ms) / scale_ref
+        self._ema_ms = dt if self._ema_ms is None else (0.65 * self._ema_ms + 0.35 * dt)
+        self._volterra_latency_drift = 0.75 * self._volterra_latency_drift + inst_rel
+        fds_power = abs(inst_rel) * (1.0 + 0.25 / max(0.05, done_frac))
+        rssf_m3 = observe_warmup_fds_balance(
+            step_ms=dt,
+            ema_ms=self._ema_ms,
+            prev_ms=self._prev_ms,
+            done_frac=done_frac,
+            fds_power=fds_power,
+        )
+        self._last_rssf_balance = rssf_m3
 
-        out_prev = (p_norm, max(0.0, done_frac - 1.0 / max(1, total_targets)))
-        obs_prev = (c_norm - p_norm, 1.0 / max(1, total_targets))
-        obs_next = (0.0, 1.0 / max(1, total_targets))
-        out_next = (c_norm, min(1.0, done_frac + 1.0 / max(1, total_targets)))
+        # Signed speed delta along natural 1/2 mirror scale: sharp drop (<0.5x or >1.5x) pushes into TENSION/SPLIT; plateau -> EQUAL
+        out_prev = (p_norm, 1.0)
+        obs_prev = (c_norm, ratio if abs(ratio - 1.0) < 0.5 else -(abs(ratio - 1.0)))
+        obs_next = (c_norm, 1.0)
+        out_next = (c_norm, 1.0)
 
-        bal = eval_mirror_equality_step(out_prev, obs_prev, obs_next, out_next, equal_tol=0.15, split_tol=0.35)
+        bal = eval_mirror_equality_step(out_prev, obs_prev, obs_next, out_next)
         self._prev_ms = dt
         self.last_mirror_state = bal.state
 
-        if bal.state == "EQUAL":
+        if rssf_m3.regime == "SCALE_BREAK":
+            self.rssf_scale_breaks += 1
+            self._plateau_streak = 0
+        elif bal.state == "EQUAL":
             self._plateau_streak += 1
+            sustained_rel_drift = 0.25 * self._volterra_latency_drift
+            if rssf_m3.d3_margin > 0.0 and abs(sustained_rel_drift) <= 0.20:
+                self.fds_equilibrium_confirmations += 1
         else:
             self._plateau_streak = 0
 
@@ -989,6 +1275,15 @@ class MirrorColdWarmupScale:
             "plateau_streak": self._plateau_streak,
             "stopped_reason": self.stopped_reason,
             "last_mirror_state": self.last_mirror_state,
+            "rssf_balance": (
+                {
+                    **self._last_rssf_balance.as_dict(),
+                    "fds_equilibrium_confirmations": self.fds_equilibrium_confirmations,
+                    "scale_breaks": self.rssf_scale_breaks,
+                }
+                if self._last_rssf_balance is not None
+                else None
+            ),
         }
 
 
@@ -1044,6 +1339,8 @@ class MirrorPostPrefillRegionWarmupScale:
         self.warmed_experts_hit: int = 0
         self.warmed_experts_checked: int = 0
         self.last_mirror_state: str = "IDLE"
+        self._last_rssf_balance: Optional[DynamicBalanceSnapshot] = None
+        self.rssf_scale_breaks: int = 0
 
     def record_prefill_layer(
         self,
@@ -1115,19 +1412,28 @@ class MirrorPostPrefillRegionWarmupScale:
         prev_scar = self._prev_scar[li] if 0 <= li < self.num_layers else 0.0
 
         bal = eval_mirror_equality_step(
-            (prev_cov, prev_scar),
-            (cur_cov - prev_cov, cur_scar - prev_scar),
-            (1.0 - cur_cov, -cur_scar) if cur_cov >= 0.5 else (0.0, 0.0),
-            (1.0, 0.0),
-            equal_tol=0.15,
-            split_tol=0.40,
+            (max(1e-4, prev_cov), max(1e-4, 1.0 - prev_scar)),
+            (max(1e-4, cur_cov), max(1e-4, 1.0 - cur_scar)),
+            (cur_cov if cur_cov >= 0.5 else -max(0.1, cur_scar), (1.0 - cur_scar) if cur_cov >= 0.5 else -max(0.1, cur_scar)),
+            (1.0, 1.0),
         )
         self.last_mirror_state = bal.state
         if 0 <= li < self.num_layers:
             self._prev_cov[li] = cur_cov
             self._prev_scar[li] = cur_scar
 
-        if scar_eids and (bal.state in ("SPLIT", "ALIGN", "PROTECT") or cur_scar > 0.25):
+        rssf_m4 = observe_post_prefill_region_balance(
+            cur_cov=cur_cov,
+            cur_scar=cur_scar,
+            hit_rate=(self._prev_hit_rate[li] if 0 <= li < self.num_layers else 0.5),
+            miss_streak=(self._miss_streak[li] if 0 <= li < self.num_layers else 0),
+            scar_ratio=float(len(self._scar_weights[li])) / float(max(1, self.max_region_experts)),
+        )
+        self._last_rssf_balance = rssf_m4
+        if rssf_m4.regime == "SCALE_BREAK":
+            self.rssf_scale_breaks += 1
+
+        if scar_eids and (bal.state in ("TENSION", "SPLIT") or rssf_m4.regime == "SCALE_BREAK"):
             sc_map = self._scar_weights[li]
             sh_map = self._scar_hits[li]
             for k in list(sc_map.keys()):
@@ -1173,6 +1479,8 @@ class MirrorPostPrefillRegionWarmupScale:
             cold_cands = [e for e in ordered_cands if not is_physically_resident_fn(target_l, e)]
             if cold_cands:
                 w_cap = self._width[target_l] if 0 <= target_l < self.num_layers else 1
+                if rssf_m4.regime == "SCALE_BREAK":
+                    w_cap = 1
                 chosen = tuple(cold_cands[:w_cap])
                 self.plans_emitted += 1
                 self.warmed_experts_submitted += len(chosen)
@@ -1256,18 +1564,16 @@ class MirrorPostPrefillRegionWarmupScale:
         hit_rate = hits / max(1, len(warmed_eids))
         prev_hr = self._prev_hit_rate[li]
         bal = eval_mirror_equality_step(
-            (prev_hr, 1.0 - prev_hr),
-            (hit_rate - prev_hr, prev_hr - hit_rate),
-            (1.0 - hit_rate, hit_rate - 1.0),
-            (1.0, 0.0),
-            equal_tol=0.15,
-            split_tol=0.40,
+            (max(1e-4, prev_hr), max(1e-4, 0.5 + 0.5 * prev_hr)),
+            (max(1e-4, hit_rate), max(1e-4, 0.5 + 0.5 * hit_rate)),
+            (hit_rate if hit_rate >= 0.5 else -max(0.1, 1.0 - hit_rate), 1.0 if hit_rate >= 0.5 else -max(0.1, 1.0 - hit_rate)),
+            (1.0, 1.0),
         )
         self._prev_hit_rate[li] = hit_rate
-        if hit_rate >= 0.5 and bal.state in ("EQUAL", "ALIGN"):
+        if bal.state == "EQUAL":
             self._miss_streak[li] = 0
             self._width[li] = min(self.max_width, self._width[li] + (1 if hit_rate >= 0.99 else 0))
-        elif hit_rate == 0.0:
+        elif bal.state == "SPLIT":
             self._miss_streak[li] += 1
             self._width[li] = max(1, self._width[li] - 1)
         else:
@@ -1288,6 +1594,14 @@ class MirrorPostPrefillRegionWarmupScale:
                 100.0 * self.warmed_experts_hit / max(1, self.warmed_experts_checked), 2
             ),
             "last_mirror_state": self.last_mirror_state,
+            "rssf_balance": (
+                {
+                    **self._last_rssf_balance.as_dict(),
+                    "scale_breaks": self.rssf_scale_breaks,
+                }
+                if self._last_rssf_balance is not None
+                else None
+            ),
         }
 
 
@@ -1338,12 +1652,13 @@ def _reattach_q1_scar(
 
 
 def mirror_cube_depth_math(p_body: float, p_tail: float, min_k: int, max_k: int) -> int:
-    """Pure-math M5b cube depth from bracketless center-read probability balance (ZERO step-if thresholds!).
+    """Pure-math M5b cube depth from bracketless center-read probability balance + 8-pair Q1 cube balance.
 
     Given past body density `p_body in [0, 1]` and future tail density `p_tail in [0, 1]`:
         s = 0.5 * (p_body + p_tail)
         d = |p_body - p_tail| / (p_body + p_tail + 1e-8)
         rho = min(1.0, max(s, p_tail) * (1.0 + 0.5 * d * I[p_tail > p_body]))
+        + observe_q1_cube_balance(...): protects plane depth under SCALE_BREAK impulse.
         k = clamp(floor(min_k + rho * (max_k - min_k) + 0.5), min_k, max_k)
     """
     pb = max(0.0, min(1.0, float(p_body)))
@@ -1352,6 +1667,15 @@ def mirror_cube_depth_math(p_body: float, p_tail: float, min_k: int, max_k: int)
     d = abs(pb - pt) / (pb + pt + 1e-8)
     growth_boost = (1.0 + 0.5 * d) if pt > pb else 1.0
     rho = min(1.0, max(s, pt) * growth_boost)
+    q1_bal = observe_q1_cube_balance(
+        info_density=max(0.02, max(pb, pt)),
+        weight_mass_frac=max(0.05, s),
+        input_impulse=max(0.02, pt + (0.5 * d if pt > pb else 0.0)),
+        residual_entropy=max(0.05, 1.0 - max(pb, pt)),
+        output_coherence=max(0.10, 1.0 - 0.5 * abs(pb - pt)),
+    )
+    if q1_bal.regime == "SCALE_BREAK":
+        rho = min(1.0, max(rho, 0.75 + 0.25 * q1_bal.info_efficiency))
     k = int(math.floor(min_k + rho * max(0, max_k - min_k) + 0.5))
     return max(int(min_k), min(int(max_k), k))
 
@@ -1775,7 +2099,7 @@ class MirrorIsolatedMoEOverlayV4:
         rim_k: int = 3,
         shell_k: int = 2,
         min_shed_k: int = 2,
-        rest_tol: float = 0.24,
+        rest_tol: float = 0.0,
         rest_min: int = 3,
         auto_vram_adapt: bool = False,
         vram_safety_reserve_bytes: Optional[int] = None,
@@ -3226,19 +3550,24 @@ class MirrorIsolatedMoEOverlayV4:
                 self.decode_direct_unclosed += 1
                 continue
 
+            if self.rest_tol <= 0.0:
+                cold_to_run.append((e_int, k_pos, rw, False))
+                w_done += rw
+                done_count += 1
+                self.decode_cold_woken_split += 1
+                continue
+
             mean_w = w_done / max(1, done_count)
             est_next_delta = max(last_delta_norm, 0.5 * prev_delta_norm) * (rw / max(mean_w, 1e-6))
             scale_ref = max(line_norm, est_next_delta, 1e-6)
             bal = eval_mirror_equality_step(
                 (line_norm / scale_ref, w_done / tok_total_w),
-                (last_delta_norm / scale_ref, mean_w / tok_total_w),
-                (est_next_delta / scale_ref, rw / tok_total_w),
+                (max(1e-6, last_delta_norm / scale_ref), mean_w / tok_total_w),
+                (max(1e-6, est_next_delta / scale_ref), rw / tok_total_w),
                 ((line_norm + est_next_delta) / scale_ref, min(1.0, (w_done + rw) / tok_total_w)),
-                equal_tol=self.rest_tol,
-                split_tol=min(0.65, self.rest_tol * 2.0),
             )
             rel_tail_impact = est_next_delta / (line_norm + 1e-6)
-            # Rest ONLY when BOTH center-read mirror converged (EQUAL) AND relative tail impact < rest_tol
+            # Rest ONLY when BOTH canonical L4 mirror converged (EQUAL) AND explicit caller error bound < rest_tol
             if bal.state == "EQUAL" and rel_tail_impact < self.rest_tol:
                 c.cold_experts_rested += 1
                 c.cold_disk_reads_avoided += 1

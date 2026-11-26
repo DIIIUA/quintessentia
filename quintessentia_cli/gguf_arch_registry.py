@@ -218,6 +218,9 @@ EXTENDED_GGUF_ARCH_ALIASES: dict[str, str] = {
     "mamba2": "mamba2",
     "jamba": "jamba",
     "bamba": "bamba",
+    "bitnet": "bitnet",
+    "bitnet-b1.58": "bitnet",
+    "minicpm3": "minicpm3",
 }
 
 
@@ -587,6 +590,35 @@ def build_gguf_config_dict(
             pos_kv = [int(x) for x in raw_kv if int(x) > 0]
             if pos_kv:
                 cfg["num_key_value_heads"] = max(pos_kv)
+
+    # MiniCPM3 MLA (Multi-Head Latent Attention) config fields
+    if hf_type == "minicpm3":
+        q_lora = _meta_get(meta, p, "attention.q_lora_rank")
+        kv_lora = _meta_get(meta, p, "attention.kv_lora_rank")
+        if q_lora is not None:
+            cfg["q_lora_rank"] = int(q_lora)
+        if kv_lora is not None:
+            cfg["kv_lora_rank"] = int(kv_lora)
+        qk_rope_hd = int(rope_dim or 32)
+        qk_nope_hd = int(key_len) - qk_rope_hd if (key_len is not None and int(key_len) > qk_rope_hd) else 64
+        v_hd = qk_nope_hd
+        if tensor_shapes and n_heads:
+            kv_b_shape = tensor_shapes.get("blk.0.attn_kv_b.weight")
+            if kv_b_shape and len(kv_b_shape) == 2 and kv_b_shape[0] % int(n_heads) == 0:
+                per_head = kv_b_shape[0] // int(n_heads)
+                if per_head > qk_nope_hd:
+                    v_hd = per_head - qk_nope_hd
+        cfg["qk_rope_head_dim"] = qk_rope_hd
+        cfg["qk_nope_head_dim"] = qk_nope_hd
+        cfg["v_head_dim"] = v_hd
+        cfg["head_dim"] = qk_nope_hd + qk_rope_hd
+        for gk, tk, default_v in (
+            ("embedding_scale", "scale_emb", 12.0),
+            ("residual_scale", "scale_depth", 1.4),
+            ("dim_model_base", "dim_model_base", 256),
+        ):
+            gv = _meta_get(meta, p, gk)
+            cfg[tk] = float(gv) if gv is not None else default_v
 
     # Granite scaling multipliers if present
     for gk, tk in (
@@ -975,7 +1007,7 @@ def get_extended_gguf_mapping(
 
     # 14. GraniteMoeHybrid / GraniteMoe
     if hf_type in ("granitemoe", "granitemoehybrid"):
-        return [
+        g_rules: list[WeightTransform] = [
             WeightRenaming(r"^token_embd\.", "model.embed_tokens."),
             WeightRenaming(r"^output_norm\.", "model.norm."),
             WeightRenaming(r"^output\.", "lm_head."),
@@ -1004,6 +1036,16 @@ def get_extended_gguf_mapping(
             WeightConverter(r"\.mamba\.A_log$", ".mamba.A_log", [LogNegate(), SqueezeLast()]),
             WeightConverter(r"\.mamba\.D$", ".mamba.D", [SqueezeLast()]),
         ]
+        n_q = int(getattr(text_cfg, "num_attention_heads", 0) or 0)
+        n_kv = int(getattr(text_cfg, "num_key_value_heads", None) or n_q)
+        if n_q > 0:
+            g_rules.extend(
+                [
+                    WeightConverter(r"\.self_attn\.q_proj\.weight$", ".self_attn.q_proj.weight", [LlamaRopeReversePermute(n_q)]),
+                    WeightConverter(r"\.self_attn\.k_proj\.weight$", ".self_attn.k_proj.weight", [LlamaRopeReversePermute(n_kv)]),
+                ]
+            )
+        return g_rules
 
     # 15. Standard Dense + MoE Decoder Families (Llama, Mistral, Mixtral, Qwen2/3, OLMo/OLMoE,
     #     PhiMoE, DeepSeek-V2/V3, GLM4-MoE, MiniMax-M2, GPT-OSS, Cohere, Ernie4.5, SmolLM3, StableLM)
@@ -1028,6 +1070,9 @@ def get_extended_gguf_mapping(
             # GPT-OSS attention sinks
             WeightRenaming(r"\.attn_sinks\.weight$", ".self_attn.sinks"),
             WeightRenaming(r"\.attn_sinks$", ".self_attn.sinks"),
+            # BitNet 1.58b sub-norms
+            WeightRenaming(r"\.attn_sub_norm\.", ".self_attn.attn_sub_norm."),
+            WeightRenaming(r"\.ffn_sub_norm\.", ".mlp.ffn_sub_norm."),
         ]
     )
 
@@ -1047,8 +1092,8 @@ def get_extended_gguf_mapping(
             )
         )
 
-    # Reverse llama.cpp's interleaved RoPE Q/K permutation when arch == "llama" (Llama / Mistral / Mixtral)
-    if arch == "llama":
+    # Reverse llama.cpp's interleaved RoPE Q/K permutation for ROPE_TYPE_NORM families
+    if arch in ("llama", "granite", "smollm3", "bitnet", "bitnet-b1.58"):
         n_q = int(getattr(text_cfg, "num_attention_heads", 0) or 0)
         n_kv = int(getattr(text_cfg, "num_key_value_heads", None) or n_q)
         if n_q > 0:
@@ -1119,6 +1164,7 @@ _EXTRA_PRE_TOKENIZER_SPLITS: dict[str, str] = {
     ),
     "ernie4_5": _LLAMA3_SPLIT_REGEX,
     "granite": _GPT2_SPLIT_REGEX,
+    "refact": _GPT2_SPLIT_REGEX,
     "nemotron": _LLAMA3_SPLIT_REGEX,
     "gpt-oss": _LLAMA3_SPLIT_REGEX,
     "gpt_oss": _LLAMA3_SPLIT_REGEX,

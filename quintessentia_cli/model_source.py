@@ -45,6 +45,7 @@ from quintessentia_cli.gguf_reader import (
     GGML_TYPE_I16,
     GGML_TYPE_I32,
     GGML_TYPE_I64,
+    GGML_TYPE_I2_S,
     GGML_TYPE_MXFP4,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_K,
@@ -515,6 +516,16 @@ def check_supported(model_dir: str | Path) -> None:
         return
     if "num_hidden_layers" not in cfg or "hidden_size" not in cfg:
         raise UnsupportedModelError(f"{model_dir}: config has no decoder shape (num_hidden_layers, hidden_size)")
+    # Reject checkpoints that require unverified custom auto_map code not built into transformers.
+    raw_full = _read_json(Path(model_dir) / "config.json") if (Path(model_dir) / "config.json").is_file() else {}
+    if isinstance(raw_full, dict) and raw_full.get("auto_map"):
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        mt = str(raw_full.get("model_type") or cfg.get("model_type") or "")
+        if mt not in CONFIG_MAPPING:
+            raise UnsupportedModelError(
+                f"{model_dir}: model_type={mt!r} requires custom remote code (auto_map) and is not natively supported"
+            )
     # Validates shard index, decoder layers and the embed/norm/lm_head edges.
     HFShardedSource(model_dir).close()
 
@@ -573,7 +584,26 @@ def load_runtime_config(model_dir: str | Path):
     from transformers import AutoConfig
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 
-    cfg = AutoConfig.from_pretrained(str(d))
+    raw_cfg = _read_json(d / "config.json") if (d / "config.json").is_file() else {}
+    raw_mt = str(raw_cfg.get("model_type", "")) if isinstance(raw_cfg, dict) else ""
+    if raw_mt in ("qwen2_vl", "qwen2_5_vl"):
+        # For pure-text 1D input (t == h == w == pos), Qwen2-VL/Qwen2.5-VL mRoPE is mathematically
+        # identical to standard 1D RoPE on the Qwen2 text backbone, allowing native text CausalLM execution.
+        src_t = raw_cfg.get("text_config") if isinstance(raw_cfg.get("text_config"), dict) else raw_cfg
+        q2_fields = (
+            "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers",
+            "num_attention_heads", "num_key_value_heads", "hidden_act",
+            "max_position_embeddings", "rms_norm_eps", "rope_theta",
+            "tie_word_embeddings", "bos_token_id", "eos_token_id", "pad_token_id",
+            "sliding_window", "use_sliding_window", "max_window_layers", "attention_dropout",
+        )
+        q2_kw = {k: src_t[k] for k in q2_fields if k in src_t and src_t[k] is not None}
+        return AutoConfig.for_model("qwen2", **q2_kw)
+
+    try:
+        cfg = AutoConfig.from_pretrained(str(d), local_files_only=True, trust_remote_code=False)
+    except Exception as exc:
+        raise UnsupportedModelError(f"{d}: cannot load native config ({exc})") from exc
     if hasattr(cfg, "get_text_config") and getattr(cfg, "text_config", None) is not None:
         text_cfg = cfg.get_text_config()
         if text_cfg is not cfg and type(text_cfg) in MODEL_FOR_CAUSAL_LM_MAPPING:
@@ -600,12 +630,21 @@ def load_runtime_tokenizer(model_dir: str | Path, config: Any = None):
 
     from transformers import AutoTokenizer
 
-    tok_kwargs: dict[str, Any] = {"fix_mistral_regex": False, "local_files_only": True}
+    tok_kwargs: dict[str, Any] = {
+        "fix_mistral_regex": False,
+        "local_files_only": True,
+        "trust_remote_code": False,
+    }
     try:
         return AutoTokenizer.from_pretrained(str(d), **tok_kwargs)
     except TypeError:
         tok_kwargs.pop("fix_mistral_regex", None)
-        return AutoTokenizer.from_pretrained(str(d), **tok_kwargs)
+        try:
+            return AutoTokenizer.from_pretrained(str(d), **tok_kwargs)
+        except Exception as exc:
+            raise UnsupportedModelError(f"{d}: cannot load native tokenizer ({exc})") from exc
+    except Exception as exc:
+        raise UnsupportedModelError(f"{d}: cannot load native tokenizer ({exc})") from exc
 
 
 # --------------------------------------------------------------------------------------
@@ -1668,6 +1707,25 @@ def dequantize_gguf_tensor(u8: Any, ggml_type: int, dtype: Any = None):
         trits = (((chunks >> shifts) & 3).to(torch.int8) - 1).reshape(nb, 256).to(torch.float32)
         d = blocks[:, 64:66].contiguous().view(torch.float16).to(torch.float32)
         return (d * trits).to(dtype).reshape(-1)
+
+    if ggml_type == GGML_TYPE_I2_S:
+        # Microsoft BitNet.cpp I2_S: 128-element interleaved 32-byte blocks (shifts 6,4,2,0; val - 1)
+        # followed by a 32-byte trailer whose first 4 bytes store the per-tensor float32 scale.
+        if u8.numel() < 32:
+            return torch.empty(0, dtype=dtype, device=u8.device)
+        data_bytes = int(u8.numel()) - 32
+        scale = u8[data_bytes : data_bytes + 4].contiguous().view(torch.float32)
+        blocks = u8[:data_bytes].reshape(-1, 32)
+        trits = torch.cat(
+            [
+                ((blocks >> 6) & 3).to(torch.int8) - 1,
+                ((blocks >> 4) & 3).to(torch.int8) - 1,
+                ((blocks >> 2) & 3).to(torch.int8) - 1,
+                (blocks & 3).to(torch.int8) - 1,
+            ],
+            dim=1,
+        ).reshape(-1).to(torch.float32)
+        return (trits * scale).to(dtype)
 
     if ggml_type == GGML_TYPE_MXFP4:
         blocks = u8.reshape(-1, 17)
@@ -3074,7 +3132,12 @@ class GGUFModelSource:
                 continue
 
             gt = int(t["ggml_type"])
-            if self._raw_torch_dtype(gt) is None and gt not in GGML_BLOCK and gt not in _EXTRA_GGML_BLOCKS:
+            if (
+                self._raw_torch_dtype(gt) is None
+                and gt not in GGML_BLOCK
+                and gt not in _EXTRA_GGML_BLOCKS
+                and gt != GGML_TYPE_I2_S
+            ):
                 raise UnsupportedModelError(
                     f"{self.gguf_path}: tensor {gguf_name!r} uses unsupported ggml quantization {t['type_name']} ({gt})"
                 )
@@ -3423,6 +3486,8 @@ class GGUFModelSource:
         if gt in _EXTRA_GGML_BLOCKS:
             _, block_elems, block_bytes = _EXTRA_GGML_BLOCKS[gt]
             return (int(shape[1]) // block_elems) * block_bytes
+        if gt == GGML_TYPE_I2_S:
+            return int(shape[1]) // 4
         raise UnsupportedModelError(f"Unsupported row-slice ggml type {gt}")
 
     def read_matrix_row_range(self, gguf_name: str, r0: int, r1: int, dtype: Any = None):
@@ -3438,9 +3503,19 @@ class GGUFModelSource:
         if count == 0:
             return torch.empty((0, cols), dtype=target_dtype, device=dev)
         stride = self._row_byte_stride(info)
+        gt = int(info["ggml_type"])
+        if gt == GGML_TYPE_I2_S:
+            buf = bytearray(count * stride + 32)
+            row_buf = memoryview(buf)[: count * stride]
+            self._read_into(int(info["abs_offset"]) + r0 * stride, row_buf, shard_path=info.get("shard_path"))
+            trailer = memoryview(buf)[count * stride :]
+            self._read_into(
+                int(info["abs_offset"]) + int(info["nbytes"]) - 32, trailer, shard_path=info.get("shard_path")
+            )
+            return self._decode_bytes(buf, gt, (count, cols), dtype=target_dtype, device=dev)
         buf = bytearray(count * stride)
         self._read_into(int(info["abs_offset"]) + r0 * stride, buf, shard_path=info.get("shard_path"))
-        return self._decode_bytes(buf, int(info["ggml_type"]), (count, cols), dtype=target_dtype, device=dev)
+        return self._decode_bytes(buf, gt, (count, cols), dtype=target_dtype, device=dev)
 
     def lookup_matrix_rows(self, gguf_name: str, indices: Any, dtype: Any = None):
         import torch

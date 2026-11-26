@@ -93,3 +93,43 @@ def test_cli_parser_commands():
     assert args.command == "serve" and args.port == 9000 and args.require_auth
     args = parser.parse_args(["ask", "--no-think", "hello", "world"])
     assert args.prompt == ["hello", "world"] and args.no_think
+    args = parser.parse_args(["bench", "--model", "1", "--runs", "3", "--max-tokens", "64", "--no-think"])
+    assert args.command == "bench" and args.runs == 3 and args.max_tokens == 64 and args.no_think
+    args = parser.parse_args(["hud", "--status"])
+    assert args.command == "hud" and args.status is True
+    args = parser.parse_args(["hud", "--stop"])
+    assert args.command == "hud" and args.stop is True
+    args = parser.parse_args(["hud", "--install-desktop"])
+    assert args.command == "hud" and args.install_desktop is True
+
+
+def test_hud_backend_rssf_extract_and_standby_env():
+    from quintessentia_cli.hud import hud_backend
+
+    extracted = hud_backend._extract_rssf_fields_from_metrics({
+        "kv_gpu_layers": 2,
+        "kv_offloaded_layers": 6,
+        "kv_promoted_layers": 1,
+        "rssf_generation_balance": {
+            "entry_balance": {"d3_margin": 2.22},
+            "entry_collapse": {"loss_of_archive": False},
+            "turn_end_balance": {"d3_margin": 3.75, "regime": "EXPAND"},
+            "prefill_damped_chunks": 2,
+            "prefill_scale_breaks": 0,
+            "active_scales": {
+                "m0_trunk_q1": {},
+                "m3_cold_warmup": {},
+                "m6_probability_path": {},
+                "kv_placement": {},
+            },
+        },
+    })
+    assert extracted["kv_gpu_layers"] == 2 and extracted["kv_offloaded_layers"] == 6
+    assert extracted["rssf_d3_margin"] == 3.75 and extracted["rssf_regime"] == "EXPAND"
+    assert extracted["rssf_active_scales"] == ["M0", "M3", "M6", "KV"]
+
+    standby_win = hud_backend.read_live_telemetry(
+        {"telemetry_file": "/nonexistent/quint_missing_12345.json"}, wsl_running=False
+    )
+    assert standby_win["env"] == "Windows" or standby_win["source"] == "live_json"
+

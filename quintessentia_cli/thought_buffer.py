@@ -95,6 +95,15 @@ def capture_cache_snapshot(past_key_values: Any) -> CacheStateSnapshot:
     for l_idx, l_cache in enumerate(past_key_values.layers):
         if not (hasattr(l_cache, "keys") or hasattr(l_cache, "conv_states")):
             raise NotImplementedError(f"Unsupported thought-buffer cache layer: {type(l_cache).__name__}")
+        if getattr(l_cache, "is_quintessentia_pinned_layer", False) or getattr(
+            l_cache, "is_quintessentia_prealloc_layer", False
+        ):
+            seq_len = int(l_cache.get_seq_length())
+            if seq_len > 0:
+                snap.kv_lengths[l_idx] = seq_len
+            snap.append_only_kv.add(l_idx)
+            snap.layer_states.append({"_quintessentia_pinned_seq_len": seq_len})
+            continue
         keys = getattr(l_cache, "keys", None)
         if keys is not None and keys.numel() > 0:
             snap.kv_lengths[l_idx] = int(keys.shape[-2])
@@ -121,7 +130,19 @@ def restore_cache_snapshot(past_key_values: Any, snap: CacheStateSnapshot) -> No
         return
     if not hasattr(past_key_values, "layers") or len(past_key_values.layers) < len(snap.layer_states):
         raise NotImplementedError("Cannot restore this thought-buffer state format")
+    if getattr(past_key_values, "is_quintessentia_offloaded", False):
+        from .kv_offload import release_kv_cache_gpu_buffers
+        release_kv_cache_gpu_buffers(past_key_values)
     for l_idx, state in enumerate(snap.layer_states):
+        if "_quintessentia_pinned_seq_len" in state:
+            layer = past_key_values.layers[l_idx]
+            target_len = int(state["_quintessentia_pinned_seq_len"])
+            cur_len = int(layer.get_seq_length())
+            if target_len < cur_len:
+                layer.crop(-(cur_len - target_len))
+            else:
+                layer.offload()
+            continue
         memo = {}
         if l_idx in snap.append_only_kv:
             memo = {id(state[k]): state[k] for k in ("keys", "values") if state.get(k) is not None}
@@ -294,6 +315,11 @@ class InitialProbabilityAnchor:
         self._mirror_equal_revisions: int = 0
         self._mirror_tension_revisions: int = 0
         self._mirror_zero_force_steps: int = 0
+        # M8 pure-tensor 8-pair balance accumulators (zero CPU sync on hot decode path!)
+        self._mirror_rssf_steps: int = 0
+        self._mirror_rssf_scale_breaks: Any = 0
+        self._mirror_rssf_d3_sum: Any = 0.0
+        self._mirror_rssf_ie_sum: Any = 0.0
 
     def initial_fingerprint(self) -> str | None:
         if self.phi0 is None:
@@ -546,8 +572,15 @@ class InitialProbabilityAnchor:
                 setattr(self.telemetry, name, value.to(device))
             elif isinstance(value, list):
                 value[:] = [v.to(device) if isinstance(v, torch.Tensor) else v for v in value]
-        if isinstance(self._mirror_zero_force_steps, torch.Tensor) and self._mirror_zero_force_steps.device != device:
-            self._mirror_zero_force_steps = self._mirror_zero_force_steps.to(device)
+        for m_attr in (
+            "_mirror_zero_force_steps",
+            "_mirror_rssf_scale_breaks",
+            "_mirror_rssf_d3_sum",
+            "_mirror_rssf_ie_sum",
+        ):
+            m_val = getattr(self, m_attr, None)
+            if isinstance(m_val, torch.Tensor) and m_val.device != device:
+                setattr(self, m_attr, m_val.to(device))
 
     def _transform_logits_mirror_m8(self, z2d: torch.Tensor, is_3d: bool, step_index: int) -> torch.Tensor:
         """Pure-tensor M8 canonical L4 logit steering (zero CPU syncs, zero 0.125/0.42/5.5/0.25/1.85 constants)."""
@@ -559,9 +592,10 @@ class InitialProbabilityAnchor:
         # otherwise blend strictly by canonical Tie(Phi0, phi_buf) in [0, 1] while keeping Phi0 immutable.
         if self._mirror_last_state == "SPLIT" and self.mirror_split_leaves:
             y_node = buf_v
+            branch_tie_t = torch.zeros((), device=z2d.device, dtype=torch.float32)
         else:
-            branch_tie = _tensor_tie(phi0_v, buf_v).reshape(())
-            y_node = branch_tie * phi0_v + (1.0 - branch_tie) * buf_v
+            branch_tie_t = _tensor_tie(phi0_v, buf_v).reshape(())
+            y_node = branch_tie_t * phi0_v + (1.0 - branch_tie_t) * buf_v
 
         logp = torch.log_softmax(z2d, dim=-1)
         probs = logp.exp()
@@ -579,9 +613,25 @@ class InitialProbabilityAnchor:
         y_cand = y_node.unsqueeze(0) * cand_mask
         tau_step = _tensor_tie(z_cand, y_cand)  # [M, 1], == 0 on orthogonal/opposite SPLIT -> zero force!
 
+        # Pure-tensor zero-sync 8-pair force balance at thought/logit scale (I = tau_step, S = g_H, L = branch_tie)
+        from src.rssf_dynamic_operators import observe_thought_balance_tensor
+
+        d3_m8, ie_m8, _br_m8 = observe_thought_balance_tensor(
+            tau_step=tau_step,
+            entropy=entropy,
+            g_h=g_h,
+            branch_tie=branch_tie_t,
+            step_index=step_index,
+        )
+        # Modulate cap_t smoothly by live 8-force balance (strictly zero-force when tau_step == 0!)
+        bal_scale = torch.where(
+            d3_m8 <= 0.0,
+            torch.full_like(d3_m8, 0.5),
+            (0.75 + 1.25 * ie_m8).clamp(0.5, 1.25),
+        )
         # Dynamic mirror log-odds cap (replaces hardcoded max_log_odds_shift=0.125):
-        # cap_t = g_H * tau_step * 0.5 * min(H, 1.0)
-        cap_t = g_h * tau_step * (0.5 * entropy.clamp_max(1.0))
+        # cap_t = g_H * tau_step * 0.5 * min(H, 1.0) * bal_scale
+        cap_t = g_h * tau_step * (0.5 * entropy.clamp_max(1.0)) * bal_scale
         span = (y_cand.amax(dim=-1, keepdim=True) - y_cand.amin(dim=-1, keepdim=True)).clamp_min(1e-12)
         delta = y_cand * (cap_t / span)
 
@@ -596,6 +646,10 @@ class InitialProbabilityAnchor:
         self.telemetry.initial_rows_active += (delta.abs().sum(-1) > 0).sum().detach()
         self.telemetry.initial_logit_l1 += delta.abs().sum().detach()
         self._mirror_zero_force_steps += (tau_step.squeeze(-1) <= 0.0).sum().detach()
+        self._mirror_rssf_steps += int(M)
+        self._mirror_rssf_scale_breaks = self._mirror_rssf_scale_breaks + (d3_m8.squeeze(-1) <= 0.0).sum().detach()
+        self._mirror_rssf_d3_sum = self._mirror_rssf_d3_sum + d3_m8.sum().detach()
+        self._mirror_rssf_ie_sum = self._mirror_rssf_ie_sum + ie_m8.sum().detach()
 
         if self.phi0 is not None:
             chosen_phi = self.phi0.gather(0, new_top[:1])[0].detach()
@@ -608,6 +662,10 @@ class InitialProbabilityAnchor:
 
     def mirror_stats(self) -> dict[str, Any]:
         zero_force = int(self._mirror_zero_force_steps.item()) if isinstance(self._mirror_zero_force_steps, torch.Tensor) else int(self._mirror_zero_force_steps)
+        rssf_steps = int(self._mirror_rssf_steps)
+        rssf_sb = int(self._mirror_rssf_scale_breaks.item()) if isinstance(self._mirror_rssf_scale_breaks, torch.Tensor) else int(self._mirror_rssf_scale_breaks)
+        rssf_d3 = float(self._mirror_rssf_d3_sum.item()) if isinstance(self._mirror_rssf_d3_sum, torch.Tensor) else float(self._mirror_rssf_d3_sum)
+        rssf_ie = float(self._mirror_rssf_ie_sum.item()) if isinstance(self._mirror_rssf_ie_sum, torch.Tensor) else float(self._mirror_rssf_ie_sum)
         return {
             "scale": "M8_mirror_thought_buffer",
             "mirror_mode": self.mirror_mode,
@@ -621,6 +679,16 @@ class InitialProbabilityAnchor:
             "last_tie": round(self._mirror_last_tie, 4),
             "last_delta": round(self._mirror_last_delta, 4),
             "phi0_immutable_sha256": self.initial_fingerprint(),
+            "rssf_balance": (
+                {
+                    "steps": rssf_steps,
+                    "scale_breaks": rssf_sb,
+                    "mean_d3_margin": round(rssf_d3 / max(1, rssf_steps), 4),
+                    "mean_info_efficiency_t4": round(rssf_ie / max(1, rssf_steps), 4),
+                }
+                if rssf_steps > 0
+                else None
+            ),
         }
 
     def transform_logits(self, logits: torch.Tensor, past_key_values: Any, step_index: int) -> torch.Tensor:

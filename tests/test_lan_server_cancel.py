@@ -227,16 +227,42 @@ def test_context_discovery_endpoints_and_sse_disconnect_log(server, tmp_path):
     eng.config = SimpleNamespace(max_position_embeddings=40960)
 
     st, m_v1 = _get(srv.http_port, "/v1/models")
-    assert st == 200 and m_v1["data"][0]["context_length"] is None and m_v1["data"][0]["context_limit_enforced"] is False and m_v1["data"][0]["native_context_length"] == 40960
+    d0 = m_v1["data"][0]
+    assert st == 200
+    assert d0["context_length"] == 40960
+    assert d0["max_model_len"] == 40960
+    assert d0["loaded_context_length"] == 40960
+    assert d0["max_context_length"] == 40960
+    assert d0["context_window"] == 40960
+    assert d0["n_ctx"] == 40960
+    assert d0["num_ctx"] == 40960
+    assert d0["native_context_length"] == 40960
+    assert d0["max_output_tokens"] == 20480
+    assert d0["max_completion_tokens"] == 20480
+    assert d0["max_input_tokens"] == 36864
+    assert d0["max_prompt_tokens"] == 36864
+    assert d0["context_limit_enforced"] is False
+    assert d0["capabilities"]["tool_calling"] is True
 
     st, m_lms = _get(srv.http_port, "/api/v0/models")
-    assert st == 200 and m_lms["data"][0]["max_context_length"] is None
+    assert st == 200 and m_lms["data"][0]["max_context_length"] == 40960
+    assert m_lms["data"][0]["loaded_context_length"] == 40960
+    assert m_lms["data"][0]["max_output_tokens"] == 20480
+    assert m_lms["data"][0]["max_input_tokens"] == 36864
 
     st, props = _get(srv.http_port, "/props")
-    assert st == 200 and props["default_generation_settings"]["n_ctx"] is None
+    assert st == 200 and props["default_generation_settings"]["n_ctx"] == 40960
+    assert props["n_ctx"] == 40960 and props["max_output_tokens"] == 20480 and props["max_input_tokens"] == 36864
 
     st, kobold = _get(srv.http_port, "/api/extra/true_max_context_length")
-    assert st == 200 and kobold["value"] is None
+    assert st == 200 and kobold["value"] == 40960 and kobold["max_output_tokens"] == 20480
+
+    st, show_raw = _post(srv.http_port, "/api/show", body={"name": eng.model_id})
+    show = json.loads(show_raw)
+    assert st == 200
+    assert show["model_info"]["general.context_length"] == 40960
+    assert "num_ctx 40960" in show["parameters"]
+    assert "tools" in show["capabilities"]
 
     sock = _start_stream(srv.http_port, max_tokens=500)
     assert eng.first_token.wait(5)

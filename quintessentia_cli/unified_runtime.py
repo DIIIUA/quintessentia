@@ -30,7 +30,7 @@ from typing import Any, Callable, Iterator
 import torch
 
 
-from .runtime_config import (model_context_limit, PROJECT_ROOT, VRAM_MODES, ContextBudgetExceeded, GenerationCancelled,
+from .runtime_config import (compute_runtime_limits, model_context_limit, PROJECT_ROOT, VRAM_MODES, ContextBudgetExceeded, GenerationCancelled,
                              find_quintessentia_root, checkpoint_manifest_path)
 
 
@@ -1277,18 +1277,44 @@ class QuintessentiaKVPrefixSession:
             self.unfed_tail = all_ids[past_len:]
 
         ram_budget = _streaming_ram_budget_bytes()
-        allow_pin = using_cuda and (ram_budget is None or ram_budget >= 512 * MiB)
+        from .kv_offload import empty_host_pinned_cache, release_kv_cache_gpu_buffers
+        from .runtime_config import _available_host_ram_bytes
+        est_kv_bytes = sum(
+            (int(lc.keys.nbytes + lc.values.nbytes) if getattr(lc, "keys", None) is not None else 0)
+            for lc in getattr(past_key_values, "layers", ())
+        )
+        avail_ram_b = _available_host_ram_bytes()
+        allow_pin = bool(
+            using_cuda
+            and (ram_budget is None or ram_budget >= 512 * MiB)
+            and est_kv_bytes <= 1024 * MiB
+            and (avail_ram_b <= 0 or (avail_ram_b - est_kv_bytes) >= int(1.5 * GiB))
+        )
         self._pending_bridge_h = _detach_park_cpu(last_h, allow_pin) if last_h is not None else None
 
         t0 = time.perf_counter()
+        release_kv_cache_gpu_buffers(past_key_values)
+        if using_cuda:
+            torch.cuda.synchronize(execution_device)
         self.parked_backbone = {}
         total_bytes = 0
         for l_idx, l_cache in enumerate(past_key_values.layers):
             entry: dict[str, Any] = {}
-            if getattr(l_cache, "keys", None) is not None and l_cache.keys.numel() > 0:
+            bshd_pair = l_cache.export_bshd_slices() if hasattr(l_cache, "export_bshd_slices") else None
+            if bshd_pair is not None:
+                entry["keys"] = _detach_park_cpu(bshd_pair[0], allow_pin)
+                entry["values"] = _detach_park_cpu(bshd_pair[1], allow_pin)
+                entry["layout"] = "bshd"
+                total_bytes += entry["keys"].nbytes + entry["values"].nbytes
+                l_cache.reset()
+            elif getattr(l_cache, "keys", None) is not None and l_cache.keys.numel() > 0:
                 entry["keys"] = _detach_park_cpu(l_cache.keys, allow_pin)
                 entry["values"] = _detach_park_cpu(l_cache.values, allow_pin)
                 total_bytes += entry["keys"].nbytes + entry["values"].nbytes
+                if getattr(l_cache, "is_quintessentia_pinned_layer", False) or getattr(
+                    l_cache, "is_quintessentia_prealloc_layer", False
+                ):
+                    l_cache.reset()
             # Sliding KV tensors only retain a window, not the absolute position.
             if hasattr(l_cache, "cumulative_length"):
                 entry["cumulative_length"] = int(l_cache.cumulative_length)
@@ -1325,6 +1351,8 @@ class QuintessentiaKVPrefixSession:
         gc.collect()
         if using_cuda:
             torch.cuda.empty_cache()
+            from .kv_offload import empty_host_pinned_cache
+            empty_host_pinned_cache()
             torch.cuda.synchronize(execution_device)
         self.park_ms = (time.perf_counter() - t0) * 1000.0
         self.parked_bytes = total_bytes
@@ -1343,19 +1371,48 @@ class QuintessentiaKVPrefixSession:
         device: torch.device,
         mtp_head: QuintessentiaNativeMTPHead | None,
         first_new_token: int,
+        *,
+        offload_kv: bool = False,
+        offload_layer_count: int | None = None,
+        disable_prefetch: bool = False,
+        initial_capacity: int = 0,
+        chunk_pad: int = 512,
     ) -> tuple[Any, float]:
         from transformers.cache_utils import DynamicCache
 
         t0 = time.perf_counter()
         tcfg = self.config.get_text_config() if hasattr(self.config, "get_text_config") else self.config
-        past = DynamicCache(config=tcfg)
-        for l_idx, entry in self.parked_backbone.items():
+        if offload_kv and device.type == "cuda":
+            from .kv_offload import make_offloaded_kv_cache
+            past = make_offloaded_kv_cache(
+                tcfg,
+                initial_capacity=max(len(self.fed) + chunk_pad, int(initial_capacity)),
+                chunk_pad=chunk_pad,
+                device=device,
+                disable_prefetch=disable_prefetch,
+                offload_layer_count=offload_layer_count,
+            )
+        else:
+            past = DynamicCache(config=tcfg)
+        parked_map = self.parked_backbone or {}
+        self.parked_backbone = None
+        self.parked_bytes = 0
+        for l_idx in list(parked_map.keys()):
+            entry = parked_map.pop(l_idx)
             if l_idx < len(past.layers):
                 l_cache = past.layers[l_idx]
                 if "keys" in entry:
-                    k_gpu = entry["keys"].to(device, non_blocking=True)
-                    v_gpu = entry["values"].to(device, non_blocking=True)
-                    l_cache.update(k_gpu, v_gpu)
+                    is_bshd = entry.get("layout") == "bshd"
+                    if hasattr(l_cache, "seed_from_cpu_tensors"):
+                        l_cache.seed_from_cpu_tensors(entry["keys"], entry["values"], device, is_bshd=is_bshd)
+                    else:
+                        k_src = entry["keys"].transpose(1, 2).contiguous() if is_bshd else entry["keys"]
+                        v_src = entry["values"].transpose(1, 2).contiguous() if is_bshd else entry["values"]
+                        k_gpu = k_src.to(device, non_blocking=True)
+                        v_gpu = v_src.to(device, non_blocking=True)
+                        l_cache.update(k_gpu, v_gpu)
+                    entry.pop("keys", None)
+                    entry.pop("values", None)
                 if "cumulative_length" in entry:
                     l_cache.cumulative_length = entry["cumulative_length"]
                 for state_idx, state in entry.get("linear_states", {}).items():
@@ -1367,9 +1424,35 @@ class QuintessentiaKVPrefixSession:
                                                 state_idx=state_idx,
                                                 conv_kernel_size=state.get("conv_kernel_size"))
                     if c_gpu is not None:
-                        l_cache.conv_states[state_idx].copy_(c_gpu)
+                        dst_c = (
+                            l_cache.conv_states.get(state_idx)
+                            if isinstance(l_cache.conv_states, dict)
+                            else l_cache.conv_states[state_idx]
+                        )
+                        if dst_c is None:
+                            l_cache.conv_states[state_idx] = c_gpu.clone()
+                        else:
+                            dst_c.copy_(c_gpu)
+                        if hasattr(l_cache, "is_conv_states_initialized"):
+                            l_cache.is_conv_states_initialized[state_idx] = True
+                        if hasattr(l_cache, "conv_kernel_size"):
+                            cks = state.get("conv_kernel_size")
+                            if cks is None and c_gpu.ndim >= 1:
+                                cks = int(c_gpu.shape[-1])
+                            if cks is not None:
+                                l_cache.conv_kernel_size[state_idx] = int(cks)
                     if r_gpu is not None:
-                        l_cache.recurrent_states[state_idx].copy_(r_gpu)
+                        dst_r = (
+                            l_cache.recurrent_states.get(state_idx)
+                            if isinstance(l_cache.recurrent_states, dict)
+                            else l_cache.recurrent_states[state_idx]
+                        )
+                        if dst_r is None:
+                            l_cache.recurrent_states[state_idx] = r_gpu.clone()
+                        else:
+                            dst_r.copy_(r_gpu)
+                        if hasattr(l_cache, "is_recurrent_states_initialized"):
+                            l_cache.is_recurrent_states_initialized[state_idx] = True
                     l_cache.has_previous_state[state_idx] = state["has_previous_state"]
             elif "keys" in entry:
                 k_gpu = entry["keys"].to(device, non_blocking=True)
@@ -1389,6 +1472,8 @@ class QuintessentiaKVPrefixSession:
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+            from .kv_offload import empty_host_pinned_cache
+            empty_host_pinned_cache()
         return past, (time.perf_counter() - t0) * 1000.0
 
 
@@ -1520,7 +1605,10 @@ def state_bytes_from_config(cfg: dict[str, Any]) -> tuple[int, int, int, int]:
     else:
         full = n
         lin = 0
-    if cfg.get("qk_nope_head_dim") is not None or cfg.get("v_head_dim") is not None:
+    if mtype == "minicpm3" and cfg.get("kv_lora_rank"):
+        # MiniCPM3 caches compressed MLA latent (kv_lora_rank) + RoPE key (qk_rope_head_dim) as 1 head.
+        kv = full * (int(cfg["kv_lora_rank"]) + int(cfg.get("qk_rope_head_dim") or 0)) * 2
+    elif cfg.get("qk_nope_head_dim") is not None or cfg.get("v_head_dim") is not None:
         qk_d = int(cfg.get("qk_nope_head_dim") or head) + int(cfg.get("qk_rope_head_dim") or 0)
         v_d = int(cfg.get("v_head_dim") or head)
         kv = full * n_kv * (qk_d + v_d) * 2
@@ -1605,6 +1693,7 @@ def plan_vram(
     allow_cube_subdivision: bool = False,
     max_slot_bytes: int | None = None,
     min_cube_slot_bytes: int = 2 * MiB,
+    allow_single_slot: bool = False,
 ) -> VRAMPlan:
     """Splits the *available* VRAM between weights and a guaranteed working reserve.
 
@@ -1652,7 +1741,8 @@ def plan_vram(
         return VRAMPlan(mode, total_bytes, free_bytes, reserve, budget, n, n, 0, 0, True, mtp_bytes > 0,
                         chunk, max_ctx, weights_all + mtp_bytes, False, False)
 
-    ring_slots = max(3, min(4, int(ring_slots)))
+    min_slots = 1 if allow_single_slot else 3
+    ring_slots = max(min_slots, min(4, int(ring_slots)))
     if explicit_sub_layer or explicit_sub_head:
         if not allow_cube_subdivision:
             raise RuntimeError(
@@ -1773,6 +1863,56 @@ def _q1_lm_head_telemetry(model: Any) -> dict[str, Any] | None:
     }
 
 
+def _q1_cubes_storage_bytes(
+    layers: list[dict[str, tuple]],
+    globals_sh: dict[str, tuple],
+    cfg: dict[str, Any],
+    cfg_hidden: int,
+    q1_p: int,
+    lm_head_planes: int | None = None,
+) -> tuple[list[int], int, int, int]:
+    """Compute exact Binary Halving Q1 storage bytes per layer and for `lm_head` at plane depth `q1_p`."""
+    layer_bytes: list[int] = []
+    packed_count = 0
+    for shapes in layers:
+        size = 0
+        for name, shape in shapes.items():
+            sh = tuple(shape)
+            lname = str(name).lower()
+            is_router = (
+                len(sh) == 2
+                and int(sh[0]) <= 512
+                and (
+                    lname.endswith(".gate.weight")
+                    or lname.endswith(".router.weight")
+                    or lname.endswith(".router.layer.weight")
+                    or ".router." in lname
+                )
+            )
+            if len(sh) == 2 and lname.endswith(".weight") and not is_router and int(sh[1]) >= 64 and int(sh[1]) % 64 == 0:
+                n_out, k_in = int(sh[0]), int(sh[1])
+                # Shared qscale[0] Binary Halving Q1 storage: packed_lo + qscale[0] + qzero + Sinkhorn row/col scales
+                size += int(q1_p) * n_out * (k_in // 8) + 2 * n_out * (k_in // 64) * 2 + 2 * (n_out + k_in)
+                packed_count += 1
+            else:
+                size += bf16_bytes_for_shape(sh)
+        layer_bytes.append(size)
+
+    shape = tuple(globals_sh.get("lm_head.weight", (int(cfg.get("vocab_size") or 1), cfg_hidden)))
+    bf16_lm_b = bf16_bytes_for_shape(shape)
+    lm_root = 16 if int(q1_p) > 8 else 8
+    if lm_head_planes is not None:
+        lm_cubes = max(1, min(lm_root, int(lm_head_planes)))
+    else:
+        lm_cubes = max(1, min(lm_root, max(5, int(q1_p))))
+    if len(shape) == 2 and bf16_lm_b >= 256 * MiB and int(shape[1]) >= 64 and int(shape[1]) % 64 == 0:
+        v_sz, h_sz = int(shape[0]), int(shape[1])
+        lm_head_bytes = lm_cubes * v_sz * (h_sz // 8) + 2 * v_sz * (h_sz // 64) * 2 + 2 * (v_sz + h_sz)
+    else:
+        lm_head_bytes = bf16_lm_b
+    return layer_bytes, packed_count, int(lm_head_bytes), int(lm_cubes)
+
+
 def plan_for_checkpoint(
     model_dir: str | Path,
     *,
@@ -1789,6 +1929,8 @@ def plan_for_checkpoint(
     allow_cube_subdivision: bool = True,
     max_slot_bytes: int | None = None,
     q1_planes: int | None = None,
+    auto_fit_q1_planes: bool = False,
+    min_q1_planes: int = 3,
 ) -> tuple[dict[str, Any], VRAMPlan, bool]:
     """Plan from headers and meta modules, including the actual packed projections.
 
@@ -1836,6 +1978,7 @@ def plan_for_checkpoint(
     finally:
         if tmp_source is not None and hasattr(tmp_source, "close"):
             tmp_source.close()
+    kv, rec, hidden_size, intermediate = state_bytes_from_config(cfg)
     fast = bool(profile["fast_qwen"])
     if fast:
         layer_bytes = [estimate_layer_vram_bytes(sh) for sh in layers]
@@ -1846,42 +1989,86 @@ def plan_for_checkpoint(
             mtp_bytes += q4_bytes_for_shape(tuple(mtp_sh["mtp.fc.weight"]))
         has_mtp = "mtp.fc.weight" in mtp_sh
     elif selected_format == "q1_cubes":
-        layer_bytes = []
-        packed_count = 0
-        for shapes in layers:
-            size = 0
-            for name, shape in shapes.items():
-                sh = tuple(shape)
-                lname = str(name).lower()
-                is_router = (
-                    len(sh) == 2
-                    and int(sh[0]) <= 512
-                    and (
-                        lname.endswith(".gate.weight")
-                        or lname.endswith(".router.weight")
-                        or lname.endswith(".router.layer.weight")
-                        or ".router." in lname
+        q1_p_req = int(q1_p)
+        layer_bytes, packed_count, lm_head_bytes, lm_cubes = _q1_cubes_storage_bytes(
+            layers, globals_sh, cfg, cfg_hidden, q1_p_req
+        )
+        # Adaptive Binary Halving under VRAM constraints:
+        # When the full model does not fit at `q1_p_req`, step down strictly by whole halving
+        # planes (`k -> k-1 -> ... -> min_q1_planes`) so every layer stays resident at peak speed
+        # instead of falling back to slow PCIe layer streaming.
+        if auto_fit_q1_planes and q1_p_req > 1 and max_slot_bytes is None and free_bytes > 0:
+            probe_plan = plan_vram(
+                mode,
+                total_bytes=total_bytes,
+                free_bytes=free_bytes,
+                layer_bytes=[0] * len(layers),
+                lm_head_bytes=0,
+                mtp_bytes=0,
+                kv_bytes_per_token=kv,
+                recurrent_state_bytes=rec,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate,
+                max_context_tokens=max_context_tokens,
+                prefill_chunk_tokens=prefill_chunk_tokens,
+                prefill_wavefront=False,
+                allow_cube_subdivision=True,
+                max_slot_bytes=None,
+            )
+            avail_budget = int(probe_plan.budget_bytes)
+            is_moe_model = int(profile.get("num_experts") or 0) >= 2
+            if is_moe_model:
+                moe_reserve = 512 * MiB if avail_budget >= 768 * MiB else int(avail_budget * 0.35)
+                target_budget = max(0, avail_budget - moe_reserve)
+            else:
+                target_budget = avail_budget
+
+            if avail_budget > 0 and (sum(layer_bytes) + lm_head_bytes) > target_budget:
+                k_floor = max(1, min(q1_p_req, int(min_q1_planes)))
+                chosen = None
+                for k_cand in range(q1_p_req - 1, k_floor - 1, -1):
+                    # First try preserving high-precision lm_head, then halve lm_head to match k_cand.
+                    lm_candidates = [max(5, k_cand), k_cand] if q1_p_req >= 5 and k_cand < 5 else [k_cand]
+                    for lm_cand in lm_candidates:
+                        c_layers, c_packed, c_lm_b, c_lm_k = _q1_cubes_storage_bytes(
+                            layers, globals_sh, cfg, cfg_hidden, k_cand, lm_head_planes=lm_cand
+                        )
+                        if (sum(c_layers) + c_lm_b) <= target_budget:
+                            chosen = (k_cand, c_layers, c_packed, c_lm_b, c_lm_k)
+                            break
+                    if chosen is not None:
+                        break
+                if chosen is not None:
+                    q1_p, layer_bytes, packed_count, lm_head_bytes, lm_cubes = chosen
+                elif not is_moe_model and k_floor < q1_p_req:
+                    # Even at k_floor the dense model exceeds VRAM; still halve to k_floor so
+                    # maximum layers remain resident and streamed layers transfer faster over PCIe.
+                    q1_p = k_floor
+                    layer_bytes, packed_count, lm_head_bytes, lm_cubes = _q1_cubes_storage_bytes(
+                        layers, globals_sh, cfg, cfg_hidden, k_floor, lm_head_planes=k_floor
                     )
-                )
-                if len(sh) == 2 and lname.endswith(".weight") and not is_router and int(sh[1]) >= 64 and int(sh[1]) % 64 == 0:
-                    n_out, k_in = int(sh[0]), int(sh[1])
-                    # Shared qscale[0] Binary Halving Q1 storage: packed_lo + qscale[0] + qzero + Sinkhorn row/col scales
-                    size += q1_p * n_out * (k_in // 8) + 2 * n_out * (k_in // 64) * 2 + 2 * (n_out + k_in)
-                    packed_count += 1
-                else:
-                    size += bf16_bytes_for_shape(sh)
-            layer_bytes.append(size)
+            elif avail_budget > 0 and not is_moe_model and q1_p_req < 8:
+                # Mirror-balance depth refinement (step-up): when a compact dense checkpoint fits
+                # comfortably inside <= 35% of the available VRAM budget even at higher bit-plane
+                # depth (up to full 8-bit cube root k=8), step up automatically so outlier-heavy or
+                # heavily quantized small models keep crisp fidelity while leaving >= 65% VRAM free.
+                refine_cap = int(target_budget * 0.35)
+                for k_cand in range(8, q1_p_req, -1):
+                    c_layers, c_packed, c_lm_b, c_lm_k = _q1_cubes_storage_bytes(
+                        layers, globals_sh, cfg, cfg_hidden, k_cand, lm_head_planes=k_cand
+                    )
+                    if (sum(c_layers) + c_lm_b) <= refine_cap:
+                        q1_p, layer_bytes, packed_count, lm_head_bytes, lm_cubes = (
+                            k_cand, c_layers, c_packed, c_lm_b, c_lm_k
+                        )
+                        break
+        profile["q1_planes"] = int(q1_p)
+        profile["q1_planes_requested"] = int(q1_p_req)
+        profile["q1_planes_auto_halved"] = bool(int(q1_p) < int(q1_p_req))
+        profile["q1_planes_auto_refined"] = bool(int(q1_p) > int(q1_p_req))
+        profile["q1_lm_head_planes"] = int(lm_cubes)
         profile["packed_projections"] = packed_count
         profile["q1_cubes_layer_bytes"] = list(layer_bytes)
-        shape = tuple(globals_sh.get("lm_head.weight", (int(cfg.get("vocab_size") or 1), cfg_hidden)))
-        bf16_lm_b = bf16_bytes_for_shape(shape)
-        if len(shape) == 2 and bf16_lm_b >= 256 * MiB and int(shape[1]) >= 64 and int(shape[1]) % 64 == 0:
-            v_sz, h_sz = int(shape[0]), int(shape[1])
-            lm_root = 16 if q1_p > 8 else 8
-            lm_cubes = max(1, min(lm_root, max(5, q1_p)))
-            lm_head_bytes = lm_cubes * v_sz * (h_sz // 8) + 2 * v_sz * (h_sz // 64) * 2 + 2 * (v_sz + h_sz)
-        else:
-            lm_head_bytes = bf16_lm_b
         profile["q1_cubes_lm_head_bytes"] = int(lm_head_bytes)
         mtp_bytes = 0
         has_mtp = False
@@ -1928,7 +2115,6 @@ def plan_for_checkpoint(
             lm_head_bytes = bf16_bytes_for_shape(shape)
         mtp_bytes = 0
         has_mtp = False
-    kv, rec, hidden_size, intermediate = state_bytes_from_config(cfg)
     eff_allow_cube_sub = bool(allow_cube_subdivision and not prefill_wavefront and selected_format != "q1_cubes")
     try:
         plan = plan_vram(
@@ -1944,9 +2130,11 @@ def plan_for_checkpoint(
             intermediate_size=intermediate,
             max_context_tokens=max_context_tokens,
             prefill_chunk_tokens=prefill_chunk_tokens,
+            ring_slots=1 if selected_format == "q1_cubes" else 3,
             prefill_wavefront=prefill_wavefront,
             allow_cube_subdivision=eff_allow_cube_sub,
             max_slot_bytes=max_slot_bytes,
+            allow_single_slot=(selected_format == "q1_cubes"),
         )
     except RuntimeError:
         if selected_format != "q1_cubes":
@@ -2051,6 +2239,57 @@ def _eos_token_set(eos_token_id: Any) -> set[int]:
     if isinstance(eos_token_id, (list, tuple, set)):
         return {int(x) for x in eos_token_id if x is not None}
     return set()
+
+
+_CHAT_TEMPLATE_TURN_STOP_TOKENS: tuple[str, ...] = (
+    "<|im_end|>",
+    "<|eot_id|>",
+    "<end_of_turn>",
+    "<|END_OF_TURN_TOKEN|>",
+    "<|END_RESPONSE|>",
+    "<|end_of_text|>",
+    "<|return|>",
+    "<|assistant_end|>",
+    "<|end|>",
+)
+
+
+def _resolve_effective_eos_ids(tokenizer: Any, config: Any = None, model_dir: Path | None = None) -> set[int]:
+    """Collects primary EOS plus chat-template turn-end tokens (e.g. Phi `<|end|>`, Gemma `<end_of_turn>`).
+
+    Avoids false-positive truncation on multi-channel formats (e.g. Harmony `<|channel|>` where
+    `<|end|>` separates reasoning channels and `<|return|>` terminates the turn).
+    """
+    eos = _eos_token_set(getattr(tokenizer, "eos_token_id", None))
+    if config is not None:
+        tcfg = config.get_text_config() if hasattr(config, "get_text_config") else config
+        eos |= _eos_token_set(getattr(tcfg, "eos_token_id", None))
+        eos |= _eos_token_set(getattr(config, "eos_token_id", None))
+    if model_dir is not None:
+        gen_cfg_path = Path(model_dir) / "generation_config.json"
+        if gen_cfg_path.is_file():
+            try:
+                gdata = json.loads(gen_cfg_path.read_text(encoding="utf-8"))
+                eos |= _eos_token_set(gdata.get("eos_token_id"))
+            except Exception:
+                pass
+    tmpl = getattr(tokenizer, "chat_template", None)
+    if isinstance(tmpl, str) and tmpl:
+        is_harmony = "<|channel|>" in tmpl and "<|return|>" in tmpl
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+        if callable(convert):
+            for tok_str in _CHAT_TEMPLATE_TURN_STOP_TOKENS:
+                if tok_str == "<|end|>" and is_harmony:
+                    continue
+                if tok_str in tmpl:
+                    try:
+                        tid = convert(tok_str)
+                    except Exception:
+                        tid = None
+                    if isinstance(tid, int) and tid >= 0 and (unk_id is None or tid != unk_id):
+                        eos.add(tid)
+    return eos
 
 
 @dataclass
@@ -2203,6 +2442,8 @@ class QuintessentiaUnifiedEngine:
         q1_imprint_depths: tuple[int, int, int, int] = (5, 4, 3, 2),
         q1_fixation_cov_thresh: float = 1.0,
         q1_graphify_feedback: Any = False,
+        auto_fit_q1_planes: bool | None = None,
+        min_q1_planes: int = 3,
     ):
         if device not in ("auto", "cpu"):
             raise ValueError("device must be auto or cpu")
@@ -2273,10 +2514,14 @@ class QuintessentiaUnifiedEngine:
         self._q1_cubes_runner = None
         self.thought_anchor_enabled = bool(thought_anchor)
         self._session_thought_anchor = None
+        from src.rssf_dynamic_operators import GenerationBalanceTracker
+        self.generation_balance = GenerationBalanceTracker()
         self._active_sampling: SamplingConfig | None = None
         self._sampling_rng: torch.Generator | None = None
         self.max_slot_bytes = resolved_slot_bytes
         self.q1_planes = int(q1_planes)
+        self.q1_planes_requested = int(q1_planes)
+        self.q1_lm_head_planes: int | None = None
         self.cube_root_bits = int(cube_root_bits)
         self.cube_relay = bool(cube_relay)
         from src.stanok_contour import load_cube_blueprint
@@ -2287,6 +2532,12 @@ class QuintessentiaUnifiedEngine:
             raise ValueError("A cube blueprint requires weight_format=q1_cubes")
         if bp_max_depth > 0:
             self.q1_planes = max(self.q1_planes, bp_max_depth)
+        self.min_q1_planes = max(1, int(min_q1_planes))
+        self.auto_fit_q1_planes = (
+            bool(weight_format == "q1_cubes" and self.cube_blueprint is None)
+            if auto_fit_q1_planes is None
+            else bool(auto_fit_q1_planes)
+        )
         self.q1_early_stop = bool(q1_early_stop)
         self.puzzle_overlay = bool(puzzle_overlay)
         self.puzzle_slice_ratio = float(puzzle_slice_ratio)
@@ -2295,6 +2546,8 @@ class QuintessentiaUnifiedEngine:
         # longer means that GPU startup waits for CPU work.
         if cpu_first is not None:
             progressive_start = bool(cpu_first)
+        from .live_hud_beacon import LiveTelemetryBeacon
+        self._hud_beacon = LiveTelemetryBeacon()
         use_direct_q1_cubes_gpu = bool(weight_format == "q1_cubes" and device != "cpu" and torch.cuda.is_available())
         if (progressive_start and not use_direct_q1_cubes_gpu) or device == "cpu":
             self._init_progressive(model_dir, vram_mode, enable_mtp, enable_vocab_pruner,
@@ -2307,6 +2560,7 @@ class QuintessentiaUnifiedEngine:
                 mtp_head_budget_mib,
                 bool(prune_regions and self.profile.get("weight_format") != "q1_cubes"),
             )
+            self._hud_beacon.publish_engine_ready(self)
             return
         from src.quintessentia_engine import PriorityRanker
         from src.quintessentia_integrated import QuintessentiaModel
@@ -2344,6 +2598,9 @@ class QuintessentiaUnifiedEngine:
         extra_plan_kw = {"max_slot_bytes": self.max_slot_bytes} if self.max_slot_bytes is not None else {}
         if weight_format in ("q1", "q1_cubes") or self.q1_planes != 4:
             extra_plan_kw["q1_planes"] = self.q1_planes
+        if weight_format == "q1_cubes":
+            extra_plan_kw["auto_fit_q1_planes"] = self.auto_fit_q1_planes
+            extra_plan_kw["min_q1_planes"] = self.min_q1_planes
         self.profile, self.plan, has_mtp = plan_for_checkpoint(
             self.model_dir,
             mode=vram_mode,
@@ -2362,6 +2619,10 @@ class QuintessentiaUnifiedEngine:
             ),
             **extra_plan_kw,
         )
+        if self.profile.get("weight_format") == "q1_cubes":
+            self.q1_planes = int(self.profile.get("q1_planes", self.q1_planes))
+            self.q1_planes_requested = int(self.profile.get("q1_planes_requested", self.q1_planes_requested))
+            self.q1_lm_head_planes = self.profile.get("q1_lm_head_planes")
         self.fast_qwen = bool(self.profile["fast_qwen"])
         self.vram_mode = vram_mode
         self.prefill_chunk_tokens = self.plan.prefill_chunk_tokens
@@ -2381,9 +2642,15 @@ class QuintessentiaUnifiedEngine:
                 if p.full_residency
                 else f"{p.resident_layers}/{p.layers_total} resident + {p.ring_slots}-slot ring ({p.slot_bytes / MiB:.0f} MiB each)"
             )
+            planes_tag = ""
+            if self.profile.get("weight_format") == "q1_cubes":
+                if self.profile.get("q1_planes_auto_halved"):
+                    planes_tag = f" (k={self.q1_planes}, auto-halved from k={self.q1_planes_requested})"
+                else:
+                    planes_tag = f" (k={self.q1_planes})"
             print(
                 f"[Quintessentia] GPU: {self.gpu_name} ({self.total_vram_gib} GiB, free {free_b / GiB:.2f} GiB) | "
-                f"Mode: {vram_mode} | Backend: {self.profile['backend']} | "
+                f"Mode: {vram_mode} | Backend: {self.profile['backend']}{planes_tag} | "
                 f"Budget: {p.budget_bytes / GiB:.2f} GiB, reserve {p.reserve_bytes / GiB:.2f} GiB | "
                 f"{layout} | Model: {self.model_id} ({self.model_format})",
                 flush=True,
@@ -2557,6 +2824,7 @@ class QuintessentiaUnifiedEngine:
                 stanok_contour=None if is_v4_isolated else self.stanok_contour,
                 graphify_feedback=self.q1_graphify_feedback,
                 mirror_v4_trunk=is_v4_isolated,
+                lm_head_cubes=self.q1_lm_head_planes,
                 resident_layers=resident,
                 host_cache_bytes=layer_host_bytes,
                 moe_gpu_cache_bytes=moe_gpu_bytes,
@@ -2616,8 +2884,16 @@ class QuintessentiaUnifiedEngine:
             self.mtp_enabled = False
             self.enable_vocab_pruner = False
 
+        from .kv_offload import enable_zero_copy_gqa_sdpa
+        enable_zero_copy_gqa_sdpa()
+        self.kv_offload_enabled = True
         self.session = QuintessentiaKVPrefixSession()
-        self._session_messages: list[dict[str, str]] = []
+        self._session_messages: list[dict[str, Any]] = []
+        self._session_prompt_messages: list[dict[str, Any]] = []
+        self._session_last_tool_calls: list[dict[str, Any]] = []
+        self._session_tools_sig: str = ""
+        self._idle_free_vram_bytes: int | None = None
+        self.calibration: dict[str, Any] | None = None
         self.last_metrics: dict[str, Any] = {}
         self.generations_started = 0
         self.generations_cancelled = 0
@@ -2635,6 +2911,16 @@ class QuintessentiaUnifiedEngine:
 
         self.boot_seconds = round(time.perf_counter() - t_boot0, 2)
         self.resident_vram_mib = round(torch.cuda.memory_allocated(self.device) / MiB, 2)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            try:
+                _fb, _ = torch.cuda.mem_get_info(self.device)
+                _alloc = int(torch.cuda.memory_allocated(self.device))
+                _pending = max(0, int(getattr(self.plan, "weights_bytes", 0) or 0) - _alloc)
+                self._idle_free_vram_bytes = max(
+                    0, int(_fb) + max(0, int(torch.cuda.memory_reserved(self.device)) - _alloc) - _pending
+                )
+            except Exception:
+                pass
         if verbose:
             ec = self.expert_cache_stats()
             if ec is not None and ec.get("slots", 0) > 0:
@@ -2654,6 +2940,8 @@ class QuintessentiaUnifiedEngine:
             self._configure_general_stream(
                 speculation, mtp_head_path, mtp_head_budget_mib, bool(prune_regions and not is_q1_cubes)
             )
+        if getattr(self, "_hud_beacon", None) is not None:
+            self._hud_beacon.publish_engine_ready(self)
 
     def _attach_unified_primary_components(self, *, allow_dynamic_memory: bool = True) -> None:
         """Attach the Unified Primary Engine mechanisms by default (A->B->C(0)->A + Survivor Tracker)."""
@@ -2786,8 +3074,16 @@ class QuintessentiaUnifiedEngine:
         self.has_native_dll = False
         self.anchor_schedule = {"resident_layers": [], "streamed_layers": list(range(layers))}
         self.pread_reader = PreadSafetensorsReader(max_handles=8)
+        from .kv_offload import enable_zero_copy_gqa_sdpa
+        enable_zero_copy_gqa_sdpa()
+        self.kv_offload_enabled = True
         self.session = QuintessentiaKVPrefixSession()
         self._session_messages = []
+        self._session_prompt_messages = []
+        self._session_last_tool_calls = []
+        self._session_tools_sig = ""
+        self._idle_free_vram_bytes = None
+        self.calibration = None
         self.last_metrics = {}
         self.generations_started = self.generations_cancelled = 0
 
@@ -2894,6 +3190,14 @@ class QuintessentiaUnifiedEngine:
         self.boot_seconds = round(time.perf_counter() - boot, 2)
         metric_device = self._gpu_metric_device()
         self.resident_vram_mib = round(torch.cuda.memory_allocated(metric_device)/MiB, 2) if metric_device is not None else 0.0
+        if metric_device is not None and torch.cuda.is_available():
+            try:
+                from .runtime_config import _query_physical_avail_vram
+                q_avail, _ = _query_physical_avail_vram(metric_device, self.plan)
+                if q_avail is not None:
+                    self._idle_free_vram_bytes = q_avail
+            except Exception:
+                pass
         if verbose:
             policy = "Common CPU/GPU start" if getattr(self.engine.progressive, "gpu_enabled", False) else "CPU streaming"
             print(f"[Quintessentia] {policy} | {self.model_id} ({fmt}); work follows device readiness", flush=True)
@@ -2940,14 +3244,86 @@ class QuintessentiaUnifiedEngine:
             self.snap_mgr.active_capture = False
         if self.captured:
             self.captured.pop("post_norm", None)
+        q1_runner = getattr(self, "_q1_cubes_runner", None)
+        if q1_runner is not None and hasattr(q1_runner, "clear_mirror_anchors"):
+            q1_runner.clear_mirror_anchors()
         gc.collect()
         if self.engine is not None and self.engine.device.type == "cuda":
             torch.cuda.empty_cache()
+            from .kv_offload import empty_host_pinned_cache
+            empty_host_pinned_cache()
+            try:
+                from .runtime_config import _query_physical_avail_vram
+                q_avail, _ = _query_physical_avail_vram(self.engine.device, getattr(self, "plan", None))
+                if q_avail is not None:
+                    self._idle_free_vram_bytes = q_avail
+            except Exception:
+                pass
+
+    def _effective_prefill_chunk(self, remaining_tokens: int) -> int:
+        """Adapts the prefill chunk size via calibrated workspace need + RSSF EC/FDS/8-force balance."""
+        base = max(1, int(self.prefill_chunk_tokens))
+        if remaining_tokens <= 128 or self.engine is None or getattr(self.engine, "device", None) is None:
+            return base
+        gpu_dev = self._gpu_metric_device()
+        is_cuda = bool(gpu_dev is not None and gpu_dev.type == "cuda" and torch.cuda.is_available())
+        try:
+            advised = base
+            free_b: int
+            total_b: int
+            sec_free_b: int | None = None
+            if is_cuda:
+                from .runtime_config import _query_physical_avail_vram
+                cuda_free_b, total_b = torch.cuda.mem_get_info(gpu_dev)
+                phys_free_b, phys_total_b = _query_physical_avail_vram(gpu_dev, getattr(self, "plan", None))
+                free_b = int(phys_free_b if phys_free_b is not None else cuda_free_b)
+                if phys_total_b and phys_total_b > 0:
+                    total_b = int(phys_total_b)
+                sec_free_b = int(cuda_free_b)
+                cal = getattr(self, "calibration", None)
+                if isinstance(cal, dict) and cal.get("ok") and isinstance(cal.get("chunk_workspace_mib"), (int, float)):
+                    # Keep full calibrated chunk whenever physical free VRAM covers measured workspace + safety guard.
+                    ws_b = max(64 * MiB, int(float(cal["chunk_workspace_mib"]) * MiB))
+                    need_full = int(ws_b * 1.5) + 96 * MiB
+                    need_half = int(ws_b * 0.9) + 64 * MiB
+                    if free_b < need_half:
+                        advised = min(base, 128)
+                    elif free_b < need_full:
+                        advised = min(base, 256)
+                else:
+                    if free_b < 256 * MiB:
+                        advised = min(base, 128)
+                    elif free_b < 512 * MiB:
+                        advised = min(base, 256)
+            else:
+                import psutil
+                vm = psutil.virtual_memory()
+                free_b, total_b = int(vm.available), int(vm.total)
+            # Overlay scale-invariant EC Volterra + FDS T_end + 8-force balance (GPU & CPU alike!)
+            gb = getattr(self, "generation_balance", None)
+            if gb is not None and total_b > 0:
+                reserve_b = max(192 * MiB, int(total_b * 0.05))
+                rssf_chunk, _bal, _ec = gb.advise_prefill_chunk(
+                    base_chunk=advised,
+                    remaining_tokens=remaining_tokens,
+                    free_bytes=free_b,
+                    total_bytes=total_b,
+                    reserve_bytes=reserve_b,
+                    secondary_free_bytes=sec_free_b,
+                )
+                advised = min(advised, max(128, rssf_chunk))
+            return advised
+        except Exception:
+            pass
+        return base
 
     def _abort_cleanup(self) -> None:
         """Restores a clean engine after a cancelled or failed generation (no VRAM or busy ring slot may stay behind)."""
         self.session.reset()
         self._session_messages.clear()
+        self._session_prompt_messages.clear()
+        self._session_last_tool_calls.clear()
+        self._session_tools_sig = ""
         eng = self.engine
         if eng is not None:
             if hasattr(eng, "reset_after_cancel"):
@@ -2973,13 +3349,153 @@ class QuintessentiaUnifiedEngine:
     def reset_session(self) -> None:
         self.session.reset()
         self._session_messages.clear()
+        self._session_prompt_messages.clear()
+        self._session_last_tool_calls.clear()
+        self._session_tools_sig = ""
         self._session_thought_anchor = None
         warmup = getattr(self.engine, "probability_warmup", None)
         if warmup is not None:
             warmup.reset()
         if getattr(self, "survivor_tracker", None) is not None:
             self.survivor_tracker.reset()
+        if getattr(self, "generation_balance", None) is not None:
+            self.generation_balance.reset_session()
         self._release_transient_state()
+
+    def runtime_limits(self, *, busy: bool = False) -> dict[str, Any]:
+        return compute_runtime_limits(self, busy=busy)
+
+    def calibrate_hardware_limits(
+        self,
+        *,
+        probe_tokens: int = 512,
+        verbose: bool = True,
+    ) -> dict[str, Any]:
+        """Run a short 1-chunk prefill + decode hardware probe (never fills memory to OOM).
+
+        Measures real post-weights VRAM/RAM headroom, real chunk activation workspace (`M_chunk`),
+        real prefill/decode throughput, and RAM->GPU PCIe bandwidth on the user's machine, then
+        releases all temporary buffers so the GPU stays clean for user requests.
+        """
+        if self.engine is None or self.tokenizer is None:
+            return {"ok": False, "reason": "engine_not_ready"}
+
+        t_all = time.perf_counter()
+        dev = self.engine.device
+        is_cuda = bool(dev.type == "cuda" and torch.cuda.is_available())
+        pcie_gb_s: float | None = None
+        if is_cuda:
+            try:
+                buf_cpu = torch.empty((4 * 1024 * 1024,), dtype=torch.float32, pin_memory=True)
+                buf_gpu = torch.empty_like(buf_cpu, device=dev)
+                buf_gpu.copy_(buf_cpu, non_blocking=True)
+                torch.cuda.synchronize(dev)
+                t_c0 = time.perf_counter()
+                for _ in range(4):
+                    buf_gpu.copy_(buf_cpu, non_blocking=True)
+                torch.cuda.synchronize(dev)
+                dt_c = max(1e-6, time.perf_counter() - t_c0)
+                pcie_gb_s = round((4 * buf_cpu.nbytes / 1e9) / dt_c, 2)
+                del buf_gpu, buf_cpu
+                torch.cuda.empty_cache()
+            except Exception:
+                pcie_gb_s = None
+
+        # Warm up lazy Q1 cube carving / CUDA kernels with a tiny 12-token pass so the 512-token
+        # measurement reflects steady-state chunk workspace and speed (and keeps first user turn instant).
+        try:
+            for _ in self.stream_chat(
+                [{"role": "user", "content": "OK"}],
+                max_new_tokens=2,
+                enable_thinking=False,
+                use_session_cache=False,
+                stop_on_eos=True,
+                temperature=0.0,
+            ):
+                pass
+            self.reset_session()
+            if is_cuda:
+                torch.cuda.synchronize(dev)
+                torch.cuda.empty_cache()
+
+            base_alloc_mib = (
+                round(torch.cuda.memory_allocated(dev) / MiB, 2) if is_cuda else 0.0
+            )
+            target_probe = max(64, min(int(probe_tokens), int(self.prefill_chunk_tokens or 512)))
+            # Build a deterministic ~target_probe-token prompt without exceeding 1 chunk.
+            unit = "Quintessentia hardware probe: measure chunk workspace, prefill throughput, and memory headroom. "
+            u_ids = self.tokenizer.encode(unit, add_special_tokens=False) or [1]
+            reps = max(1, (target_probe - 24) // max(1, len(u_ids)))
+            probe_text = (unit * reps).strip()
+
+            done_metrics: dict[str, Any] = {}
+            for ev in self.stream_chat(
+                [{"role": "user", "content": probe_text}],
+                max_new_tokens=6,
+                enable_thinking=False,
+                use_session_cache=False,
+                stop_on_eos=False,
+                temperature=0.0,
+            ):
+                if ev.get("type") == "done":
+                    done_metrics = dict(ev.get("metrics") or {})
+
+            self.reset_session()
+            if is_cuda:
+                torch.cuda.synchronize(dev)
+                torch.cuda.empty_cache()
+
+            post_alloc_mib = round(torch.cuda.memory_allocated(dev) / MiB, 2) if is_cuda else 0.0
+            peak_mib = float(done_metrics.get("peak_vram_mib") or post_alloc_mib)
+            n_probe = int(done_metrics.get("prompt_tokens") or target_probe)
+            prefill_ms = float(done_metrics.get("prefill_ms") or 0.0)
+            dec_tok_s = float(done_metrics.get("decode_tok_per_s") or 0.0)
+            pre_tok_s = round(n_probe / max(1e-3, prefill_ms / 1000.0), 1) if prefill_ms > 0 else 0.0
+
+            from .runtime_config import (
+                _extract_text_config_dict,
+                _kv_geometry_from_config_dict,
+                _query_physical_avail_vram,
+            )
+            cfg = _extract_text_config_dict(self.engine) or _extract_text_config_dict(self)
+            kv_per_tok, rec_b, _ = _kv_geometry_from_config_dict(cfg)
+            probe_kv_mib = ((n_probe * (kv_per_tok or 0)) + rec_b) / MiB
+            chunk_ws_mib = round(max(48.0, peak_mib - max(base_alloc_mib, post_alloc_mib) - probe_kv_mib), 1)
+
+            phys_free_mib: float | None = None
+            if is_cuda:
+                q_avail, _ = _query_physical_avail_vram(dev, getattr(self, "plan", None))
+                if q_avail is not None:
+                    self._idle_free_vram_bytes = q_avail
+                    phys_free_mib = round(q_avail / MiB, 1)
+
+            self.calibration = {
+                "ok": True,
+                "probe_tokens": n_probe,
+                "base_vram_mib": post_alloc_mib,
+                "physical_free_vram_mib": phys_free_mib,
+                "chunk_workspace_mib": chunk_ws_mib,
+                "prefill_tok_per_s": pre_tok_s,
+                "decode_tok_per_s": round(dec_tok_s, 2),
+                "pcie_h2d_gb_s": pcie_gb_s,
+                "elapsed_s": round(time.perf_counter() - t_all, 2),
+            }
+            lim = self.runtime_limits(busy=False)
+            self.calibration["fast_vram_context_length"] = lim.get("fast_vram_context_length")
+            self.calibration["effective_context_length"] = lim.get("effective_context_length")
+            if verbose:
+                pcie_str = f" | PCIe H2D: {pcie_gb_s} GB/s" if pcie_gb_s else ""
+                print(
+                    f"[Quintessentia] Calibrated ({n_probe} tok in {self.calibration['elapsed_s']}s): "
+                    f"chunk_ws={chunk_ws_mib} MiB | prefill={pre_tok_s} tok/s | decode={round(dec_tok_s, 2)} tok/s"
+                    f"{pcie_str} | fast_vram_ctx={lim.get('fast_vram_context_length')} | hybrid_ctx={lim.get('effective_context_length')}",
+                    flush=True,
+                )
+            return dict(self.calibration)
+        except Exception as exc:
+            self.reset_session()
+            self.calibration = {"ok": False, "error": str(exc)}
+            return dict(self.calibration)
 
     def status_snapshot(self) -> dict[str, Any]:
         self.device = self.engine.device
@@ -3061,87 +3577,151 @@ class QuintessentiaUnifiedEngine:
         warmup = getattr(self.engine, "probability_warmup", None)
         if warmup is not None:
             snap["probability_warmup"] = warmup.stats()
+        if getattr(self, "calibration", None) is not None:
+            snap["calibration"] = self.calibration
+        snap["limits"] = self.runtime_limits()
         return snap
 
     # ------------------------------------------------------------------ prompt preparation
 
+    def _effective_eos_token_ids(self) -> set[int]:
+        cached = getattr(self, "_cached_effective_eos_ids", None)
+        if cached is not None:
+            return cached
+        cfg = getattr(getattr(self, "engine", None), "config", None)
+        mdir = getattr(self, "model_dir", None)
+        eos = _resolve_effective_eos_ids(self.tokenizer, config=cfg, model_dir=mdir)
+        self._cached_effective_eos_ids = eos
+        return eos
+
     def _prepare_prompt_and_cache(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         enable_thinking: bool,
         use_session_cache: bool,
         max_new_tokens: int = 0,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
     ) -> tuple[list[int], int, Any, float]:
-        eos_ids = _eos_token_set(self.tokenizer.eos_token_id)
-        norm_msgs = [{"role": str(m["role"]), "content": str(m.get("content", ""))} for m in messages]
+        from .kv_offload import plan_kv_cache
+        from .tool_calling import (
+            apply_chat_template_with_tools,
+            normalize_messages,
+            render_incremental_turn_suffix,
+            tool_calls_match_signature,
+            tools_signature,
+        )
 
-        has_active_session = (
+        eos_ids = self._effective_eos_token_ids()
+        norm_msgs = normalize_messages(messages, parse_tool_args_as_dict=False)
+        cur_tools_sig = tools_signature(tools, tool_choice)
+        has_parked = (
             use_session_cache
-            and len(norm_msgs) >= 3
-            and norm_msgs[-1]["role"] == "user"
-            and norm_msgs[:-1] == self._session_messages
+            and cur_tools_sig == getattr(self, "_session_tools_sig", "")
             and len(self.session.fed) > 0
             and self.session.parked_backbone is not None
         )
-        if has_active_session and self.session.chatml_think_format:
-            prev_full = self.session.fed + self.session.unfed_tail
-            lead = "" if (prev_full and prev_full[-1] in eos_ids) else "<|im_end|>"
-            think_tail = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
-            suffix_str = (
-                f"{lead}\n<|im_start|>user\n{norm_msgs[-1]['content']}<|im_end|>\n"
-                f"<|im_start|>assistant\n{think_tail}"
-            )
-            suffix_ids = self.tokenizer(suffix_str, add_special_tokens=False).input_ids
-            full_ids = prev_full + suffix_ids
-            self._check_context_budget(len(full_ids), max_new_tokens)
-            reused = self.session.kv_prefix_reuse(full_ids)
-            if reused > 0:
-                self._last_prompt_opened_think = bool(enable_thinking)
-                self._last_prompt_chatml_think = True
-                past_kv, unpark_ms = self.session.unpark_to_gpu(
-                    self.device, self.mtp_head, first_new_token=full_ids[reused]
-                )
-                return full_ids, reused, past_kv, unpark_ms
 
-        prompt_str: str | None = None
-        if getattr(self.tokenizer, "chat_template", None):
-            template_kwargs = dict(tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
-            try:
-                prompt_str = self.tokenizer.apply_chat_template(norm_msgs, **template_kwargs)
-            except TypeError:
-                template_kwargs.pop("enable_thinking", None)
-                try:
-                    prompt_str = self.tokenizer.apply_chat_template(norm_msgs, **template_kwargs)
-                except (ValueError, AttributeError):
-                    prompt_str = None
-            except (ValueError, AttributeError):
-                prompt_str = None
-        if prompt_str is None:
-            parts: list[str] = []
-            for m in norm_msgs:
-                role = m["role"]
-                content = m["content"]
-                if role == "system":
-                    parts.append(f"System: {content}\n\n")
-                elif role == "assistant":
-                    # The generation prefix ends at ':'. Any following space
-                    # belongs to the generated tokens, not to the template.
-                    parts.append(f"Assistant:{content}\n\n")
-                else:
-                    parts.append(f"User: {content}\n\n")
-            parts.append("Assistant:")
-            prompt_str = "".join(parts)
+        def _unpark_for(full_ids: list[int], reused: int) -> tuple[Any, float]:
+            target_len = len(full_ids) + min(2048, max(0, int(max_new_tokens)))
+            use_managed, n_offload, disable_pf = plan_kv_cache(self, target_len, device=self.device)
+            return self.session.unpark_to_gpu(
+                self.device,
+                self.mtp_head,
+                first_new_token=full_ids[reused],
+                offload_kv=use_managed,
+                offload_layer_count=n_offload,
+                disable_prefetch=disable_pf,
+                initial_capacity=target_len,
+                chunk_pad=max(1, int(self.prefill_chunk_tokens)),
+            )
+
+        # Universal incremental KV continuation for BOTH plain `user` turns AND multi-turn `role="tool"` loops:
+        # reuses the entire parked KV prefix (even when the client stripped `<think>` from the prior assistant turn).
+        if has_parked:
+            prev_prompt_msgs = getattr(self, "_session_prompt_messages", [])
+            prev_n = len(prev_prompt_msgs)
+            prev_tool_calls = getattr(self, "_session_last_tool_calls", [])
+            prev_asst_content = (
+                self._session_messages[-1].get("content", "")
+                if (self._session_messages and self._session_messages[-1].get("role") == "assistant")
+                else ""
+            )
+            is_direct_continuation = False
+            tail_msgs: list[dict[str, Any]] = []
+            if prev_n > 0 and len(norm_msgs) >= prev_n + 2 and norm_msgs[:prev_n] == prev_prompt_msgs:
+                asst_msg = norm_msgs[prev_n]
+                cand_tail = norm_msgs[prev_n + 1 :]
+                if asst_msg.get("role") == "assistant" and cand_tail and all(
+                    m.get("role") in ("tool", "user") for m in cand_tail
+                ):
+                    if asst_msg.get("tool_calls") and prev_tool_calls:
+                        is_direct_continuation = tool_calls_match_signature(
+                            asst_msg.get("tool_calls"), prev_tool_calls
+                        )
+                    elif asst_msg.get("content", "") == prev_asst_content:
+                        is_direct_continuation = True
+                    if is_direct_continuation:
+                        tail_msgs = cand_tail
+            elif (
+                not tools
+                and len(norm_msgs) >= 3
+                and norm_msgs[-1]["role"] == "user"
+                and norm_msgs[:-1] == self._session_messages
+            ):
+                is_direct_continuation = True
+                tail_msgs = [norm_msgs[-1]]
+
+            if is_direct_continuation and tail_msgs:
+                prev_full = self.session.fed + self.session.unfed_tail
+                prev_ended_eos = bool(prev_full and prev_full[-1] in eos_ids)
+                suffix_str = render_incremental_turn_suffix(
+                    self.tokenizer,
+                    tail_msgs,
+                    enable_thinking=enable_thinking,
+                    prev_ended_with_eos=prev_ended_eos,
+                )
+                if suffix_str is None and self.session.chatml_think_format and len(tail_msgs) == 1 and tail_msgs[0]["role"] == "user":
+                    lead = "" if prev_ended_eos else "<|im_end|>"
+                    think_tail = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+                    suffix_str = (
+                        f"{lead}\n<|im_start|>user\n{tail_msgs[0]['content']}<|im_end|>\n"
+                        f"<|im_start|>assistant\n{think_tail}"
+                    )
+                if suffix_str:
+                    suffix_ids = self.tokenizer(suffix_str, add_special_tokens=False).input_ids
+                    full_ids = prev_full + suffix_ids
+                    self._check_context_budget(len(full_ids), max_new_tokens)
+                    reused = self.session.kv_prefix_reuse(full_ids)
+                    if reused > 0:
+                        self._last_prompt_opened_think = suffix_str.rstrip().endswith("<think>")
+                        self._last_prompt_chatml_think = (
+                            self.session.chatml_think_format or "<|im_start|>assistant\n<think>" in suffix_str
+                        )
+                        past_kv, unpark_ms = _unpark_for(full_ids, reused)
+                        return full_ids, reused, past_kv, unpark_ms
+
+        prompt_str = apply_chat_template_with_tools(
+            self.tokenizer,
+            messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            enable_thinking=enable_thinking,
+        )
         self._last_prompt_opened_think = prompt_str.rstrip().endswith("<think>")
         self._last_prompt_chatml_think = "<|im_start|>assistant\n<think>" in prompt_str
         prompt_ids = self.tokenizer(prompt_str, return_tensors="pt").input_ids[0].tolist()
         self._check_context_budget(len(prompt_ids), max_new_tokens)
 
-        if has_active_session:
+        can_reuse_prefix = (
+            use_session_cache
+            and len(self.session.fed) > 0
+            and self.session.parked_backbone is not None
+        )
+        if can_reuse_prefix:
             reused = self.session.kv_prefix_reuse(prompt_ids)
             if reused > 0:
-                past_kv, unpark_ms = self.session.unpark_to_gpu(
-                    self.device, self.mtp_head, first_new_token=prompt_ids[reused]
-                )
+                past_kv, unpark_ms = _unpark_for(prompt_ids, reused)
                 return prompt_ids, reused, past_kv, unpark_ms
 
         if use_session_cache:
@@ -3177,15 +3757,16 @@ class QuintessentiaUnifiedEngine:
         Returns ``(first_token, past, last_hidden[1,1,H], mtp_draft or None)``. The MTP head is
         committed chunk by chunk so its attention never sees the whole prompt at once either.
         """
-        chunk = max(1, int(self.prefill_chunk_tokens))
         n = len(tail_ids)
         past = past_kv
         picked = -1
         last_h = None
         mtp_draft = None
-        for a in range(0, n, chunk):
+        a = 0
+        while a < n:
             check("prefill")
-            b = min(n, a + chunk)
+            cur_chunk = self._effective_prefill_chunk(n - a)
+            b = min(n, a + cur_chunk)
             is_last = b == n
             lg, past = forward_step_all_logits(
                 self.engine,
@@ -3207,6 +3788,7 @@ class QuintessentiaUnifiedEngine:
                 mtp_draft = self.mtp_head.commit_and_draft_first(h_chunk, next_toks)
             del h_chunk
             self.captured.pop("post_norm", None)
+            a = b
         return picked, past, last_h, mtp_draft
 
     def _sample_next_token(self, logits_row: torch.Tensor, gen_history: list[int] | None = None) -> int:
@@ -3232,7 +3814,7 @@ class QuintessentiaUnifiedEngine:
         multi-turn KV + GatedDeltaNet caches stay aligned, and every decoder layer's pre-hook
         polls ``cancel_check`` for sub-layer stop latency.
         """
-        eos_ids = _eos_token_set(self.tokenizer.eos_token_id)
+        eos_ids = self._effective_eos_token_ids()
         check = self._make_cancel_checker(cancel_check)
         if not prompt_ids:
             raise ValueError("empty prompt")
@@ -3242,6 +3824,21 @@ class QuintessentiaUnifiedEngine:
         all_ids = list(prompt_ids)
         gen_history: list[int] = []
         past = past_kv if start > 0 else None
+        if past is None:
+            from .kv_offload import make_offloaded_kv_cache, plan_kv_cache
+            target_len = n + min(2048, max_new_tokens)
+            use_managed, n_offload, disable_pf = plan_kv_cache(
+                self, target_len, device=self.engine.device
+            )
+            if use_managed:
+                past = make_offloaded_kv_cache(
+                    self.engine.config,
+                    initial_capacity=target_len,
+                    chunk_pad=chunk,
+                    device=self.engine.device,
+                    disable_prefetch=disable_pf,
+                    offload_layer_count=n_offload,
+                )
         picked = -1
         phase_ref = ["prefill"]
         self._wavefront_windows = []
@@ -3256,10 +3853,13 @@ class QuintessentiaUnifiedEngine:
                 prog = getattr(self.engine, "progressive", None)
                 has_moe_loader = getattr(self.model_source, "_expert_loader", None) is not None
                 a = start
+                hud_beacon = getattr(self, "_hud_beacon", None)
                 while a < n:
                     check("prefill")
+                    cur_chunk = self._effective_prefill_chunk(n - a)
+                    cur_stride = cur_chunk * (4 if self.prefill_wavefront else 1)
                     step_stride = (
-                        min(stride, 2)
+                        min(cur_stride, 2)
                         if (
                             prog is not None
                             and prog.gpu_enabled
@@ -3269,13 +3869,13 @@ class QuintessentiaUnifiedEngine:
                             and not self.prefill_wavefront
                             and has_moe_loader
                         )
-                        else stride
+                        else cur_stride
                     )
                     b = min(n, a + step_stride)
                     step = torch.tensor([prompt_ids[a:b]], dtype=torch.long)
                     cache_pos = torch.arange(a, b, dtype=torch.long)
-                    if self.prefill_wavefront and b - a > chunk and self.engine.device.type == "cuda":
-                        logits, past = self.engine.prefill_wavefront(step, chunk, past)
+                    if self.prefill_wavefront and b - a > cur_chunk and self.engine.device.type == "cuda":
+                        logits, past = self.engine.prefill_wavefront(step, cur_chunk, past)
                         self._wavefront_windows.append(dict(self.engine.last_wavefront_stats))
                     else:
                         logits, past = self.engine._forward_step(
@@ -3292,6 +3892,8 @@ class QuintessentiaUnifiedEngine:
                         picked = self._sample_next_token(logits[0], gen_history)
                     del logits
                     a = b
+                    if hud_beacon is not None and b < n:
+                        hud_beacon.on_prefill_progress(b, n)
                 all_ids.append(picked)
                 gen_history.append(picked)
                 self._sync_compute()
@@ -3302,6 +3904,13 @@ class QuintessentiaUnifiedEngine:
                 passes = 0
                 cursor = n
                 phase_ref[0] = "decode"
+                from .kv_offload import transition_kv_cache_to_decode
+                transition_kv_cache_to_decode(
+                    past,
+                    self,
+                    decode_pad=1,
+                    extra_decode_tokens=min(2048, max(256, max_new_tokens)),
+                )
                 self._sync_compute()
                 t_dec0 = time.perf_counter()
                 while generated < max_new_tokens:
@@ -3343,6 +3952,10 @@ class QuintessentiaUnifiedEngine:
             "decode_tokens": max(0, generated - 1),
             "backbone_passes": passes,
             "spec_gate": {"overall_accept_rate_pct": 0.0, "mtp_accept_rate_pct": 0.0},
+            "kv_offloaded": bool(getattr(past, "is_quintessentia_offloaded", False)),
+            "kv_gpu_layers": int(getattr(past, "gpu_kv_layer_count", 0)),
+            "kv_offloaded_layers": int(getattr(past, "offloaded_kv_layer_count", 0)),
+            "kv_promoted_layers": int(getattr(past, "promoted_layers_count", 0)),
         }
 
     def _stream_token_ids(
@@ -3368,7 +3981,7 @@ class QuintessentiaUnifiedEngine:
                 past_kv=past_kv,
             )
             return
-        eos_id = self.tokenizer.eos_token_id
+        eos_ids = self._effective_eos_token_ids()
         check = self._make_cancel_checker(cancel_check)
         all_ids = list(prompt_ids)
         gen_history_fq: list[int] = []
@@ -3395,7 +4008,7 @@ class QuintessentiaUnifiedEngine:
                 self._sync_compute()
                 t_dec0 = time.perf_counter()
                 while generated_count < max_new_tokens:
-                    if stop_on_eos and picked == eos_id:
+                    if stop_on_eos and picked in eos_ids:
                         break
                     check("decode")
                     lg, past = forward_step_all_logits(
@@ -3458,7 +4071,7 @@ class QuintessentiaUnifiedEngine:
             t_dec0 = time.perf_counter()
 
             while generated_count < max_new_tokens:
-                if stop_on_eos and picked == eos_id:
+                if stop_on_eos and picked in eos_ids:
                     break
                 check("decode")
                 rem = max_new_tokens - generated_count
@@ -3516,7 +4129,7 @@ class QuintessentiaUnifiedEngine:
                         step_emitted.append(drafts[j])
                         self.draft_vocab.observe_picked_token(drafts[j])
                         generated_count += 1
-                        if stop_on_eos and drafts[j] == eos_id:
+                        if stop_on_eos and drafts[j] in eos_ids:
                             hit_eos = True
                             break
                     else:
@@ -3549,7 +4162,7 @@ class QuintessentiaUnifiedEngine:
                 yield {"kind": "tokens", "new_ids": step_emitted}
 
                 mtp_tokens = drafts[:accepted] + [bonus_tok]
-                if stop_on_eos and bonus_tok == eos_id:
+                if stop_on_eos and bonus_tok in eos_ids:
                     self.mtp_head.commit_and_draft_first(h_post_b[:, : accepted + 1, :].clone(), mtp_tokens)
                     break
 
@@ -3578,7 +4191,7 @@ class QuintessentiaUnifiedEngine:
 
     def stream_chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         max_new_tokens: int | None = 1024,
         enable_thinking: bool = True,
         use_session_cache: bool = False,
@@ -3591,6 +4204,8 @@ class QuintessentiaUnifiedEngine:
         presence_penalty: float = 0.0,
         penalty_window: int = 256,
         seed: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
     ) -> Iterator[dict[str, Any]]:
         """Streams UTF-8-safe `thinking` and `answer` deltas, followed by a `done` telemetry packet.
 
@@ -3600,7 +4215,7 @@ class QuintessentiaUnifiedEngine:
         ``GenerationCancelled``. On cancellation, errors and early close (``generator.close()``)
         every per-request tensor and ring slot is released in ``finally``.
         """
-        eos_ids = _eos_token_set(self.tokenizer.eos_token_id)
+        eos_ids = self._effective_eos_token_ids()
         check = self._make_cancel_checker(cancel_check)
         self.generations_started += 1
         completed = False
@@ -3623,12 +4238,49 @@ class QuintessentiaUnifiedEngine:
                 raise ValueError("max_new_tokens must be >= 0 (0 = unlimited until EOS)")
             unlimited_tokens = (max_new_tokens is None) or (int(max_new_tokens) == 0)
             plan_reserve_tokens = 4096 if unlimited_tokens else int(max_new_tokens)
+            had_prior_archive = bool(
+                use_session_cache and len(self.session.fed) > 0 and self.session.parked_backbone is not None
+            )
             prompt_ids, cached_len, past_kv, unpark_ms = self._prepare_prompt_and_cache(
                 messages, enable_thinking=enable_thinking, use_session_cache=use_session_cache,
-                max_new_tokens=plan_reserve_tokens,
+                max_new_tokens=plan_reserve_tokens, tools=tools, tool_choice=tool_choice,
             )
+            gb = getattr(self, "generation_balance", None)
+            if gb is not None:
+                try:
+                    entry_free_b, entry_total_b, entry_sec_b = 0, 1, None
+                    if self.engine is not None and getattr(self.engine, "device", None) is not None and self.engine.device.type == "cuda" and torch.cuda.is_available():
+                        from .runtime_config import _query_physical_avail_vram
+                        c_free, c_tot = torch.cuda.mem_get_info(self.engine.device)
+                        p_free, p_tot = _query_physical_avail_vram(self.engine.device, getattr(self, "plan", None))
+                        entry_free_b = int(p_free if p_free is not None else c_free)
+                        entry_total_b = int(p_tot if (p_tot and p_tot > 0) else c_tot)
+                        entry_sec_b = int(c_free)
+                    else:
+                        import psutil
+                        vm = psutil.virtual_memory()
+                        entry_free_b, entry_total_b = int(vm.available), int(vm.total)
+                    cal = getattr(self, "calibration", None)
+                    pcie_v = float(cal["pcie_h2d_gb_s"]) if (isinstance(cal, dict) and isinstance(cal.get("pcie_h2d_gb_s"), (int, float))) else None
+                    n_off = int(getattr(past_kv, "offloaded_kv_layer_count", 0)) if past_kv is not None else 0
+                    n_gpu = int(getattr(past_kv, "gpu_kv_layer_count", 0)) if past_kv is not None else 0
+                    off_ratio = (float(n_off) / float(n_off + n_gpu)) if (n_off + n_gpu) > 0 else 0.0
+                    gb.begin_turn(
+                        prompt_tokens=len(prompt_ids),
+                        cached_prefix_tokens=cached_len,
+                        had_prior_archive=had_prior_archive,
+                        free_bytes=entry_free_b,
+                        total_bytes=max(1, entry_total_b),
+                        reserve_bytes=max(192 * MiB, int(entry_total_b * 0.05)),
+                        secondary_free_bytes=entry_sec_b,
+                        pcie_gb_s=pcie_v,
+                        offload_ratio=off_ratio,
+                    )
+                except Exception:
+                    pass
             if unlimited_tokens:
-                model_ctx = int(getattr(self.engine.config, "max_position_embeddings", 32768) or 32768)
+                lim = self.runtime_limits(busy=True)
+                model_ctx = int(lim.get("effective_context_length") or lim.get("native_context_length") or 32768)
                 eff_max_new = max(1, min(32768, max(2048, model_ctx - len(prompt_ids))))
             else:
                 eff_max_new = int(max_new_tokens)
@@ -3661,6 +4313,9 @@ class QuintessentiaUnifiedEngine:
             committed_tok_idx = 0
             thinking_acc: list[str] = []
             answer_acc: list[str] = []
+            hud_beacon = getattr(self, "_hud_beacon", None)
+            if hud_beacon is not None:
+                hud_beacon.begin_turn(len(prompt_ids), cached_len)
 
             inner = self._stream_token_ids(
                 prompt_ids,
@@ -3701,6 +4356,13 @@ class QuintessentiaUnifiedEngine:
                                     thinking_acc.append(chunk)
                                 else:
                                     answer_acc.append(chunk)
+                                if hud_beacon is not None:
+                                    hud_beacon.on_tokens(
+                                        len(raw_gen_ids),
+                                        "".join(answer_acc),
+                                        "".join(thinking_acc),
+                                        phase=phase,
+                                    )
                                 yield {"type": "delta", "phase": phase, "text": chunk}
                 elif ev["kind"] == "final_state":
                     final_info = ev
@@ -3741,10 +4403,17 @@ class QuintessentiaUnifiedEngine:
                     chatml_think_format=bool(getattr(self, "_last_prompt_chatml_think", False)),
                     consumed_tokens=final_info.get("consumed_tokens"),
                 )
+                from .tool_calling import normalize_messages, parse_tool_calls, tools_signature
+                norm_prompt_msgs = normalize_messages(messages, parse_tool_args_as_dict=False)
+                self._session_prompt_messages = norm_prompt_msgs
+                _, self._session_last_tool_calls = parse_tool_calls(
+                    answer_text, tools=tools, allow_bare_json=bool(tools)
+                )
                 self._session_messages = [
-                    *[{"role": str(m["role"]), "content": str(m.get("content", ""))} for m in messages],
+                    *norm_prompt_msgs,
                     {"role": "assistant", "content": answer_text},
                 ]
+                self._session_tools_sig = tools_signature(tools, tool_choice)
             final_info.pop("past", None)
             final_info.pop("last_fed_h", None)
             if not use_session_cache:
@@ -3753,6 +4422,13 @@ class QuintessentiaUnifiedEngine:
                 gc.collect()
                 if self.engine.device.type == "cuda":
                     torch.cuda.empty_cache()
+                    try:
+                        from .runtime_config import _query_physical_avail_vram
+                        q_avail, _ = _query_physical_avail_vram(self.engine.device, getattr(self, "plan", None))
+                        if q_avail is not None:
+                            self._idle_free_vram_bytes = q_avail
+                    except Exception:
+                        pass
 
             stopped_by_eos = bool(raw_gen_ids and raw_gen_ids[-1] in eos_ids)
             metrics = {
@@ -3773,6 +4449,10 @@ class QuintessentiaUnifiedEngine:
                 "spec_gate": final_info.get("spec_gate", {}),
                 "sampling": sampling_cfg.as_dict(),
                 "unlimited_tokens": unlimited_tokens,
+                "kv_offloaded": bool(final_info.get("kv_offloaded", False)),
+                "kv_gpu_layers": int(final_info.get("kv_gpu_layers", 0)),
+                "kv_offloaded_layers": int(final_info.get("kv_offloaded_layers", 0)),
+                "kv_promoted_layers": int(final_info.get("kv_promoted_layers", 0)),
             }
             progressive = getattr(self.engine, "progressive", None)
             if progressive is not None:
@@ -3800,12 +4480,84 @@ class QuintessentiaUnifiedEngine:
                 metrics["q1_puzzle_overlay"] = puz_ctrl.stats()
             if active_anchor_ref is not None:
                 metrics["thought_anchor"] = active_anchor_ref.telemetry.summary()
+            if getattr(self, "generation_balance", None) is not None:
+                try:
+                    end_free_b, end_total_b = 0, 1
+                    if self.engine is not None and getattr(self.engine, "device", None) is not None and self.engine.device.type == "cuda" and torch.cuda.is_available():
+                        from .runtime_config import _query_physical_avail_vram
+                        c_free, c_tot = torch.cuda.mem_get_info(self.engine.device)
+                        p_free, p_tot = _query_physical_avail_vram(self.engine.device, getattr(self, "plan", None))
+                        end_free_b = int(p_free if p_free is not None else c_free)
+                        end_total_b = int(p_tot if (p_tot and p_tot > 0) else c_tot)
+                    else:
+                        import psutil
+                        vm = psutil.virtual_memory()
+                        end_free_b, end_total_b = int(vm.available), int(vm.total)
+                    cal = getattr(self, "calibration", None)
+                    cal_dec = float(cal["decode_tok_per_s"]) if (isinstance(cal, dict) and isinstance(cal.get("decode_tok_per_s"), (int, float))) else None
+                    gb_summary = self.generation_balance.finish_turn(
+                        prompt_tokens=len(prompt_ids),
+                        cached_prefix_tokens=cached_len,
+                        generated_tokens=len(raw_gen_ids),
+                        free_bytes=end_free_b,
+                        total_bytes=max(1, end_total_b),
+                        kv_offloaded_layers=int(final_info.get("kv_offloaded_layers", 0)),
+                        kv_gpu_layers=int(final_info.get("kv_gpu_layers", 0)),
+                        decode_tok_per_s=float(tok_per_s),
+                        calibrated_decode_tok_per_s=cal_dec,
+                    )
+                    scales_bal: dict[str, Any] = {}
+                    kv_bal = getattr(self, "_last_kv_placement_balance", None)
+                    if kv_bal is not None:
+                        scales_bal["kv_placement"] = kv_bal
+                    q1_runner = getattr(self, "_q1_cubes_runner", None)
+                    if q1_runner is not None and hasattr(q1_runner, "stats"):
+                        tm_v4 = (q1_runner.stats() or {}).get("trunk_mirror_v4") or {}
+                        if tm_v4.get("rssf_balance") is not None:
+                            scales_bal["m0_trunk_q1"] = tm_v4["rssf_balance"]
+                        tb = tm_v4.get("v4_trunk_breather") or {}
+                        if isinstance(tb.get("m1"), dict) and tb["m1"].get("rssf_balance") is not None:
+                            scales_bal["m1_trunk_load"] = tb["m1"]["rssf_balance"]
+                        if isinstance(tb.get("m2"), dict) and tb["m2"].get("rssf_balance") is not None:
+                            scales_bal["m2_trunk_pool"] = tb["m2"]["rssf_balance"]
+                    if getattr(self, "cold_warmup_scale", None) is not None:
+                        m3_bal = (self.cold_warmup_scale.stats() or {}).get("rssf_balance")
+                        if m3_bal is not None:
+                            scales_bal["m3_cold_warmup"] = m3_bal
+                    if getattr(self, "survivor_tracker", None) is not None:
+                        m6_bal = (self.survivor_tracker.stats() or {}).get("rssf_balance")
+                        if m6_bal is not None:
+                            scales_bal["m6_probability_path"] = m6_bal
+                    if active_anchor_ref is not None and hasattr(active_anchor_ref, "mirror_stats"):
+                        m8_bal = (active_anchor_ref.mirror_stats() or {}).get("rssf_balance")
+                        if m8_bal is not None:
+                            scales_bal["m8_thought_buffer"] = m8_bal
+                    if isinstance(metrics.get("expert_cache"), dict):
+                        imp = metrics["expert_cache"].get("imprint_overlay") or {}
+                        for k_src, k_dst in (
+                            ("m1_load_dispatcher", "m1_moe_load"),
+                            ("m2_region_breathing_pool", "m2_moe_pool"),
+                            ("m4_post_prefill_warmup", "m4_moe_warmup"),
+                        ):
+                            sub = imp.get(k_src)
+                            if isinstance(sub, dict) and sub.get("rssf_balance") is not None:
+                                scales_bal[k_dst] = sub["rssf_balance"]
+                    if isinstance(metrics.get("speculative_decoding"), dict):
+                        ms7 = metrics["speculative_decoding"].get("mirror_speculation")
+                        if isinstance(ms7, dict) and ms7.get("rssf_balance") is not None:
+                            scales_bal["m7_speculation"] = ms7["rssf_balance"]
+                    gb_summary["active_scales"] = scales_bal
+                    metrics["rssf_generation_balance"] = gb_summary
+                except Exception:
+                    pass
             if self.prefill_wavefront:
                 metrics["prefill_wavefront"] = {"enabled": True, "windows": list(self._wavefront_windows)}
             if auto_anchor_installed and use_session_cache:
                 self._session_thought_anchor = active_anchor_ref
             self.last_metrics = metrics
             completed = True
+            if hud_beacon is not None:
+                hud_beacon.finish_turn(self, metrics, answer_text, thinking_text)
             yield {
                 "type": "done",
                 "thinking_text": thinking_text,
@@ -3831,9 +4583,18 @@ class QuintessentiaUnifiedEngine:
                 inner = None
             final_info.clear()
             if not completed:
+                hb = getattr(self, "_hud_beacon", None)
+                if hb is not None and hasattr(hb, "cancel_turn"):
+                    hb.cancel_turn()
                 self._abort_cleanup()
 
     def close(self) -> None:
+        if getattr(self, "_hud_beacon", None) is not None:
+            try:
+                self._hud_beacon.close()
+            except Exception:
+                pass
+            self._hud_beacon = None
         # Optional ThoughtBuffer baselines belong to this engine's device lifetime.
         self._neutral_logprob_cache = None
         self._session_thought_anchor = None

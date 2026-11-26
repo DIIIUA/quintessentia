@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import secrets
 import sys
@@ -170,6 +171,7 @@ def resolve_auto_v4_plan(
             "q1_planes": q1_planes,
             "cube_root_bits": 16,
             "auto_v4_selected": False,
+            "auto_fit_q1_planes": (wf == "q1_cubes" and q1_planes is None),
             "reason": "explicit_off",
         }
 
@@ -186,6 +188,7 @@ def resolve_auto_v4_plan(
             "q1_planes": eff_planes,
             "cube_root_bits": eff_root if wf == "q1_cubes" else 16,
             "auto_v4_selected": (fb_norm == "mirror_scales"),
+            "auto_fit_q1_planes": (wf == "q1_cubes" and q1_planes is None),
             "reason": f"explicit_{fb_norm}",
         }
 
@@ -207,6 +210,7 @@ def resolve_auto_v4_plan(
             "q1_planes": eff_planes,
             "cube_root_bits": eff_root,
             "auto_v4_selected": True,
+            "auto_fit_q1_planes": (q1_planes is None),
             "reason": "auto_q1_cubes_v4",
         }
 
@@ -218,6 +222,7 @@ def resolve_auto_v4_plan(
             "q1_planes": q1_planes,
             "cube_root_bits": 16,
             "auto_v4_selected": False,
+            "auto_fit_q1_planes": False,
             "reason": "explicit_non_q1_or_cpu",
         }
 
@@ -276,6 +281,7 @@ def resolve_auto_v4_plan(
                 "q1_planes": eff_planes,
                 "cube_root_bits": eff_root,
                 "auto_v4_selected": True,
+                "auto_fit_q1_planes": (q1_planes is None),
                 "reason": "auto_large_moe_exceeds_vram",
                 "num_experts": num_experts,
                 "weight_gib": round(wb / 2**30, 2),
@@ -289,6 +295,7 @@ def resolve_auto_v4_plan(
         "q1_planes": eff_planes,
         "cube_root_bits": eff_root,
         "auto_v4_selected": True,
+        "auto_fit_q1_planes": (q1_planes is None),
         "reason": "auto_q1_cubes_v4",
     }
 
@@ -371,6 +378,11 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Experimental vocabulary pruner (off by default: it drops rare tokens on long outputs)",
     )
+    p.add_argument(
+        "--hud",
+        action="store_true",
+        help="Open the live visual Quintessentia Desktop HUD window alongside CLI execution",
+    )
 
 
 def _add_generation_args(p: argparse.ArgumentParser) -> None:
@@ -392,6 +404,8 @@ def _add_generation_args(p: argparse.ArgumentParser) -> None:
 
 def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
     from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
+    if getattr(args, "hud", False):
+        launch_desktop_hud(quiet=True)
     model = args.model
     root = find_quintessentia_root(args.quintessentia_root)
     if getattr(args, "download_dir", None):
@@ -471,6 +485,7 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         ),
         q1_imprint_puzzle=bool(v4_plan["q1_imprint_puzzle"]),
         q1_graphify_feedback=v4_plan["feedback_mode"],
+        auto_fit_q1_planes=bool(v4_plan.get("auto_fit_q1_planes", False)),
     )
 
 
@@ -537,6 +552,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 q1_p_doc = v4_doc["q1_planes"] or (16 if wf_doc == "q1_cubes" else 4)
                 if wf_doc in ("q1", "q1_cubes") or q1_p_doc != 4:
                     extra_plan["q1_planes"] = q1_p_doc
+                if wf_doc == "q1_cubes":
+                    extra_plan["auto_fit_q1_planes"] = bool(v4_doc.get("auto_fit_q1_planes", False))
                 profile, plan, _has_mtp = plan_for_checkpoint(
                     model_dir,
                     mode=args.vram_mode,
@@ -570,7 +587,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if profile.get("weight_format") == "q1_cubes":
             q1_p = profile.get("q1_planes") or (v4_doc or {}).get("q1_planes") or 5
             root_b = (v4_doc or {}).get("cube_root_bits") or (16 if int(q1_p) > 8 else 8)
-            print(f"  Backend            : {profile.get('backend')} / q1_cubes (k={q1_p}, root_bits={root_b})")
+            halved_note = (
+                f", auto-halved from k={profile.get('q1_planes_requested')}"
+                if profile.get("q1_planes_auto_halved")
+                else ""
+            )
+            print(f"  Backend            : {profile.get('backend')} / q1_cubes (k={q1_p}{halved_note}, root_bits={root_b})")
         else:
             why = "; ".join(profile.get("why_not_fast") or [])
             fast_line = "on" if profile.get("fast_qwen") else f"off ({why})" if why else "off"
@@ -604,6 +626,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
     elif "vram_plan_error" in report:
         print(f"  VRAM plan          : {report['vram_plan_error']}")
+    print(f"  RSSF Balance       : ON (8-pair force balance + EC Volterra + FDS + Collapse)")
+    hud_ps1 = Path(__file__).resolve().parent / "hud" / "quintessentia_hud.ps1"
+    print(f"  Desktop HUD        : {'ready' if hud_ps1.is_file() else 'missing'} (`quint hud` / `--hud`)")
     print(f"  Detected LAN IPv4  : {lan_ip} (all: {', '.join(all_ips)})")
     print("=" * 76)
     if args.json_out:
@@ -660,6 +685,7 @@ def _verify_preparation(folder, *, root, device="auto", weight_format="auto", vr
         max_context_tokens=512, prefill_chunk_tokens=8, q1_planes=v4_plan["q1_planes"],
         cube_root_bits=v4_plan["cube_root_bits"], q1_imprint_puzzle=bool(v4_plan["q1_imprint_puzzle"]),
         q1_graphify_feedback=v4_plan["feedback_mode"], q1_early_stop=q1_early_stop,
+        auto_fit_q1_planes=bool(v4_plan.get("auto_fit_q1_planes", False)),
     ) as engine:
         ids = engine.tokenizer("Hi", return_tensors="pt").input_ids
         with torch.inference_mode():
@@ -783,10 +809,21 @@ def _stream_to_console(
         accel_str = ""
     reuse_str = f" | Prefix reused: {m.get('cached_prefix_tokens', 0)} tok" if m.get("cached_prefix_tokens") else ""
     park_str = f" | Parked RAM: {m.get('parked_session_ram_mib', 0.0)} MiB" if use_session else ""
+    kv_g = int(m.get("kv_gpu_layers", 0) or 0)
+    kv_o = int(m.get("kv_offloaded_layers", 0) or 0)
+    kv_str = f" | KV: {kv_g}G/{kv_o}R" if (kv_g + kv_o) > 0 else ""
+    rb = m.get("rssf_generation_balance") or {}
+    tb = rb.get("turn_end_balance") or {}
+    ec_rep = rb.get("entry_collapse") or {}
+    bal_str = ""
+    if tb.get("d3_margin") is not None:
+        bal_str = f" | Balance: d3={tb.get('d3_margin')} ({tb.get('regime')})"
+        if ec_rep.get("loss_of_archive"):
+            bal_str += " [ARCHIVE_WIPE]"
     print(
         f"\n\n--- [ one answer: {m.get('decode_tok_per_s', 0.0):.2f} tok/s | "
         f"{m.get('generated_tokens', 0)} tok (EOS={m.get('stopped_by_eos')}) | "
-        f"Prefill: {m.get('prefill_ms', 0.0):.1f} ms{reuse_str}{accel_str} | "
+        f"Prefill: {m.get('prefill_ms', 0.0):.1f} ms{reuse_str}{accel_str}{kv_str}{bal_str} | "
         f"Peak VRAM: {m.get('peak_vram_mib', 0.0):.1f} MiB{park_str} ] ---",
         flush=True,
     )
@@ -794,9 +831,13 @@ def _stream_to_console(
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    prompt_text = " ".join(args.prompt).strip()
+    raw_parts = list(args.prompt or [])
+    if raw_parts == ["-"] or (not raw_parts and not sys.stdin.isatty()):
+        prompt_text = sys.stdin.read().strip()
+    else:
+        prompt_text = " ".join(raw_parts).strip()
     if not prompt_text:
-        print("Error: please provide a prompt, e.g. `quint ask \"Привет!\"`", file=sys.stderr)
+        print("Error: please provide a prompt, e.g. `quint ask \"Привет!\"` or pipe via stdin (`-`)", file=sys.stderr)
         return EXIT_USAGE
 
     thinking = not args.no_think
@@ -847,11 +888,15 @@ def cmd_chat(args: argparse.Namespace) -> int:
         messages.append({"role": "system", "content": args.system})
 
     with _engine_from_args(args) as eng:
+        import os as _os
+        if _os.environ.get("QUINTESSENTIA_SKIP_CALIBRATION", "").strip().lower() not in ("1", "true", "yes"):
+            if hasattr(eng, "calibrate_hardware_limits"):
+                eng.calibrate_hardware_limits(verbose=True)
         b_lbl = eng.profile.get("backend", "auto")
         wf_lbl = eng.profile.get("weight_format", "auto")
         print(
             f"\n[Quintessentia Interactive Chat | mode={cur_mode} | {b_lbl} ({wf_lbl})] "
-            "Commands: `/reset`, `/think on|off`, `/mode default|custom`, `/status`, `/exit`. "
+            "Commands: `/reset`, `/think on|off`, `/mode default|custom`, `/balance`, `/hud`, `/status`, `/exit`. "
             "Ctrl+C stops the current answer.\n",
             flush=True,
         )
@@ -882,6 +927,14 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     print(f"[Режим профиля: {cur_mode}]", flush=True)
                 else:
                     print(f"[Текущий режим: {cur_mode}. Использование: /mode default|custom]", flush=True)
+                continue
+            if user_in.lower() == "/balance":
+                lm = getattr(eng, "last_metrics", None) or {}
+                rb = lm.get("rssf_generation_balance")
+                print(json.dumps(rb or {"status": "no_turn_yet"}, ensure_ascii=False, indent=2), flush=True)
+                continue
+            if user_in.lower() == "/hud":
+                launch_desktop_hud(quiet=False)
                 continue
             if user_in.lower() == "/status":
                 print(json.dumps(eng.status_snapshot(), ensure_ascii=False, indent=2), flush=True)
@@ -922,6 +975,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
     log_file = None if args.no_log_file else (args.log_file or str(root / DEFAULT_LOG_FILE))
 
     with _engine_from_args(args) as eng:
+        import os as _os
+        if _os.environ.get("QUINTESSENTIA_SKIP_CALIBRATION", "").strip().lower() not in ("1", "true", "yes"):
+            if hasattr(eng, "calibrate_hardware_limits"):
+                eng.calibrate_hardware_limits(verbose=True)
         srv = QuintessentiaLANServer(
             engine=eng,
             host=args.host,
@@ -935,6 +992,329 @@ def cmd_serve(args: argparse.Namespace) -> int:
             preempt=not args.no_preempt,
         )
         srv.serve_forever()
+    return EXIT_OK
+
+
+def _resolve_win_userprofile_from_wsl() -> Path | None:
+    """Resolve the active Windows user profile directory (`/mnt/c/Users/<name>`) when running under WSL2."""
+    import shutil
+    import subprocess
+
+    users_root = Path("/mnt/c/Users")
+    if not users_root.is_dir():
+        return None
+    # Prefer cmd.exe /c echo %USERPROFILE% + wslpath when available
+    cmd_exe = shutil.which("cmd.exe")
+    wslpath = shutil.which("wslpath")
+    if cmd_exe and wslpath:
+        try:
+            win_prof = subprocess.check_output(
+                [cmd_exe, "/c", "echo %USERPROFILE%"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=3.0,
+            ).strip()
+            if win_prof and "%" not in win_prof:
+                wsl_p = Path(subprocess.check_output([wslpath, "-u", win_prof], text=True, timeout=3.0).strip())
+                if wsl_p.is_dir():
+                    return wsl_p
+        except Exception:
+            pass
+    skip = {"public", "default", "default user", "all users", "defaultapppool", "glcache"}
+    best: list[tuple[int, Path]] = []
+    for entry in sorted(users_root.iterdir()):
+        el = entry.name.lower()
+        if not entry.is_dir() or el in skip or "sandbox" in el:
+            continue
+        has_q = (entry / ".quintessentia").is_dir()
+        has_desk = (entry / "Desktop").is_dir()
+        if has_q or has_desk:
+            best.append(((0 if has_q else 1) * 10 + (0 if has_desk else 1), entry))
+    best.sort(key=lambda item: (item[0], item[1].as_posix()))
+    return best[0][1] if best else None
+
+
+def _sync_hud_bundle_to(target_dir: Path, *, include_launchers: bool = False) -> Path:
+    import shutil
+
+    src_dir = Path(__file__).resolve().parent / "hud"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ("quintessentia_hud.ps1", "hud_backend.py"):
+        src = src_dir / fname
+        if src.is_file():
+            shutil.copy2(src, target_dir / fname)
+    if include_launchers:
+        for fname in ("launch.vbs", "quintessentia_hud.ico"):
+            src = src_dir / fname
+            if src.is_file():
+                shutil.copy2(src, target_dir / fname)
+        if not (target_dir / "launch.vbs").is_file():
+            (target_dir / "launch.vbs").write_text(
+                'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+                'Set sh = CreateObject("WScript.Shell")\r\n'
+                'dir = fso.GetParentFolderName(WScript.ScriptFullName)\r\n'
+                'cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File """ & dir & "\\quintessentia_hud.ps1"""\r\n'
+                'sh.Run cmd, 0, False\r\n',
+                encoding="utf-8",
+            )
+        (target_dir / "Start Quintessentia HUD.cmd").write_text(
+            '@echo off\r\nstart "" wscript.exe "%~dp0launch.vbs"\r\n',
+            encoding="utf-8",
+        )
+        (target_dir / "Stop Quintessentia HUD.cmd").write_text(
+            '@echo off\r\n'
+            'if not exist "%~dp0.cache" mkdir "%~dp0.cache"\r\n'
+            'echo 1 > "%~dp0.cache\\stop_hud.flag"\r\n'
+            'if exist "%USERPROFILE%\\.quintessentia\\hud_cache" echo 1 > "%USERPROFILE%\\.quintessentia\\hud_cache\\stop_hud.flag"\r\n'
+            'timeout /t 1 /nobreak >nul\r\n'
+            'if exist "%~dp0.cache\\hud_ui.pid" (\r\n'
+            '  set /p HPID=<"%~dp0.cache\\hud_ui.pid"\r\n'
+            '  if defined HPID taskkill /F /T /PID %HPID% >nul 2>&1\r\n'
+            ')\r\n'
+            'echo Quintessentia HUD stopped.\r\n',
+            encoding="utf-8",
+        )
+    return target_dir / "quintessentia_hud.ps1"
+
+
+def stop_desktop_hud(*, quiet: bool = False) -> bool:
+    """Stop any running Quintessentia Live HUD window and its collector (fast flag + PID, zero WMI lag)."""
+    import shutil
+    import subprocess
+    import time
+
+    cache_dirs: list[Path] = []
+    if os.name == "nt":
+        cache_dirs.append(Path.home() / ".quintessentia" / "hud_cache")
+        cache_dirs.append(Path.home() / "Desktop" / "Quintessentia HUD" / ".cache")
+    else:
+        wp = _resolve_win_userprofile_from_wsl()
+        if wp is not None:
+            cache_dirs.append(wp / ".quintessentia" / "hud_cache")
+            cache_dirs.append(wp / "Desktop" / "Quintessentia HUD" / ".cache")
+
+    pids: list[int] = []
+    for cd in cache_dirs:
+        if cd.is_dir():
+            try:
+                (cd / "stop_hud.flag").write_text("1", encoding="ascii")
+            except OSError:
+                pass
+            pid_f = cd / "hud_ui.pid"
+            if pid_f.is_file():
+                try:
+                    p = int(pid_f.read_text(encoding="ascii").strip())
+                    if p > 0 and p not in pids:
+                        pids.append(p)
+                except Exception:
+                    pass
+
+    time.sleep(0.5)
+    # Fallback force kill by exact PID (no slow WMI scan!) if process did not exit cleanly
+    tk_exe = shutil.which("taskkill.exe") or (r"C:\Windows\System32\taskkill.exe" if os.name == "nt" else None)
+    if tk_exe and pids:
+        for pid in pids:
+            try:
+                kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "timeout": 4.0}
+                if os.name == "nt":
+                    kwargs["creationflags"] = 0x08000000
+                subprocess.run([tk_exe, "/F", "/T", "/PID", str(pid)], **kwargs)
+            except Exception:
+                pass
+    if not quiet:
+        print("[Quintessentia HUD] Stopped.", flush=True)
+    return True
+
+
+def launch_desktop_hud(*, quiet: bool = False) -> bool:
+    """Launch (or focus if already running) the native Quintessentia Live HUD window.
+
+    Works both natively on Windows and transparently from WSL 2 Linux via host `powershell.exe`
+    (staging onto local Windows `%USERPROFILE%\\.quintessentia\\hud` to avoid UNC zone blocks).
+    """
+    import shutil
+    import subprocess
+
+    hud_script = Path(__file__).resolve().parent / "hud" / "quintessentia_hud.ps1"
+    if not hud_script.is_file():
+        if not quiet:
+            print(f"[Quintessentia HUD] Script not found: {hud_script}", file=sys.stderr)
+        return False
+
+    if os.name == "nt":
+        ps_exe = shutil.which("powershell.exe") or r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        cmd = [
+            ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
+            "-WindowStyle", "Hidden", "-File", str(hud_script),
+        ]
+        try:
+            subprocess.Popen(
+                cmd,
+                creationflags=0x08000000 | 0x00000008,  # CREATE_NO_WINDOW | DETACHED_PROCESS
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if not quiet:
+                print("[Quintessentia HUD] Live visual HUD opened.", flush=True)
+            return True
+        except Exception as exc:
+            if not quiet:
+                print(f"[Quintessentia HUD] Failed to start: {exc}", file=sys.stderr)
+            return False
+
+    # WSL 2 Linux -> stage onto native Windows profile path so PowerShell avoids UNC zone warnings
+    ps_exe = shutil.which("powershell.exe")
+    wslpath = shutil.which("wslpath")
+    if ps_exe and wslpath:
+        try:
+            win_prof = _resolve_win_userprofile_from_wsl()
+            if win_prof is not None:
+                staged = _sync_hud_bundle_to(win_prof / ".quintessentia" / "hud", include_launchers=False)
+                win_script = subprocess.check_output([wslpath, "-w", str(staged)], text=True).strip()
+            else:
+                win_script = subprocess.check_output([wslpath, "-w", str(hud_script)], text=True).strip()
+            subprocess.Popen(
+                [
+                    ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
+                    "-WindowStyle", "Hidden", "-File", win_script,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            if not quiet:
+                print("[Quintessentia HUD] Live visual HUD opened on Windows host.", flush=True)
+            return True
+        except Exception as exc:
+            if not quiet:
+                print(f"[Quintessentia HUD] Failed to launch via WSL bridge: {exc}", file=sys.stderr)
+            return False
+
+    if not quiet:
+        print(
+            "[Quintessentia HUD] Native WPF HUD requires Windows (or WSL 2 with Windows host). "
+            f"Live JSON telemetry is available at: {Path.home() / '.quintessentia' / 'live_telemetry.json'}",
+            flush=True,
+        )
+    return False
+
+
+def cmd_hud(args: argparse.Namespace) -> int:
+    if getattr(args, "stop", False):
+        return EXIT_OK if stop_desktop_hud(quiet=False) else EXIT_RUNTIME
+    if getattr(args, "install_desktop", False):
+        if os.name == "nt":
+            desk = Path.home() / "Desktop" / "Quintessentia HUD"
+        else:
+            wp = _resolve_win_userprofile_from_wsl()
+            desk = (wp / "Desktop" / "Quintessentia HUD") if wp is not None else None
+        if desk is None:
+            print("[Quintessentia HUD] Windows Desktop folder not found.", file=sys.stderr)
+            return EXIT_RUNTIME
+        _sync_hud_bundle_to(desk, include_launchers=True)
+        print(f"[Quintessentia HUD] Installed/updated Desktop widget at: {desk}", flush=True)
+        return EXIT_OK
+    if getattr(args, "status", False):
+        tel_p = Path.home() / ".quintessentia" / "live_telemetry.json"
+        if os.name != "nt":
+            wp = _resolve_win_userprofile_from_wsl()
+            if wp is not None and (wp / ".quintessentia" / "live_telemetry.json").is_file():
+                tel_p = wp / ".quintessentia" / "live_telemetry.json"
+        info: dict = {"telemetry_file": str(tel_p), "telemetry_exists": tel_p.is_file()}
+        if tel_p.is_file():
+            try:
+                d = json.loads(tel_p.read_text(encoding="utf-8"))
+                info.update({
+                    "phase": d.get("phase"),
+                    "model": d.get("model"),
+                    "env": d.get("env"),
+                    "updated_at": d.get("updated_at"),
+                    "rssf_d3_margin": d.get("rssf_d3_margin"),
+                    "rssf_regime": d.get("rssf_regime"),
+                })
+            except Exception:
+                pass
+        print(json.dumps(info, ensure_ascii=False, indent=2), flush=True)
+        return EXIT_OK
+    ok = launch_desktop_hud(quiet=False)
+    return EXIT_OK if ok else EXIT_RUNTIME
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Run a deterministic multi-turn/multi-run benchmark on a local model with full balance metrics."""
+    import statistics
+
+    runs = max(1, int(getattr(args, "runs", 3) or 3))
+    max_toks = max(8, int(getattr(args, "max_tokens", 64) or 64))
+    thinking = not bool(getattr(args, "no_think", False))
+    prompts = [
+        "Explain in two concise sentences why fast memory bandwidth improves language model inference.",
+        "Continue from your previous answer and give one short Python formula for memory transfer time.",
+        "List three numbered checks for verifying model stability on an 8 GB GPU.",
+    ]
+    results: list[dict] = []
+    with _engine_from_args(args) as eng:
+        history: list[dict[str, str]] = []
+        for idx in range(runs):
+            use_cache = (idx == 1)
+            if not use_cache:
+                eng.reset_session()
+                history = []
+            prompt = prompts[idx % len(prompts)]
+            history.append({"role": "user", "content": prompt})
+            done_pkt: dict = {}
+            for ev in eng.stream_chat(
+                history,
+                max_new_tokens=max_toks,
+                enable_thinking=thinking,
+                use_session_cache=use_cache,
+                stop_on_eos=True,
+                temperature=0.0,
+            ):
+                if ev.get("type") == "done":
+                    done_pkt = ev
+            ans = (done_pkt.get("answer_text") or "").strip()
+            history.append({"role": "assistant", "content": ans})
+            m = done_pkt.get("metrics") or {}
+            rb = m.get("rssf_generation_balance") or {}
+            tb = rb.get("turn_end_balance") or {}
+            row = {
+                "run": idx + 1,
+                "kv_reuse": use_cache,
+                "prompt_tokens": int(m.get("prompt_tokens", 0) or 0),
+                "cached_prefix_tokens": int(m.get("cached_prefix_tokens", 0) or 0),
+                "generated_tokens": int(m.get("generated_tokens", 0) or 0),
+                "prefill_ms": round(float(m.get("prefill_ms", 0.0) or 0.0), 1),
+                "decode_tok_per_s": round(float(m.get("decode_tok_per_s", 0.0) or 0.0), 2),
+                "peak_vram_mib": round(float(m.get("peak_vram_mib", 0.0) or 0.0), 1),
+                "kv_gpu_layers": int(m.get("kv_gpu_layers", 0) or 0),
+                "kv_offloaded_layers": int(m.get("kv_offloaded_layers", 0) or 0),
+                "rssf_d3_margin": tb.get("d3_margin"),
+                "rssf_regime": tb.get("regime"),
+                "active_scales": sorted((rb.get("active_scales") or {}).keys()),
+                "preview": ans[:120],
+            }
+            results.append(row)
+            print(
+                f"  Run {row['run']}/{runs}: {row['decode_tok_per_s']:6.2f} tok/s | "
+                f"gen={row['generated_tokens']} | prefill={row['prefill_ms']:.0f}ms "
+                f"(hit={row['cached_prefix_tokens']}) | peak={row['peak_vram_mib']:.0f} MiB | "
+                f"d3={row['rssf_d3_margin']} ({row['rssf_regime']})",
+                flush=True,
+            )
+
+    med_tps = round(statistics.median([r["decode_tok_per_s"] for r in results]), 2) if results else 0.0
+    max_vram = max((r["peak_vram_mib"] for r in results), default=0.0)
+    summary = {
+        "model": args.model or "default",
+        "runs": runs,
+        "median_decode_tok_per_s": med_tps,
+        "max_peak_vram_mib": max_vram,
+        "results": results,
+    }
+    print(f"Summary: median {med_tps:.2f} tok/s | max peak VRAM {max_vram:.1f} MiB | runs={runs}", flush=True)
+    if getattr(args, "json_out", None):
+        Path(args.json_out).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return EXIT_OK
 
 
@@ -1008,8 +1388,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_engine_args(p_ask)
     _add_generation_args(p_ask)
     p_ask.add_argument("--json-out", type=str, default=None, help="Save full response + telemetry JSON")
-    p_ask.add_argument("prompt", nargs="+", help="Prompt text")
+    p_ask.add_argument("prompt", nargs="*", help="Prompt text (or `-` / piped stdin)")
     p_ask.set_defaults(func=cmd_ask)
+
+    p_bench = sub.add_parser("bench", help="Run a multi-run model stability & speed benchmark with balance telemetry")
+    _add_engine_args(p_bench)
+    p_bench.add_argument("--runs", type=int, default=3, help="Number of benchmark runs (default: 3, run 2 tests KV reuse)")
+    p_bench.add_argument("--max-tokens", type=int, default=64, help="Max new tokens per run (default: 64)")
+    p_bench.add_argument("--no-think", action="store_true", help="Disable `<think>` reasoning block")
+    p_bench.add_argument("--json-out", type=str, default=None, help="Save benchmark JSON report")
+    p_bench.set_defaults(func=cmd_bench)
 
     p_chat = sub.add_parser("chat", help="Interactive terminal chat with `kv_prefix` reuse & RAM parking")
     _add_engine_args(p_chat)
@@ -1043,6 +1431,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_disc.add_argument("--timeout", type=float, default=2.0, help="Scan duration in seconds (default: 2.0)")
     p_disc.add_argument("--json-out", type=str, default=None)
     p_disc.set_defaults(func=cmd_discover)
+
+    p_hud = sub.add_parser("hud", help="Open, inspect, stop, or install the native Quintessentia Live HUD widget")
+    p_hud.add_argument("--stop", action="store_true", help="Stop any running HUD window and collector")
+    p_hud.add_argument("--status", action="store_true", help="Print live telemetry & HUD status JSON")
+    p_hud.add_argument("--install-desktop", action="store_true", help="Install/update the Windows Desktop HUD launcher folder")
+    p_hud.set_defaults(func=cmd_hud)
 
     return parser
 

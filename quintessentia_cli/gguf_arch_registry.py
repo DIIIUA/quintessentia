@@ -919,13 +919,10 @@ def get_extended_gguf_mapping(
         ]
 
     # 12. Qwen3-Next (hybrid GatedDeltaNet + MoE)
+    # Unlike Qwen3.5 (which splits `in_proj_qkv` + `in_proj_z` and stores tiled V-heads),
+    # llama.cpp `qwen3next` GGUFs preserve HF grouped `[num_k_heads, num_v_heads // num_k_heads]`
+    # ordering across `ssm_in`, `ssm_ba`, `ssm_a`, `ssm_dt.bias`, `ssm_conv1d`, and `ssm_out`.
     if hf_type == "qwen3_next":
-        num_k = int(getattr(text_cfg, "linear_num_key_heads", 16))
-        num_v = int(getattr(text_cfg, "linear_num_value_heads", 32))
-        v_hd = int(getattr(text_cfg, "linear_value_head_dim", 128))
-        k_hd = int(getattr(text_cfg, "linear_key_head_dim", 128))
-        heads = (num_k, max(1, num_v // max(1, num_k)))
-        qk_rows = 2 * k_hd * num_k
         return (
             list(DENSE_DECODER_RENAMINGS)
             + _moe_common_renamings(router_target=".mlp.gate.", shared_plural=False)
@@ -943,17 +940,11 @@ def get_extended_gguf_mapping(
                 WeightConverter(r"\.ffn_norm\.weight$", ".post_attention_layernorm.weight", [SubtractOne()]),
                 WeightConverter(r"\.attn_q_norm\.weight$", ".self_attn.q_norm.weight", [SubtractOne()]),
                 WeightConverter(r"\.attn_k_norm\.weight$", ".self_attn.k_norm.weight", [SubtractOne()]),
-                WeightConverter("linear_attn.A_log", "linear_attn.A_log", [LogNegate(), TiledToGroupedRows(*heads)]),
-                WeightConverter("linear_attn.dt_bias", "linear_attn.dt_bias", [TiledToGroupedRows(*heads)]),
+                WeightConverter("linear_attn.A_log", "linear_attn.A_log", [LogNegate()]),
                 WeightConverter(
                     "linear_attn.conv1d.weight",
                     "linear_attn.conv1d.weight",
-                    [TiledToGroupedRows(*heads, v_hd, offset=qk_rows), Unsqueeze(1, expected_ndim=3)],
-                ),
-                WeightConverter(
-                    "linear_attn.out_proj.weight",
-                    "linear_attn.out_proj.weight",
-                    [TiledToGroupedInputs(*heads, v_hd)],
+                    [Unsqueeze(1, expected_ndim=3)],
                 ),
                 WeightConverter(
                     "mlp.shared_expert_gate.weight",

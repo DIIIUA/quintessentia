@@ -160,8 +160,9 @@ def plan_kv_cache(
     total_prealloc_need = per_layer_need * n_full
 
     # Case 1: All full-attention layers fit directly in GDDR6 with PreallocatedGPUDynamicLayer!
-    from src.rssf_dynamic_operators import observe_kv_placement_balance
+    from src.rssf_dynamic_operators import is_rssf_balance_enabled, observe_kv_placement_balance
 
+    rssf_kv = bool(getattr(wrapper, "enable_rssf_balance", True)) and is_rssf_balance_enabled()
     cal = getattr(wrapper, "calibration", None)
     pcie_gb_s = (
         float(cal["pcie_h2d_gb_s"])
@@ -170,6 +171,12 @@ def plan_kv_cache(
     )
 
     def _record_kv_bal(n_gpu_sel: int, n_off_sel: int, st_bytes: int, dis_pf: bool) -> Any:
+        if not rssf_kv:
+            try:
+                wrapper._last_kv_placement_balance = None
+            except Exception:
+                pass
+            return None
         bal = observe_kv_placement_balance(
             n_gpu=n_gpu_sel,
             n_full=n_full,
@@ -196,7 +203,7 @@ def plan_kv_cache(
 
     if total_prealloc_need <= safe_kv_vram:
         bal_all = _record_kv_bal(n_full, 0, 0, False)
-        if bal_all.regime != "SCALE_BREAK":
+        if bal_all is None or bal_all.regime != "SCALE_BREAK":
             # Use preallocated GPU layers whenever KV exceeds 64 MiB or 2048 tokens (prevents torch.cat 2x spikes);
             # keep stock DynamicCache only for tiny prompts.
             if toks >= 2048 or total_prealloc_need >= 64 * _MIB:
@@ -212,16 +219,16 @@ def plan_kv_cache(
     # If only 1 layer needs offloading, 1 staging slot suffices (single-layer sync copy is ~4 ms).
     if (n_full - 1) * per_layer_need + per_layer_need <= int(safe_kv_vram * 0.95):
         bal_1 = _record_kv_bal(n_full - 1, 1, per_layer_need, True)
-        if bal_1.regime != "SCALE_BREAK":
+        if bal_1 is None or bal_1.regime != "SCALE_BREAK":
             return True, 1, True
 
     # For >=2 offloaded layers, prefer 2 staging slots (async double-buffer prefetch on prefetch_stream).
     staging_2 = int(2 * per_layer_need * 1.06)
     if staging_2 <= int(safe_kv_vram * 0.92):
         n_gpu = max(0, min(n_full - 2, (safe_kv_vram - staging_2) // max(1, per_layer_need)))
-        while n_gpu > 0:
+        while rssf_kv and n_gpu > 0:
             bal_h = _record_kv_bal(n_gpu, n_full - n_gpu, staging_2, False)
-            if bal_h.regime != "SCALE_BREAK":
+            if bal_h is None or bal_h.regime != "SCALE_BREAK":
                 break
             n_gpu -= 1
         _record_kv_bal(n_gpu, n_full - n_gpu, staging_2, False)
@@ -230,9 +237,9 @@ def plan_kv_cache(
     # Very tight VRAM (e.g. very long context or small 4-6 GB card): use 1 staging slot (lowest VRAM footprint).
     staging_1 = int(per_layer_need * 1.06)
     n_gpu = max(0, min(n_full - 1, max(0, safe_kv_vram - staging_1) // max(1, per_layer_need)))
-    while n_gpu > 0:
+    while rssf_kv and n_gpu > 0:
         bal_t = _record_kv_bal(n_gpu, n_full - n_gpu, staging_1, True)
-        if bal_t.regime != "SCALE_BREAK":
+        if bal_t is None or bal_t.regime != "SCALE_BREAK":
             break
         n_gpu -= 1
     _record_kv_bal(n_gpu, n_full - n_gpu, staging_1, True)
@@ -901,51 +908,54 @@ def _build_kv_classes():
                 to_promote = off_indices[:max_promote]
 
             # Scale-invariant 8-pair balance guard: ensure post-promotion decode VRAM stays out of SCALE_BREAK.
-            from src.rssf_dynamic_operators import observe_kv_placement_balance
+            from src.rssf_dynamic_operators import is_rssf_balance_enabled, observe_kv_placement_balance
 
-            cur_gpu = self.gpu_kv_layer_count
-            n_full = max(1, cur_gpu + len(off_indices))
-            tot_b = int(total_vram_bytes) if int(total_vram_bytes) > 0 else max(int(avail_vram_bytes), 1)
-            bal_dec = None
-            while to_promote:
-                rem_after = len(off_indices) - len(to_promote)
-                st_after = 0 if rem_after == 0 else sample_need * (1 if (rem_after == 1 or self._disable_prefetch) else 2)
-                bal_dec = observe_kv_placement_balance(
-                    n_gpu=cur_gpu + len(to_promote),
-                    n_full=n_full,
-                    kv_gpu_bytes=len(to_promote) * sample_need,
-                    staging_bytes=st_after,
-                    avail_vram_bytes=int(avail_vram_bytes),
-                    total_vram_bytes=tot_b,
-                    reserve_bytes=int(reserve_bytes),
-                    workspace_bytes=16 * _MIB,
-                    pcie_gb_s=pcie_gb_s,
-                    is_decode=True,
-                )
-                if bal_dec.regime != "SCALE_BREAK":
-                    break
-                to_promote.pop()
-            if bal_dec is None:
-                st_cur = sample_need * (1 if (len(off_indices) == 1 or self._disable_prefetch) else 2)
-                bal_dec = observe_kv_placement_balance(
-                    n_gpu=cur_gpu,
-                    n_full=n_full,
-                    kv_gpu_bytes=0,
-                    staging_bytes=st_cur,
-                    avail_vram_bytes=int(avail_vram_bytes),
-                    total_vram_bytes=tot_b,
-                    reserve_bytes=int(reserve_bytes),
-                    workspace_bytes=16 * _MIB,
-                    pcie_gb_s=pcie_gb_s,
-                    is_decode=True,
-                )
-            self.last_decode_kv_balance = {
-                **bal_dec.as_dict(),
-                "phase": "decode_transition",
-                "n_gpu": int(cur_gpu + len(to_promote)),
-                "n_off": int(len(off_indices) - len(to_promote)),
-                "promoted_planned": int(len(to_promote)),
-            }
+            if is_rssf_balance_enabled():
+                cur_gpu = self.gpu_kv_layer_count
+                n_full = max(1, cur_gpu + len(off_indices))
+                tot_b = int(total_vram_bytes) if int(total_vram_bytes) > 0 else max(int(avail_vram_bytes), 1)
+                bal_dec = None
+                while to_promote:
+                    rem_after = len(off_indices) - len(to_promote)
+                    st_after = 0 if rem_after == 0 else sample_need * (1 if (rem_after == 1 or self._disable_prefetch) else 2)
+                    bal_dec = observe_kv_placement_balance(
+                        n_gpu=cur_gpu + len(to_promote),
+                        n_full=n_full,
+                        kv_gpu_bytes=len(to_promote) * sample_need,
+                        staging_bytes=st_after,
+                        avail_vram_bytes=int(avail_vram_bytes),
+                        total_vram_bytes=tot_b,
+                        reserve_bytes=int(reserve_bytes),
+                        workspace_bytes=16 * _MIB,
+                        pcie_gb_s=pcie_gb_s,
+                        is_decode=True,
+                    )
+                    if bal_dec.regime != "SCALE_BREAK":
+                        break
+                    to_promote.pop()
+                if bal_dec is None:
+                    st_cur = sample_need * (1 if (len(off_indices) == 1 or self._disable_prefetch) else 2)
+                    bal_dec = observe_kv_placement_balance(
+                        n_gpu=cur_gpu,
+                        n_full=n_full,
+                        kv_gpu_bytes=0,
+                        staging_bytes=st_cur,
+                        avail_vram_bytes=int(avail_vram_bytes),
+                        total_vram_bytes=tot_b,
+                        reserve_bytes=int(reserve_bytes),
+                        workspace_bytes=16 * _MIB,
+                        pcie_gb_s=pcie_gb_s,
+                        is_decode=True,
+                    )
+                self.last_decode_kv_balance = {
+                    **bal_dec.as_dict(),
+                    "phase": "decode_transition",
+                    "n_gpu": int(cur_gpu + len(to_promote)),
+                    "n_off": int(len(off_indices) - len(to_promote)),
+                    "promoted_planned": int(len(to_promote)),
+                }
+            else:
+                self.last_decode_kv_balance = None
 
             promoted = 0
             for idx in to_promote:

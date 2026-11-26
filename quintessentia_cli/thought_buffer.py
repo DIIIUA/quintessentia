@@ -63,6 +63,7 @@ class CacheStateSnapshot:
     rec_states: dict[int, torch.Tensor] = field(default_factory=dict)
     layer_states: list[dict[str, Any]] = field(default_factory=list)
     append_only_kv: set[int] = field(default_factory=set)
+    fast_linear_layers: set[int] = field(default_factory=set)
     vram_bytes: int = 0
 
 
@@ -104,6 +105,29 @@ def capture_cache_snapshot(past_key_values: Any) -> CacheStateSnapshot:
             snap.append_only_kv.add(l_idx)
             snap.layer_states.append({"_quintessentia_pinned_seq_len": seq_len})
             continue
+        # Fast direct-clone path for Qwen3.5 / Mamba / LFM2 LinearAttentionLayer (avoids slow copy.deepcopy
+        # while keeping flat `vars(layer)` shape so RowwiseVerification.restore() works seamlessly too).
+        if hasattr(l_cache, "conv_states") and hasattr(l_cache, "recurrent_states") and not hasattr(l_cache, "keys"):
+            c_map = getattr(l_cache, "conv_states", None)
+            r_map = getattr(l_cache, "recurrent_states", None)
+            if isinstance(c_map, dict) and isinstance(r_map, dict):
+                c_clone = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in c_map.items()}
+                r_clone = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in r_map.items()}
+                state = {
+                    k: (dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list) else v)
+                    for k, v in vars(l_cache).items()
+                    if k not in ("conv_states", "recurrent_states")
+                }
+                state["conv_states"] = c_clone
+                state["recurrent_states"] = r_clone
+                snap.fast_linear_layers.add(l_idx)
+                snap.layer_states.append(state)
+                total_b += tensor_bytes(c_clone) + tensor_bytes(r_clone)
+                if c_clone.get(0) is not None:
+                    snap.conv_states[l_idx] = c_clone[0]
+                if r_clone.get(0) is not None:
+                    snap.rec_states[l_idx] = r_clone[0]
+                continue
         keys = getattr(l_cache, "keys", None)
         if keys is not None and keys.numel() > 0:
             snap.kv_lengths[l_idx] = int(keys.shape[-2])
@@ -142,6 +166,27 @@ def restore_cache_snapshot(past_key_values: Any, snap: CacheStateSnapshot) -> No
                 layer.crop(-(cur_len - target_len))
             else:
                 layer.offload()
+            continue
+        if l_idx in snap.fast_linear_layers:
+            layer = past_key_values.layers[l_idx]
+            for attr_name in ("conv_states", "recurrent_states"):
+                src_map = state[attr_name]
+                dst_map = getattr(layer, attr_name, None)
+                if isinstance(dst_map, dict):
+                    for k, v in src_map.items():
+                        cur = dst_map.get(k)
+                        if isinstance(v, torch.Tensor) and isinstance(cur, torch.Tensor) and cur.shape == v.shape and cur.dtype == v.dtype and cur.device == v.device:
+                            cur.copy_(v)
+                        else:
+                            dst_map[k] = v.clone() if isinstance(v, torch.Tensor) else v
+                    for extra_k in list(dst_map.keys()):
+                        if extra_k not in src_map:
+                            del dst_map[extra_k]
+                else:
+                    setattr(layer, attr_name, {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in src_map.items()})
+            for k, v in state.items():
+                if k not in ("conv_states", "recurrent_states"):
+                    setattr(layer, k, dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list) else v)
             continue
         memo = {}
         if l_idx in snap.append_only_kv:
@@ -614,21 +659,28 @@ class InitialProbabilityAnchor:
         tau_step = _tensor_tie(z_cand, y_cand)  # [M, 1], == 0 on orthogonal/opposite SPLIT -> zero force!
 
         # Pure-tensor zero-sync 8-pair force balance at thought/logit scale (I = tau_step, S = g_H, L = branch_tie)
-        from src.rssf_dynamic_operators import observe_thought_balance_tensor
+        from src.rssf_dynamic_operators import is_rssf_balance_enabled, observe_thought_balance_tensor
 
-        d3_m8, ie_m8, _br_m8 = observe_thought_balance_tensor(
-            tau_step=tau_step,
-            entropy=entropy,
-            g_h=g_h,
-            branch_tie=branch_tie_t,
-            step_index=step_index,
-        )
-        # Modulate cap_t smoothly by live 8-force balance (strictly zero-force when tau_step == 0!)
-        bal_scale = torch.where(
-            d3_m8 <= 0.0,
-            torch.full_like(d3_m8, 0.5),
-            (0.75 + 1.25 * ie_m8).clamp(0.5, 1.25),
-        )
+        if is_rssf_balance_enabled():
+            d3_m8, ie_m8, _br_m8 = observe_thought_balance_tensor(
+                tau_step=tau_step,
+                entropy=entropy,
+                g_h=g_h,
+                branch_tie=branch_tie_t,
+                step_index=step_index,
+            )
+            # Modulate cap_t smoothly by live 8-force balance (strictly zero-force when tau_step == 0!)
+            bal_scale = torch.where(
+                d3_m8 <= 0.0,
+                torch.full_like(d3_m8, 0.5),
+                (0.75 + 1.25 * ie_m8).clamp(0.5, 1.25),
+            )
+            self._mirror_rssf_steps += int(M)
+            self._mirror_rssf_scale_breaks = self._mirror_rssf_scale_breaks + (d3_m8.squeeze(-1) <= 0.0).sum().detach()
+            self._mirror_rssf_d3_sum = self._mirror_rssf_d3_sum + d3_m8.sum().detach()
+            self._mirror_rssf_ie_sum = self._mirror_rssf_ie_sum + ie_m8.sum().detach()
+        else:
+            bal_scale = 1.0
         # Dynamic mirror log-odds cap (replaces hardcoded max_log_odds_shift=0.125):
         # cap_t = g_H * tau_step * 0.5 * min(H, 1.0) * bal_scale
         cap_t = g_h * tau_step * (0.5 * entropy.clamp_max(1.0)) * bal_scale
@@ -646,10 +698,6 @@ class InitialProbabilityAnchor:
         self.telemetry.initial_rows_active += (delta.abs().sum(-1) > 0).sum().detach()
         self.telemetry.initial_logit_l1 += delta.abs().sum().detach()
         self._mirror_zero_force_steps += (tau_step.squeeze(-1) <= 0.0).sum().detach()
-        self._mirror_rssf_steps += int(M)
-        self._mirror_rssf_scale_breaks = self._mirror_rssf_scale_breaks + (d3_m8.squeeze(-1) <= 0.0).sum().detach()
-        self._mirror_rssf_d3_sum = self._mirror_rssf_d3_sum + d3_m8.sum().detach()
-        self._mirror_rssf_ie_sum = self._mirror_rssf_ie_sum + ie_m8.sum().detach()
 
         if self.phi0 is not None:
             chosen_phi = self.phi0.gather(0, new_top[:1])[0].detach()

@@ -37,7 +37,16 @@ $ShowFlagPath = Join-Path $CacheDir "show_window.flag"
 $created = $false
 $InstanceMutex = New-Object System.Threading.Mutex($true, "Local\QuintessentiaLiveHUD_v2", [ref]$created)
 if (-not $created) {
-    try { Set-Content -LiteralPath $ShowFlagPath -Value "1" -Encoding ASCII } catch {}
+    $wakeDirs = @(
+        $CacheDir,
+        (Join-Path (Join-Path $env:USERPROFILE ".quintessentia") "hud_cache"),
+        (Join-Path (Join-Path (Join-Path $env:USERPROFILE "Desktop") "Quintessentia HUD") ".cache")
+    )
+    foreach ($wd in $wakeDirs) {
+        if ($wd -and (Test-Path $wd)) {
+            try { Set-Content -LiteralPath (Join-Path $wd "show_window.flag") -Value "1" -Encoding ASCII } catch {}
+        }
+    }
     $InstanceMutex.Dispose()
     exit 0
 }
@@ -86,10 +95,17 @@ $HudJsonPath = Join-Path $CacheDir "quintessentia_hud.json"
 $ClearFlagPath = Join-Path $CacheDir "clear_history.flag"
 $CaptureFlagPath = Join-Path $CacheDir "capture_preview.flag"
 $StopFlagPath = Join-Path $CacheDir "stop_hud.flag"
+$OwnerAlivePath = Join-Path $CacheDir "console_owner_alive.flag"
 $UiPidPath = Join-Path $CacheDir "hud_ui.pid"
 $BackendScript = Join-Path $ScriptDir "hud_backend.py"
 try { Set-Content -LiteralPath $UiPidPath -Value "$PID" -Encoding ASCII } catch {}
 try { if (Test-Path $StopFlagPath) { Remove-Item -Force $StopFlagPath -ErrorAction SilentlyContinue } } catch {}
+try {
+    if (Test-Path $OwnerAlivePath) {
+        $ageOwn = ((Get-Date) - (Get-Item -LiteralPath $OwnerAlivePath).LastWriteTime).TotalSeconds
+        if ($ageOwn -gt 8.0) { Remove-Item -Force $OwnerAlivePath -ErrorAction SilentlyContinue }
+    }
+} catch {}
 
 # Resolve Python executable cleanly across any Windows installation
 function Resolve-PythonExe {
@@ -295,25 +311,28 @@ function Clamp-WindowToVirtualScreen([System.Windows.Window]$Win) {
 function Save-WindowState {
     try {
         if (-not $script:Config.window) {
-            $script:Config | Add-Member -NotePropertyName window -NotePropertyValue ([pscustomobject]@{ left = 0; top = 0; pin_mode = "float" }) -Force
+            $script:Config | Add-Member -NotePropertyName window -NotePropertyValue ([pscustomobject]@{ left = 0; top = 0; width = 660; height = 620; pin_mode = "float" }) -Force
         }
-        $script:Config.window.left = [int]$HudWin.Left
-        $script:Config.window.top = [int]$HudWin.Top
-        $script:Config.window.pin_mode = $script:PinMode
+        $script:Config.window | Add-Member -NotePropertyName left     -NotePropertyValue ([int][Math]::Round($HudWin.Left))   -Force
+        $script:Config.window | Add-Member -NotePropertyName top      -NotePropertyValue ([int][Math]::Round($HudWin.Top))    -Force
+        $script:Config.window | Add-Member -NotePropertyName width    -NotePropertyValue ([int][Math]::Round($HudWin.Width))  -Force
+        $script:Config.window | Add-Member -NotePropertyName height   -NotePropertyValue ([int][Math]::Round($HudWin.Height)) -Force
+        $script:Config.window | Add-Member -NotePropertyName pin_mode -NotePropertyValue $script:PinMode                      -Force
         Write-Utf8Json $ConfigPath $script:Config
     } catch {}
 }
 
 # ==============================================================================
-# XAML: QUINTESSENTIA LIVE HUD (660 x 580 — crisp, zero clipping, Win + WSL2)
+# XAML: QUINTESSENTIA LIVE HUD (Base 660 x 620 — uniform vector scaling on resize)
 # ==============================================================================
 [xml]$HudXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Quintessentia Live HUD"
-        Width="660" Height="580"
+        Width="660" Height="620"
+        MinWidth="440" MinHeight="414"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-        ResizeMode="NoResize" ShowInTaskbar="False">
+        ResizeMode="CanResize" ShowInTaskbar="False">
   <Window.Resources>
     <Style x:Key="PillBtn" TargetType="Button">
       <Setter Property="Background" Value="#2630363D"/>
@@ -361,19 +380,27 @@ function Save-WindowState {
       </Setter>
     </Style>
     <Style TargetType="ScrollBar">
-      <Setter Property="Width" Value="6"/>
-      <Setter Property="MinWidth" Value="6"/>
+      <Setter Property="Width" Value="8"/>
+      <Setter Property="MinWidth" Value="8"/>
       <Setter Property="Background" Value="Transparent"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ScrollBar">
-            <Grid Background="Transparent">
+            <Grid Background="#1438BDF8">
               <Track x:Name="PART_Track" IsDirectionReversed="True">
                 <Track.Thumb>
                   <Thumb>
                     <Thumb.Template>
                       <ControlTemplate TargetType="Thumb">
-                        <Border Background="#4438BDF8" CornerRadius="3" Margin="1,2"/>
+                        <Border x:Name="thumbBd" Background="#6638BDF8" CornerRadius="4" Margin="1,2"/>
+                        <ControlTemplate.Triggers>
+                          <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="thumbBd" Property="Background" Value="#BB38BDF8"/>
+                          </Trigger>
+                          <Trigger Property="IsDragging" Value="True">
+                            <Setter TargetName="thumbBd" Property="Background" Value="#FF38BDF8"/>
+                          </Trigger>
+                        </ControlTemplate.Triggers>
                       </ControlTemplate>
                     </Thumb.Template>
                   </Thumb>
@@ -386,11 +413,15 @@ function Save-WindowState {
     </Style>
   </Window.Resources>
 
-  <Border x:Name="OuterFrame" Margin="8" CornerRadius="14" Background="#EE0B1018" BorderBrush="#5538BDF8" BorderThickness="1">
-    <Border.Effect>
-      <DropShadowEffect Color="#000000" BlurRadius="14" ShadowDepth="3" Opacity="0.68"/>
-    </Border.Effect>
-    <Grid Margin="14,12,14,12">
+  <Grid>
+    <Border x:Name="OuterFrame" Margin="8" CornerRadius="14" Background="#EE0B1018" BorderBrush="#5538BDF8" BorderThickness="1">
+      <Border.Effect>
+        <DropShadowEffect Color="#000000" BlurRadius="14" ShadowDepth="3" Opacity="0.68"/>
+      </Border.Effect>
+      <Viewbox x:Name="HudViewbox" Stretch="Uniform" StretchDirection="Both"
+               TextOptions.TextFormattingMode="Ideal" RenderOptions.BitmapScalingMode="HighQuality">
+        <Grid Width="642" Height="602">
+          <Grid Margin="14,12,14,12">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
@@ -418,14 +449,14 @@ function Save-WindowState {
             <TextBlock x:Name="ClockTxt" Text="00:00:00" FontFamily="Consolas" FontSize="10" Foreground="#7DD3FC"/>
           </Border>
           <Border x:Name="EnvBadge" Background="#2234D399" CornerRadius="5" Padding="6,1" Margin="6,0,0,0" VerticalAlignment="Center">
-            <TextBlock x:Name="EnvTxt" Text="WIN native" FontFamily="Consolas" FontSize="10" Foreground="#6EE7B7"/>
+            <TextBlock x:Name="EnvTxt" Text="WINDOWS" FontFamily="Consolas" FontSize="10" Foreground="#6EE7B7"/>
           </Border>
           <Border x:Name="LanBadge" Background="#26A78BFA" CornerRadius="5" Padding="6,1" Margin="6,0,0,0" VerticalAlignment="Center" Visibility="Collapsed">
             <TextBlock x:Name="LanTxt" Text="LAN :8787" FontFamily="Consolas" FontSize="10" Foreground="#DDD6FE"/>
           </Border>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
-          <Button x:Name="BtnClear" Content="CLR" Style="{StaticResource PillBtn}" Margin="0,0,4,0" ToolTip="Reset live graphs and session peaks"/>
+          <Button x:Name="BtnClear" Content="CLR" Style="{StaticResource PillBtn}" Margin="0,0,4,0" ToolTip="Clear graphs, peaks, and output log history"/>
           <Button x:Name="BtnPin" Content="FLT" Style="{StaticResource PillBtn}" Margin="0,0,4,0" ToolTip="Toggle Float / Topmost / Desktop"/>
           <Button x:Name="BtnHide" Content="_" Style="{StaticResource PillBtn}" Margin="0,0,4,0" Padding="7,3" ToolTip="Minimize to system tray"/>
           <Button x:Name="BtnExit" Content="x" Style="{StaticResource CloseBtn}" Padding="7,3" ToolTip="Close Quintessentia HUD"/>
@@ -581,12 +612,12 @@ function Save-WindowState {
             </Grid>
           </Border>
 
-          <!-- Dual System Bars: WSL2 VM RAM (or Host CPU Load on Native Windows) + Host RAM -->
+          <!-- Dual System Bars: CPU Load (or WSL2 VM RAM on Linux/WSL) + System RAM -->
           <UniformGrid Rows="1" Columns="2">
             <StackPanel Margin="0,0,8,0">
               <Grid Margin="0,0,0,3">
-                <TextBlock x:Name="LeftSysLbl" Text="HOST CPU LOAD" FontFamily="Consolas" FontSize="9.5" Foreground="#8B949E"/>
-                <TextBlock x:Name="WslRamTxt" Text="0% (Windows)" FontFamily="Consolas" FontSize="9.5" Foreground="#A78BFA" HorizontalAlignment="Right"/>
+                <TextBlock x:Name="LeftSysLbl" Text="CPU LOAD" FontFamily="Consolas" FontSize="9.5" Foreground="#8B949E"/>
+                <TextBlock x:Name="WslRamTxt" Text="0%" FontFamily="Consolas" FontSize="9.5" Foreground="#A78BFA" HorizontalAlignment="Right"/>
               </Grid>
               <Grid Height="7">
                 <Border Background="#FF161F2E" CornerRadius="3"/>
@@ -595,7 +626,7 @@ function Save-WindowState {
             </StackPanel>
             <StackPanel Margin="8,0,0,0">
               <Grid Margin="0,0,0,3">
-                <TextBlock Text="HOST RAM" FontFamily="Consolas" FontSize="9.5" Foreground="#8B949E"/>
+                <TextBlock Text="SYSTEM RAM" FontFamily="Consolas" FontSize="9.5" Foreground="#8B949E"/>
                 <TextBlock x:Name="HostRamTxt" Text="0.0 / 0.0 GiB" FontFamily="Consolas" FontSize="9.5" Foreground="#94A3B8" HorizontalAlignment="Right"/>
               </Grid>
               <Grid Height="7">
@@ -607,8 +638,8 @@ function Save-WindowState {
         </StackPanel>
       </Border>
 
-      <!-- ROW 5: Live Output Stream -->
-      <Border Grid.Row="5" Background="#A80F1724" BorderBrush="#2658A6FF" BorderThickness="1" CornerRadius="10" Padding="10,7">
+      <!-- ROW 5: Live Output Stream (scrollable history until HUD closes or CLR clicked) -->
+      <Border x:Name="StreamBorder" Grid.Row="5" Background="#A80F1724" BorderBrush="#2658A6FF" BorderThickness="1" CornerRadius="10" Padding="10,7">
         <Grid>
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -616,23 +647,80 @@ function Save-WindowState {
           </Grid.RowDefinitions>
           <Grid Grid.Row="0" Margin="0,0,0,4">
             <TextBlock x:Name="StreamHeaderTxt" Text="LIVE OUTPUT STREAM" FontFamily="Consolas" FontWeight="Bold" FontSize="9.5" Foreground="#7DD3FC"/>
-            <TextBlock x:Name="StreamSubTxt" Text="double-click to copy" FontFamily="Consolas" FontSize="9" Foreground="#6E7681" HorizontalAlignment="Right"/>
+            <TextBlock x:Name="StreamSubTxt" Text="scroll · Ctrl+C / dbl-click copy" FontFamily="Consolas" FontSize="9" Foreground="#6E7681" HorizontalAlignment="Right"/>
           </Grid>
-          <ScrollViewer x:Name="StreamScroller" Grid.Row="1" VerticalScrollBarVisibility="Auto">
-            <TextBlock x:Name="StreamBodyTxt" Text="Waiting for Quintessentia generation..." FontFamily="Segoe UI" FontSize="11.5" Foreground="#E6EDF3" TextWrapping="Wrap"/>
-          </ScrollViewer>
+          <TextBox x:Name="StreamBodyTxt" Grid.Row="1"
+                   Text="Waiting for Quintessentia generation..."
+                   FontFamily="Segoe UI" FontSize="11.5" Foreground="#E6EDF3"
+                   Background="Transparent" BorderBrush="Transparent" BorderThickness="0"
+                   FocusVisualStyle="{x:Null}" CaretBrush="Transparent" SelectionBrush="#5538BDF8"
+                   IsReadOnly="True" IsReadOnlyCaretVisible="False"
+                   TextWrapping="Wrap" AcceptsReturn="True"
+                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                   Padding="0,0,4,0"/>
         </Grid>
       </Border>
-    </Grid>
-  </Border>
+          </Grid>
+        </Grid>
+      </Viewbox>
+    </Border>
+
+    <!-- Uniform-scale resize handles (all 4 edges + 4 corners; visible subtle grip in bottom-right corner) -->
+    <Thumb x:Name="ResizeRight"  HorizontalAlignment="Right"   VerticalAlignment="Stretch" Width="10" Margin="0,18,4,18" Cursor="SizeWE"   Opacity="0"/>
+    <Thumb x:Name="ResizeBottom" HorizontalAlignment="Stretch" VerticalAlignment="Bottom"  Height="10" Margin="18,0,18,4" Cursor="SizeNS"  Opacity="0"/>
+    <Thumb x:Name="ResizeLeft"   HorizontalAlignment="Left"    VerticalAlignment="Stretch" Width="10" Margin="4,18,0,18" Cursor="SizeWE"   Opacity="0"/>
+    <Thumb x:Name="ResizeTop"    HorizontalAlignment="Stretch" VerticalAlignment="Top"     Height="10" Margin="18,4,18,0" Cursor="SizeNS"  Opacity="0"/>
+    <Thumb x:Name="ResizeNW"     HorizontalAlignment="Left"    VerticalAlignment="Top"     Width="18" Height="18" Margin="4,4,0,0"  Cursor="SizeNWSE" Opacity="0"/>
+    <Thumb x:Name="ResizeNE"     HorizontalAlignment="Right"   VerticalAlignment="Top"     Width="18" Height="18" Margin="0,4,4,0"  Cursor="SizeNESW" Opacity="0"/>
+    <Thumb x:Name="ResizeSW"     HorizontalAlignment="Left"    VerticalAlignment="Bottom"  Width="18" Height="18" Margin="4,0,0,4"  Cursor="SizeNESW" Opacity="0"/>
+    <Thumb x:Name="ResizeSE"     HorizontalAlignment="Right"   VerticalAlignment="Bottom"  Width="20" Height="20" Margin="0,0,10,10" Cursor="SizeNWSE" ToolTip="Drag corner or edges to resize (uniform scale) · Ctrl+Wheel to zoom">
+      <Thumb.Template>
+        <ControlTemplate TargetType="Thumb">
+          <Canvas Width="20" Height="20" Background="Transparent">
+            <Line X1="16" Y1="6"  X2="6"  Y2="16" Stroke="#6638BDF8" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+            <Line X1="16" Y1="10" X2="10" Y2="16" Stroke="#9938BDF8" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+            <Line X1="16" Y1="14" X2="14" Y2="16" Stroke="#DD38BDF8" StrokeThickness="1.5" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+          </Canvas>
+        </ControlTemplate>
+      </Thumb.Template>
+    </Thumb>
+  </Grid>
 </Window>
 "@
 
 $HudReader = New-Object System.Xml.XmlNodeReader $HudXaml
 $HudWin = [Windows.Markup.XamlReader]::Load($HudReader)
 
+# Base uniform geometry (642x602 inner canvas + 18px outer frame margin/border = 660x620)
+$script:HudBaseW = 660.0
+$script:HudBaseH = 620.0
+$script:HudFramePad = 18.0
+$script:HudAspect = 602.0 / 642.0
+
+function Set-HudUniformWidth([double]$TargetW, [bool]$AnchorRight = $false, [bool]$AnchorBottom = $false, [bool]$SaveNow = $false) {
+    $wa = [System.Windows.SystemParameters]::WorkArea
+    $maxWByScreenW = [Math]::Max(460.0, $wa.Width - 16.0)
+    $maxWByScreenH = [Math]::Max(460.0, (($wa.Height - 16.0) - $script:HudFramePad) / $script:HudAspect + $script:HudFramePad)
+    $maxW = [Math]::Min(1800.0, [Math]::Min($maxWByScreenW, $maxWByScreenH))
+    $newW = [Math]::Round([Math]::Max(440.0, [Math]::Min($maxW, $TargetW)))
+    $newH = [Math]::Round($script:HudFramePad + ($newW - $script:HudFramePad) * $script:HudAspect)
+    $oldRight = $HudWin.Left + $HudWin.Width
+    $oldBottom = $HudWin.Top + $HudWin.Height
+    $HudWin.Width = $newW
+    $HudWin.Height = $newH
+    if ($AnchorRight)  { $HudWin.Left = $oldRight - $newW }
+    if ($AnchorBottom) { $HudWin.Top  = $oldBottom - $newH }
+    if ($SaveNow) {
+        Clamp-WindowToVirtualScreen $HudWin
+        Save-WindowState
+    }
+}
+
 $waInit = [System.Windows.SystemParameters]::WorkArea
-$initLeft = if ($script:Config.window -and $null -ne $script:Config.window.left) { [double]$script:Config.window.left } else { [Math]::Max($waInit.Left + 16, $waInit.Right - 680) }
+if ($script:Config.window -and $null -ne $script:Config.window.width -and [double]$script:Config.window.width -ge 440.0) {
+    Set-HudUniformWidth ([double]$script:Config.window.width) $false $false $false
+}
+$initLeft = if ($script:Config.window -and $null -ne $script:Config.window.left) { [double]$script:Config.window.left } else { [Math]::Max($waInit.Left + 16, $waInit.Right - $HudWin.Width - 20) }
 $initTop  = if ($script:Config.window -and $null -ne $script:Config.window.top)  { [double]$script:Config.window.top }  else { [Math]::Max($waInit.Top + 16, $waInit.Top + 48) }
 $HudWin.Left = $initLeft
 $HudWin.Top = $initTop
@@ -697,9 +785,9 @@ $WslRamFill = $HudWin.FindName("WslRamFill")
 $HostRamTxt = $HudWin.FindName("HostRamTxt")
 $HostRamFill = $HudWin.FindName("HostRamFill")
 
+$StreamBorder = $HudWin.FindName("StreamBorder")
 $StreamHeaderTxt = $HudWin.FindName("StreamHeaderTxt")
 $StreamSubTxt = $HudWin.FindName("StreamSubTxt")
-$StreamScroller = $HudWin.FindName("StreamScroller")
 $StreamBodyTxt = $HudWin.FindName("StreamBodyTxt")
 
 # ==============================================================================
@@ -838,11 +926,87 @@ function Close-HudCleanly {
     try { [System.Windows.Application]::Current.Shutdown() } catch {}
 }
 
+$ResizeRight  = $HudWin.FindName("ResizeRight")
+$ResizeBottom = $HudWin.FindName("ResizeBottom")
+$ResizeLeft   = $HudWin.FindName("ResizeLeft")
+$ResizeTop    = $HudWin.FindName("ResizeTop")
+$ResizeNW     = $HudWin.FindName("ResizeNW")
+$ResizeNE     = $HudWin.FindName("ResizeNE")
+$ResizeSW     = $HudWin.FindName("ResizeSW")
+$ResizeSE     = $HudWin.FindName("ResizeSE")
+$script:ResizeThumbs = @($ResizeRight, $ResizeBottom, $ResizeLeft, $ResizeTop, $ResizeNW, $ResizeNE, $ResizeSW, $ResizeSE)
+
+$ResizeRight.Add_DragDelta({  param($s,$e); Set-HudUniformWidth ($HudWin.Width + $e.HorizontalChange) $false $false $false })
+$ResizeBottom.Add_DragDelta({ param($s,$e); Set-HudUniformWidth ($HudWin.Width + ($e.VerticalChange / $script:HudAspect)) $false $false $false })
+$ResizeLeft.Add_DragDelta({   param($s,$e); Set-HudUniformWidth ($HudWin.Width - $e.HorizontalChange) $true $false $false })
+$ResizeTop.Add_DragDelta({    param($s,$e); Set-HudUniformWidth ($HudWin.Width - ($e.VerticalChange / $script:HudAspect)) $false $true $false })
+$ResizeSE.Add_DragDelta({
+    param($s,$e)
+    $d = if ([Math]::Abs($e.HorizontalChange) -ge [Math]::Abs($e.VerticalChange)) { $e.HorizontalChange } else { $e.VerticalChange / $script:HudAspect }
+    Set-HudUniformWidth ($HudWin.Width + $d) $false $false $false
+})
+$ResizeSW.Add_DragDelta({
+    param($s,$e)
+    $d = if ([Math]::Abs($e.HorizontalChange) -ge [Math]::Abs($e.VerticalChange)) { -$e.HorizontalChange } else { $e.VerticalChange / $script:HudAspect }
+    Set-HudUniformWidth ($HudWin.Width + $d) $true $false $false
+})
+$ResizeNE.Add_DragDelta({
+    param($s,$e)
+    $d = if ([Math]::Abs($e.HorizontalChange) -ge [Math]::Abs($e.VerticalChange)) { $e.HorizontalChange } else { -$e.VerticalChange / $script:HudAspect }
+    Set-HudUniformWidth ($HudWin.Width + $d) $false $true $false
+})
+$ResizeNW.Add_DragDelta({
+    param($s,$e)
+    $d = if ([Math]::Abs($e.HorizontalChange) -ge [Math]::Abs($e.VerticalChange)) { -$e.HorizontalChange } else { -$e.VerticalChange / $script:HudAspect }
+    Set-HudUniformWidth ($HudWin.Width + $d) $true $true $false
+})
+foreach ($th in $script:ResizeThumbs) {
+    $th.Add_DragCompleted({ Clamp-WindowToVirtualScreen $HudWin; Save-WindowState })
+}
+
+$HudWin.Add_PreviewMouseWheel({
+    param($s, $e)
+    if (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -ne 0) {
+        $factor = if ($e.Delta -gt 0) { 1.08 } else { 1.0 / 1.08 }
+        Set-HudUniformWidth ($HudWin.Width * $factor) $false $false $true
+        $e.Handled = $true
+    }
+})
+
 $HudWin.Add_MouseLeftButtonDown({
+    if ($StreamBorder -and $StreamBorder.IsMouseOver) { return }
+    foreach ($th in $script:ResizeThumbs) { if ($th -and $th.IsMouseOver) { return } }
     if ($_.ButtonState -eq [System.Windows.Input.MouseButtonState]::Pressed) {
         try { $HudWin.DragMove(); Clamp-WindowToVirtualScreen $HudWin; Save-WindowState } catch {}
     }
 })
+
+$StreamBorder.Add_PreviewMouseWheel({
+    param($s, $e)
+    if (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -ne 0) {
+        return
+    }
+    if ($e.Delta -gt 0) { $StreamBodyTxt.LineUp(); $StreamBodyTxt.LineUp(); $StreamBodyTxt.LineUp() }
+    elseif ($e.Delta -lt 0) { $StreamBodyTxt.LineDown(); $StreamBodyTxt.LineDown(); $StreamBodyTxt.LineDown() }
+    $e.Handled = $true
+})
+
+function Clear-HudAll {
+    try { Set-Content -LiteralPath $ClearFlagPath -Value "1" -Encoding ASCII } catch {}
+    $script:TargetToks = 0.0
+    $script:CurToks = 0.0
+    $script:StreamHistory.Clear()
+    $script:CurrentEntryKey = ""
+    $script:CurrentEntryHeader = ""
+    $script:CurrentEntryThinking = ""
+    $script:CurrentEntryAnswer = ""
+    $script:LastStreamPhase = ""
+    $script:LastStreamText = ""
+    $script:ClearedSig = $script:LastRawSig
+    $StreamBodyTxt.Text = "Cleared. Waiting for Quintessentia generation..."
+    try { $StreamBodyTxt.ScrollToHome() } catch {}
+    $StreamSubTxt.Text = "cleared · scroll / Ctrl+C"
+}
 
 $HudWin.Add_SourceInitialized({
     Apply-PinMode $HudWin $script:PinMode
@@ -858,23 +1022,17 @@ $BtnPin.Add_Click({
 
 $BtnHide.Add_Click({ $HudWin.Hide() })
 $BtnExit.Add_Click({ Close-HudCleanly })
-$BtnClear.Add_Click({
-    try { Set-Content -LiteralPath $ClearFlagPath -Value "1" -Encoding ASCII } catch {}
-    $script:TargetToks = 0.0
-    $script:CurToks = 0.0
-})
+$BtnClear.Add_Click({ Clear-HudAll })
 
-$StreamBodyTxt.Add_MouseLeftButtonDown({
+$StreamBodyTxt.Add_PreviewMouseDoubleClick({
     param($s, $e)
-    if ($e.ClickCount -eq 2) {
-        $e.Handled = $true
-        try {
-            if ($StreamBodyTxt.Text) {
-                [System.Windows.Clipboard]::SetText($StreamBodyTxt.Text)
-                $StreamSubTxt.Text = "copied!"
-            }
-        } catch {}
-    }
+    $e.Handled = $true
+    try {
+        if ($StreamBodyTxt.Text) {
+            [System.Windows.Clipboard]::SetText($StreamBodyTxt.Text)
+            $StreamSubTxt.Text = "copied all!"
+        }
+    } catch {}
 })
 
 # WPF ContextMenu on right-click anywhere on window
@@ -882,16 +1040,24 @@ $WinMenu = New-Object System.Windows.Controls.ContextMenu
 $wmTop = New-Object System.Windows.Controls.MenuItem; $wmTop.Header = "Pin: Always on Top"
 $wmFlt = New-Object System.Windows.Controls.MenuItem; $wmFlt.Header = "Pin: Floating Window"
 $wmDsk = New-Object System.Windows.Controls.MenuItem; $wmDsk.Header = "Pin: Desktop Wallpaper"
-$wmClr = New-Object System.Windows.Controls.MenuItem; $wmClr.Header = "Clear Graphs & Peaks"
+$wmClr = New-Object System.Windows.Controls.MenuItem; $wmClr.Header = "Clear Graphs & Output Log"
+$wmZ100 = New-Object System.Windows.Controls.MenuItem; $wmZ100.Header = "Scale: 100% (Default)"
+$wmZ125 = New-Object System.Windows.Controls.MenuItem; $wmZ125.Header = "Scale: 125%"
+$wmZ150 = New-Object System.Windows.Controls.MenuItem; $wmZ150.Header = "Scale: 150%"
+$wmZ175 = New-Object System.Windows.Controls.MenuItem; $wmZ175.Header = "Scale: 175%"
 $wmHid = New-Object System.Windows.Controls.MenuItem; $wmHid.Header = "Minimize to Tray"
 $wmExt = New-Object System.Windows.Controls.MenuItem; $wmExt.Header = "Exit Quintessentia HUD"
 $wmTop.Add_Click({ $script:PinMode = "topmost"; Apply-PinMode $HudWin "topmost"; $BtnPin.Content = "TOP"; Save-WindowState })
 $wmFlt.Add_Click({ $script:PinMode = "float";   Apply-PinMode $HudWin "float";   $BtnPin.Content = "FLT"; Save-WindowState })
 $wmDsk.Add_Click({ $script:PinMode = "desktop"; Apply-PinMode $HudWin "desktop"; $BtnPin.Content = "DESK"; Save-WindowState })
-$wmClr.Add_Click({ try { Set-Content -LiteralPath $ClearFlagPath -Value "1" -Encoding ASCII } catch {} })
+$wmClr.Add_Click({ Clear-HudAll })
+$wmZ100.Add_Click({ Set-HudUniformWidth ($script:HudBaseW * 1.00) $false $false $true })
+$wmZ125.Add_Click({ Set-HudUniformWidth ($script:HudBaseW * 1.25) $false $false $true })
+$wmZ150.Add_Click({ Set-HudUniformWidth ($script:HudBaseW * 1.50) $false $false $true })
+$wmZ175.Add_Click({ Set-HudUniformWidth ($script:HudBaseW * 1.75) $false $false $true })
 $wmHid.Add_Click({ $HudWin.Hide() })
 $wmExt.Add_Click({ Close-HudCleanly })
-foreach ($item in @($wmTop, $wmFlt, $wmDsk, (New-Object System.Windows.Controls.Separator), $wmClr, $wmHid, $wmExt)) {
+foreach ($item in @($wmTop, $wmFlt, $wmDsk, (New-Object System.Windows.Controls.Separator), $wmZ100, $wmZ125, $wmZ150, $wmZ175, (New-Object System.Windows.Controls.Separator), $wmClr, $wmHid, $wmExt)) {
     $WinMenu.Items.Add($item) | Out-Null
 }
 $OuterFrame.ContextMenu = $WinMenu
@@ -927,6 +1093,14 @@ function Capture-HudScreenshot {
 # ==============================================================================
 $script:LastHudTs = -1.0
 $script:LastStreamText = ""
+$script:LastRawSig = ""
+$script:ClearedSig = ""
+$script:StreamHistory = New-Object System.Collections.Generic.List[string]
+$script:CurrentEntryKey = ""
+$script:CurrentEntryHeader = ""
+$script:CurrentEntryThinking = ""
+$script:CurrentEntryAnswer = ""
+$script:LastStreamPhase = ""
 $script:AnimTick = 0
 $script:TargetVramW = 4.0; $script:CurVramW = 4.0
 $script:TargetWslW  = 3.0; $script:CurWslW  = 3.0
@@ -975,8 +1149,21 @@ $AnimTimer.Add_Tick({
 
     if (Test-Path $StopFlagPath) {
         try { Remove-Item -Force $StopFlagPath -ErrorAction SilentlyContinue } catch {}
+        try { if (Test-Path $OwnerAlivePath) { Remove-Item -Force $OwnerAlivePath -ErrorAction SilentlyContinue } } catch {}
         Close-HudCleanly
         return
+    }
+
+    # If HUD was launched from Quintessentia console, auto-close cleanly when console exits (even on [X] close)
+    if (Test-Path $OwnerAlivePath) {
+        try {
+            $ownAge = ((Get-Date) - (Get-Item -LiteralPath $OwnerAlivePath).LastWriteTime).TotalSeconds
+            if ($ownAge -gt 3.5) {
+                Remove-Item -Force $OwnerAlivePath -ErrorAction SilentlyContinue
+                Close-HudCleanly
+                return
+            }
+        } catch {}
     }
 
     if (Test-Path $ShowFlagPath) {
@@ -1043,11 +1230,11 @@ $AnimTimer.Add_Tick({
         $OuterFrame.BorderBrush = Get-FrozenBrush "#4438BDF8"
     }
 
-    # Environment badge: truthful Windows Native vs WSL2
+    # Environment badge: Windows version shows NO WSL2 labels; Linux/WSL2 runtime shows WSL2 badge
     $runEnv = [string]$r.env
-    $isWinNativeRun = ($runEnv -eq "Windows") -or (-not [bool]$s.wsl_running)
-    if ($isWinNativeRun) {
-        $EnvTxt.Text = "WIN native"
+    $isLinuxWslRun = ($runEnv -match "(?i)WSL|Linux") -and ([bool]$s.wsl_running)
+    if (-not $isLinuxWslRun) {
+        $EnvTxt.Text = "WINDOWS"
         $EnvBadge.Background = Get-FrozenBrush "#2634D399"; $EnvTxt.Foreground = Get-FrozenBrush "#6EE7B7"
     } else {
         $prio = [string]$s.wsl_priority
@@ -1259,8 +1446,8 @@ $AnimTimer.Add_Tick({
     $scPart = if ($scalesArr.Count -gt 0) { ($scalesArr -join $dotSep) } else { "M0..M8" }
     $BalanceRightTxt.Text = "$kvPart  |  $scPart"
 
-    # Left bottom bar: WSL2 VM RAM when WSL2 is active, else live Windows Host CPU Load!
-    if ([bool]$s.wsl_running) {
+    # Left bottom bar: WSL2 VM RAM only for Linux/WSL2 runs; pure CPU Load for Windows version (+ System RAM on right)
+    if ($isLinuxWslRun) {
         $LeftSysLbl.Text = "WSL2 VM RAM"
         $wslLim = if ([double]$s.wsl_ram_limit_gib -gt 0.1) { [double]$s.wsl_ram_limit_gib } else { 10.0 }
         $wslUsed = [double]$s.wsl_ram_used_gib
@@ -1268,10 +1455,10 @@ $AnimTimer.Add_Tick({
         $WslRamTxt.Text = Fmt "{0:F2} / {1:F1} GiB ({2})" @($wslUsed, $wslLim, [string]$s.wsl_priority)
         $script:TargetWslW = 290.0 * $wslRatio
     } else {
-        $LeftSysLbl.Text = "HOST CPU LOAD"
+        $LeftSysLbl.Text = "CPU LOAD"
         $cpuPct = [double]$s.cpu_pct
         $cpuRatio = [Math]::Min(1.0, [Math]::Max(0.0, $cpuPct / 100.0))
-        $WslRamTxt.Text = Fmt "{0:F0}% (Windows)" @($cpuPct)
+        $WslRamTxt.Text = Fmt "{0:F0}%" @($cpuPct)
         $script:TargetWslW = 290.0 * $cpuRatio
     }
 
@@ -1281,7 +1468,7 @@ $AnimTimer.Add_Tick({
     $HostRamTxt.Text = Fmt "{0:F1} / {1:F1} GiB ({2:F0}%)" @($hUsed, $hTot, ($hRatio * 100.0))
     $script:TargetHostW = 290.0 * $hRatio
 
-    # Live Output Stream
+    # Live Output Stream with persistent scrollable session history (kept until HUD closes or CLR clicked)
     $ans = [string]$r.answer_preview
     $thk = [string]$r.thinking_preview
     $pfDone = if ($null -ne $r.prefill_done) { [int]$r.prefill_done } else { 0 }
@@ -1292,12 +1479,79 @@ $AnimTimer.Add_Tick({
     } else {
         "Prefill prompt ($pfTot tokens)..."
     }
-    $body = if ($phase -eq "THINKING" -and $thk) { "[thinking] $thk" } elseif ($ans) { $ans } elseif ($phase -eq "PREFILL") { $pfMsg } else { "Waiting for Quintessentia generation..." }
-    if ($body -ne $script:LastStreamText) {
-        $script:LastStreamText = $body
-        $StreamBodyTxt.Text = $body
-        $StreamSubTxt.Text = "double-click to copy"
-        if ($isAct) { $StreamScroller.ScrollToEnd() }
+    $turnNum = if ($null -ne $r.turn) { [int]$r.turn } else { 0 }
+    $rawSig = "$($r.source)|$phase|$turnNum|$thk|$ans"
+    $script:LastRawSig = $rawSig
+
+    $skipCleared = ($script:ClearedSig -and ($rawSig -eq $script:ClearedSig))
+    if (-not $skipCleared) {
+        if ($script:ClearedSig) { $script:ClearedSig = "" }
+
+        if ($r.source -eq "live_json" -and ($ans -or $thk -or $phase -eq "PREFILL")) {
+            $turnKey = "$([string]$r.model)|$turnNum"
+            $ansRestarted = ($script:CurrentEntryAnswer.Length -gt 0 -and $ans.Length -gt 0 -and (-not $ans.StartsWith($script:CurrentEntryAnswer.Substring(0, [Math]::Min(24, $script:CurrentEntryAnswer.Length)))))
+            $thkRestarted = ($script:CurrentEntryThinking.Length -gt 0 -and $thk.Length -gt 0 -and $script:CurrentEntryAnswer.Length -eq 0 -and (-not $thk.StartsWith($script:CurrentEntryThinking.Substring(0, [Math]::Min(24, $script:CurrentEntryThinking.Length)))))
+            $phaseRestarted = (($script:LastStreamPhase -eq "DONE" -or $script:LastStreamPhase -eq "IDLE") -and ($phase -eq "PREFILL" -or $phase -eq "THINKING" -or $phase -eq "GENERATING"))
+            $isNewTurn = ($script:CurrentEntryKey -ne "" -and (($turnKey -ne $script:CurrentEntryKey) -or $ansRestarted -or $thkRestarted -or $phaseRestarted))
+
+            if ($isNewTurn) {
+                $prevParts = @()
+                if ($script:CurrentEntryThinking) { $prevParts += "[thinking] $($script:CurrentEntryThinking)" }
+                if ($script:CurrentEntryAnswer) { $prevParts += $script:CurrentEntryAnswer }
+                if ($prevParts.Count -gt 0) {
+                    $archived = "$($script:CurrentEntryHeader)`r`n$($prevParts -join "`r`n")"
+                    $script:StreamHistory.Add($archived) | Out-Null
+                    while ($script:StreamHistory.Count -gt 200) {
+                        $script:StreamHistory.RemoveAt(0)
+                    }
+                }
+                $script:CurrentEntryThinking = ""
+                $script:CurrentEntryAnswer = ""
+                $script:CurrentEntryHeader = ""
+            }
+
+            $script:CurrentEntryKey = $turnKey
+            if (-not $script:CurrentEntryHeader) {
+                $tsNow = [string]$hud.updated_at
+                $mShort = [string]$r.model
+                if ($mShort.Length -gt 32) { $mShort = $mShort.Substring(0, 32) }
+                $script:CurrentEntryHeader = "--- [$tsNow] $mShort $dotSep Turn #$turnNum ---"
+            }
+            if ($thk) { $script:CurrentEntryThinking = $thk }
+            if ($ans) { $script:CurrentEntryAnswer = $ans }
+            $script:LastStreamPhase = $phase
+
+            $curParts = @()
+            if ($script:CurrentEntryThinking) { $curParts += "[thinking] $($script:CurrentEntryThinking)" }
+            if ($script:CurrentEntryAnswer) { $curParts += $script:CurrentEntryAnswer }
+            elseif ($phase -eq "PREFILL") { $curParts += $pfMsg }
+
+            $allBlocks = New-Object System.Collections.Generic.List[string]
+            foreach ($hb in $script:StreamHistory) { $allBlocks.Add($hb) | Out-Null }
+            if ($curParts.Count -gt 0) {
+                $allBlocks.Add("$($script:CurrentEntryHeader)`r`n$($curParts -join "`r`n")") | Out-Null
+            }
+            $body = if ($allBlocks.Count -gt 0) { $allBlocks -join "`r`n`r`n" } else { $pfMsg }
+        } elseif ($script:StreamHistory.Count -gt 0 -or $script:CurrentEntryAnswer -or $script:CurrentEntryThinking) {
+            # Keep accumulated session history visible even after model goes IDLE or standby!
+            $body = $script:LastStreamText
+        } else {
+            $body = if ($ans) { $ans } else { "Waiting for Quintessentia generation..." }
+        }
+
+        if ($body -and $body -ne $script:LastStreamText) {
+            $wasAtBottom = ($StreamBodyTxt.ExtentHeight -le ($StreamBodyTxt.ViewportHeight + 6.0)) -or (($StreamBodyTxt.VerticalOffset + $StreamBodyTxt.ViewportHeight) -ge ($StreamBodyTxt.ExtentHeight - 28.0))
+            $savedOff = $StreamBodyTxt.VerticalOffset
+            $script:LastStreamText = $body
+            $StreamBodyTxt.Text = $body
+            $histCnt = $script:StreamHistory.Count + $(if ($script:CurrentEntryHeader) { 1 } else { 0 })
+            $StreamSubTxt.Text = if ($histCnt -gt 0) { "history: $histCnt $dotSep scroll / Ctrl+C" } else { "scroll $dotSep Ctrl+C / dbl-click copy" }
+            if ($wasAtBottom) {
+                $StreamBodyTxt.ScrollToEnd()
+            } else {
+                $StreamBodyTxt.ScrollToVerticalOffset($savedOff)
+            }
+        }
     }
     $StreamHeaderTxt.Text = if ($r.source -eq "live_json") { "LIVE OUTPUT STREAM  $dotSep  $phase" } else { "QUINTESSENTIA STREAM  $dotSep  STANDBY" }
 })
@@ -1317,7 +1571,11 @@ $miPinTop = $Menu.Items.Add("Pin: Always on Top")
 $miPinFlt = $Menu.Items.Add("Pin: Floating Window")
 $miPinDsk = $Menu.Items.Add("Pin: Desktop Wallpaper")
 $Menu.Items.Add("-") | Out-Null
-$miClear = $Menu.Items.Add("Clear Graphs & Peaks")
+$miZ100 = $Menu.Items.Add("Scale: 100% (Default)")
+$miZ125 = $Menu.Items.Add("Scale: 125%")
+$miZ150 = $Menu.Items.Add("Scale: 150%")
+$Menu.Items.Add("-") | Out-Null
+$miClear = $Menu.Items.Add("Clear Graphs & Output Log")
 $miExit  = $Menu.Items.Add("Exit Quintessentia HUD")
 
 $miToggle.Add_Click({
@@ -1326,7 +1584,10 @@ $miToggle.Add_Click({
 $miPinTop.Add_Click({ $script:PinMode = "topmost"; Apply-PinMode $HudWin "topmost"; $BtnPin.Content = "TOP"; Save-WindowState })
 $miPinFlt.Add_Click({ $script:PinMode = "float";   Apply-PinMode $HudWin "float";   $BtnPin.Content = "FLT"; Save-WindowState })
 $miPinDsk.Add_Click({ $script:PinMode = "desktop"; Apply-PinMode $HudWin "desktop"; $BtnPin.Content = "DESK"; Save-WindowState })
-$miClear.Add_Click({ try { Set-Content -LiteralPath $ClearFlagPath -Value "1" -Encoding ASCII } catch {} })
+$miZ100.Add_Click({ Set-HudUniformWidth ($script:HudBaseW * 1.00) $false $false $true })
+$miZ125.Add_Click({ Set-HudUniformWidth ($script:HudBaseW * 1.25) $false $false $true })
+$miZ150.Add_Click({ Set-HudUniformWidth ($script:HudBaseW * 1.50) $false $false $true })
+$miClear.Add_Click({ Clear-HudAll })
 $miExit.Add_Click({ Close-HudCleanly })
 
 $Tray.ContextMenuStrip = $Menu

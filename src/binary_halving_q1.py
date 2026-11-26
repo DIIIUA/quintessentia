@@ -1374,9 +1374,7 @@ class IncrementalCubeCarver:
         mirror_tol: float = 0.045,
         balance_out: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], BinaryHalvingTreeMeta, int, float]:
-        """Pure-math M0 Mirror Equality trunk carver + 8-pair Q1-cube force balance."""
-        from src.rssf_dynamic_operators import observe_q1_cube_balance
-
+        """Pure-math M0 Mirror Equality trunk carver (dead M0 SCALE_BREAK branch removed after audit)."""
         target_max = max(1, min(self.root_bits, int(max_cubes)))
         target_min = max(1, min(target_max, int(min_cubes)))
         ref_n = (
@@ -1386,9 +1384,6 @@ class IncrementalCubeCarver:
         ) + 1e-8
         rem_rel = 1.0
         prev_rem_rel: Optional[float] = None
-        last_q1_bal = None
-        scale_break_protected = False
-        info_exhausted_stop = False
 
         while len(self._carved_lo) < target_max:
             p = len(self._carved_lo)
@@ -1404,7 +1399,7 @@ class IncrementalCubeCarver:
             self._carved_sc.append(scale_bf16)
             self._carved_paths.append(path)
 
-            if (p + 1) >= target_min and (mirror_tol > 0.0 or (p + 1) == target_max):
+            if (p + 1) >= target_min and mirror_tol > 0.0:
                 n_rem, n_step = torch.stack(
                     [self._rem.pow(2).sum().sqrt(), step_t.pow(2).sum().sqrt()]
                 ).tolist()
@@ -1415,14 +1410,6 @@ class IncrementalCubeCarver:
                     if prev_rem_rel is not None
                     else 1.0
                 )
-                q1_bal = observe_q1_cube_balance(
-                    info_density=max(0.01, min(1.0, step_rel)),
-                    weight_mass_frac=float(p + 1) / float(max(1, target_max)),
-                    input_impulse=max(0.02, rem_rel),
-                    residual_entropy=max(0.02, rem_rel * (1.0 + max(0.0, 1.0 - rel_gain))),
-                    output_coherence=max(0.05, 1.0 - min(0.95, rem_rel)),
-                )
-                last_q1_bal = q1_bal
                 exact_converged = (rem_rel <= mirror_tol and step_rel <= mirror_tol)
                 plateau_converged = (
                     prev_rem_rel is not None
@@ -1430,22 +1417,11 @@ class IncrementalCubeCarver:
                     and rel_gain <= 0.12
                 )
                 prev_rem_rel = rem_rel
-                if plateau_converged and q1_bal.regime == "SCALE_BREAK":
-                    scale_break_protected = True
-                    plateau_converged = False
-                if mirror_tol > 0.0 and (
-                    exact_converged
-                    or (plateau_converged and q1_bal.d3_margin > 0.0 and q1_bal.info_efficiency < 0.25)
-                ):
-                    if not exact_converged:
-                        info_exhausted_stop = True
+                if exact_converged or plateau_converged:
                     break
 
         k_opt = len(self._carved_lo)
-        if balance_out is not None and last_q1_bal is not None:
-            balance_out.update(last_q1_bal.as_dict())
-            balance_out["scale_break_protected"] = scale_break_protected
-            balance_out["info_exhausted_stop"] = info_exhausted_stop
+        if balance_out is not None:
             balance_out["k_opt"] = k_opt
             balance_out["rem_rel"] = round(rem_rel, 5)
         tensors = {
@@ -1501,7 +1477,6 @@ def carve_trunk_mirror_q1(
         and int(root_bits) in (2, 4, 8, 16)
     ):
         from src.pure_mirror_agents_nvrtc import launch_pure_mirror_carve_q1_ballot
-        from src.rssf_dynamic_operators import observe_q1_cube_balance
 
         dev = weight.device
         n, k = int(weight.shape[0]), int(weight.shape[1])
@@ -1535,28 +1510,17 @@ def carve_trunk_mirror_q1(
         k_opt = target_max
         rem_rel = 1.0
         prev_rem_rel: Optional[float] = None
-        last_q1_bal = None
-        scale_break_protected = False
-        info_exhausted_stop = False
         for p in range(target_max):
             n_rem = math.sqrt(max(0.0, float(vals[2 + p])))
             n_step = 8.0 * float(2.0 ** (-p)) * qs_norm
             rem_rel = n_rem / ref_n
             step_rel = n_step / ref_n
-            if (p + 1) >= target_min and (mirror_tol > 0.0 or (p + 1) == target_max):
+            if (p + 1) >= target_min and mirror_tol > 0.0:
                 rel_gain = (
                     max(0.0, prev_rem_rel - rem_rel) / (prev_rem_rel + 1e-12)
                     if prev_rem_rel is not None
                     else 1.0
                 )
-                q1_bal = observe_q1_cube_balance(
-                    info_density=max(0.01, min(1.0, step_rel)),
-                    weight_mass_frac=float(p + 1) / float(max(1, target_max)),
-                    input_impulse=max(0.02, rem_rel),
-                    residual_entropy=max(0.02, rem_rel * (1.0 + max(0.0, 1.0 - rel_gain))),
-                    output_coherence=max(0.05, 1.0 - min(0.95, rem_rel)),
-                )
-                last_q1_bal = q1_bal
                 exact_converged = (rem_rel <= mirror_tol and step_rel <= mirror_tol)
                 plateau_converged = (
                     prev_rem_rel is not None
@@ -1564,22 +1528,11 @@ def carve_trunk_mirror_q1(
                     and rel_gain <= 0.12
                 )
                 prev_rem_rel = rem_rel
-                if plateau_converged and q1_bal.regime == "SCALE_BREAK":
-                    scale_break_protected = True
-                    plateau_converged = False
-                if mirror_tol > 0.0 and (
-                    exact_converged
-                    or (plateau_converged and q1_bal.d3_margin > 0.0 and q1_bal.info_efficiency < 0.25)
-                ):
+                if exact_converged or plateau_converged:
                     k_opt = p + 1
-                    if not exact_converged:
-                        info_exhausted_stop = True
                     break
 
-        if balance_out is not None and last_q1_bal is not None:
-            balance_out.update(last_q1_bal.as_dict())
-            balance_out["scale_break_protected"] = scale_break_protected
-            balance_out["info_exhausted_stop"] = info_exhausted_stop
+        if balance_out is not None:
             balance_out["k_opt"] = k_opt
             balance_out["rem_rel"] = round(rem_rel, 5)
 

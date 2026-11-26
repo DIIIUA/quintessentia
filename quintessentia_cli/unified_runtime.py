@@ -340,6 +340,14 @@ class HybridSpecSnapshotManager:
         )
         self.active_capture = False
         self.rollbacks = 0
+        self._captured_row0_count = 0
+
+    def begin_capture(self) -> None:
+        self._captured_row0_count = 0
+        self.active_capture = True
+
+    def end_capture(self) -> None:
+        self.active_capture = False
 
     def save_row(self, layer_idx: int, row_r: int, conv_state: torch.Tensor, rec_state: torch.Tensor) -> None:
         if not self.active_capture or row_r >= self.max_slots:
@@ -348,11 +356,17 @@ class HybridSpecSnapshotManager:
         c_len = conv_state.shape[-1]
         self.snap_conv[lin_i, row_r, :, :, :c_len].copy_(conv_state)
         self.snap_rec[lin_i, row_r].copy_(rec_state)
+        if row_r == 0:
+            self._captured_row0_count += 1
 
-    def rollback_to_accepted(self, past_key_values: Any, accepted_drafts: int, total_drafts: int) -> None:
+    def rollback_to_accepted(self, past_key_values: Any, accepted_drafts: int, total_drafts: int) -> bool:
         rejected = total_drafts - accepted_drafts
         if rejected <= 0:
-            return
+            return True
+        if accepted_drafts < 0 or accepted_drafts >= self.max_slots:
+            return False
+        if self._captured_row0_count < len(self.linear_layers):
+            return False
         for l_idx in self.linear_layers:
             lin_i = self.layer_to_lin_slot[l_idx]
             cs = past_key_values.get_conv_state(l_idx, state_idx=0)
@@ -361,8 +375,10 @@ class HybridSpecSnapshotManager:
             cs.copy_(self.snap_conv[lin_i, accepted_drafts, :, :, :c_len])
             rs.copy_(self.snap_rec[lin_i, accepted_drafts])
         for l_idx in self.full_layers:
-            past_key_values.layers[l_idx].crop(-rejected)
+            if l_idx < len(past_key_values.layers):
+                past_key_values.layers[l_idx].crop(-rejected)
         self.rollbacks += 1
+        return True
 
 
 _DECODE_NO_MASK = {"full_attention": None, "linear_attention": None}
@@ -771,6 +787,211 @@ def install_quintessentia_multirow_unifications(
             engine.model.lm_head = raw_q4_head
 
     return captured
+
+
+def fused_deltanet_q1_multirow(
+    gk: Any,
+    lat_mod: Any,
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    snap_mgr: HybridSpecSnapshotManager | None = None,
+) -> torch.Tensor:
+    """Fused CUDA causal_conv1d + gated_delta_recurrent + RMSNormGated over Q1-Cubes (or BF16) projections."""
+    B, S, _ = hidden_states.shape
+    assert B == 1 and 1 <= S <= 4
+    qkv = lat_mod.in_proj_qkv(hidden_states).reshape(S, 8192).contiguous()
+    z = lat_mod.in_proj_z(hidden_states).reshape(S, 4096).contiguous()
+    b = lat_mod.in_proj_b(hidden_states).reshape(S, 32).contiguous()
+    a = lat_mod.in_proj_a(hidden_states).reshape(S, 32).contiguous()
+
+    buf = getattr(gk, "_q1_dn_argbuf", None)
+    if buf is None:
+        c_rqkv = ctypes.c_uint64(0)
+        c_st = ctypes.c_uint64(0)
+        c_w = ctypes.c_uint64(0)
+        c_rqkvc = ctypes.c_uint64(0)
+        c_slen = ctypes.c_int(0)
+        c_rz = ctypes.c_uint64(0)
+        c_rb = ctypes.c_uint64(0)
+        c_ra = ctypes.c_uint64(0)
+        c_alog = ctypes.c_uint64(0)
+        c_dtb = ctypes.c_uint64(0)
+        c_nw = ctypes.c_uint64(0)
+        c_rec = ctypes.c_uint64(0)
+        c_rcore = ctypes.c_uint64(0)
+        c_abf = ctypes.c_int(0)
+        c_dbf = ctypes.c_int(0)
+        c_stream = ctypes.c_void_p(0)
+        p_conv = (ctypes.c_void_p * 5)(
+            ctypes.addressof(c_rqkv), ctypes.addressof(c_st), ctypes.addressof(c_w),
+            ctypes.addressof(c_rqkvc), ctypes.addressof(c_slen),
+        )
+        p_rec = (ctypes.c_void_p * 11)(
+            ctypes.addressof(c_rqkvc), ctypes.addressof(c_rz), ctypes.addressof(c_rb),
+            ctypes.addressof(c_ra), ctypes.addressof(c_alog), ctypes.addressof(c_dtb),
+            ctypes.addressof(c_nw), ctypes.addressof(c_rec), ctypes.addressof(c_rcore),
+            ctypes.addressof(c_abf), ctypes.addressof(c_dbf),
+        )
+        buf = (
+            c_rqkv, c_st, c_w, c_rqkvc, c_slen, c_rz, c_rb, c_ra,
+            c_alog, c_dtb, c_nw, c_rec, c_rcore, c_abf, c_dbf, c_stream,
+            p_conv, p_rec, gk.fns[b"fused_causal_conv1d_silu_batched"], gk.fns[b"fused_gated_delta_recurrent_batched"],
+        )
+        gk._q1_dn_argbuf = buf
+    (
+        c_rqkv, c_st, c_w, c_rqkvc, c_slen, c_rz, c_rb, c_ra,
+        c_alog, c_dtb, c_nw, c_rec, c_rcore, c_abf, c_dbf, c_stream,
+        p_conv, p_rec, fn_conv, fn_rec,
+    ) = buf
+
+    w2d = lat_mod.conv1d.weight.squeeze(1)
+    if not w2d.is_contiguous():
+        w2d = w2d.contiguous()
+    c_stream.value = torch.cuda.current_stream(gk.device).cuda_stream
+    c_st.value = conv_state.data_ptr()
+    c_w.value = w2d.data_ptr()
+    c_slen.value = int(conv_state.shape[-1])
+    c_alog.value = lat_mod.A_log.data_ptr()
+    c_dtb.value = lat_mod.dt_bias.data_ptr()
+    c_nw.value = lat_mod.norm.weight.data_ptr()
+    c_rec.value = recurrent_state.data_ptr()
+    c_abf.value = 1 if lat_mod.A_log.dtype == torch.bfloat16 else 0
+    c_dbf.value = 1 if lat_mod.dt_bias.dtype == torch.bfloat16 else 0
+
+    qkv_base = qkv.data_ptr()
+    qkvc_base = gk.ws_qkv_conv.data_ptr()
+    z_base = z.data_ptr()
+    b_base = b.data_ptr()
+    a_base = a.data_ptr()
+    core_base = gk.ws_core.data_ptr()
+    launch = gk.nvcuda.cuLaunchKernel
+
+    for r in range(S):
+        c_rqkv.value = qkv_base + r * (8192 * 2)
+        c_rqkvc.value = qkvc_base + r * (8192 * 2)
+        c_rz.value = z_base + r * (4096 * 2)
+        c_rb.value = b_base + r * (32 * 2)
+        c_ra.value = a_base + r * (32 * 2)
+        c_rcore.value = core_base + r * (4096 * 2)
+
+        rc1 = launch(fn_conv, 32, 1, 1, 256, 1, 1, 0, c_stream, p_conv, None)
+        if rc1 != 0:
+            raise RuntimeError(f"q1_deltanet conv row {r} failed: {rc1}")
+
+        rc2 = launch(fn_rec, 32, 1, 1, 128, 1, 1, 0, c_stream, p_rec, None)
+        if rc2 != 0:
+            raise RuntimeError(f"q1_deltanet delta row {r} failed: {rc2}")
+
+        if snap_mgr is not None and r < S - 1:
+            snap_mgr.save_row(lat_mod.layer_idx, r, conv_state, recurrent_state)
+
+    return lat_mod.out_proj(gk.ws_core[:S].view(1, S, 4096))
+
+
+def install_q1_qwen35_fast_decode_unifications(
+    engine: Any,
+    *,
+    max_drafts: int = 0,
+    full_residency: bool = False,
+) -> HybridSpecSnapshotManager | None:
+    """Attach fused Qwen3.5 RMSNorm + GatedDeltaNet CUDA kernels and zero-replay snapshot slots to Q1-Cubes."""
+    cfg = getattr(engine, "config", None)
+    dev = getattr(engine, "device", None)
+    if (
+        cfg is None
+        or dev is None
+        or torch.device(dev).type != "cuda"
+        or not torch.cuda.is_available()
+        or getattr(cfg, "model_type", None) != "qwen3_5_text"
+        or int(getattr(cfg, "hidden_size", 0)) != 4096
+        or int(getattr(cfg, "linear_num_key_heads", 0)) != 16
+        or int(getattr(cfg, "linear_num_value_heads", 0)) != 32
+        or int(getattr(cfg, "linear_key_head_dim", 0)) != 128
+        or int(getattr(cfg, "linear_value_head_dim", 0)) != 128
+        or int(getattr(cfg, "linear_conv_kernel_dim", 0)) != 4
+    ):
+        return None
+    if getattr(engine, "_q1_qwen35_fast_installed", False):
+        return getattr(engine, "_q1_snap_mgr", None)
+
+    from .kernels import GrandUnifiedKernels
+
+    gk = getattr(engine, "_q1_gk", None)
+    if gk is None:
+        gk = GrandUnifiedKernels(torch.device(dev), max_batch=8)
+        engine._q1_gk = gk
+    snap_mgr: HybridSpecSnapshotManager | None = None
+    if full_residency and max_drafts > 0:
+        try:
+            free_b, _ = torch.cuda.mem_get_info(dev)
+            slots = min(3, max(1, int(max_drafts)))
+            # 24 layers * (64 KiB + 2 MiB) * slots ~= 50 MiB * slots
+            need_b = slots * 54 * MiB
+            if free_b >= need_b + 384 * MiB:
+                snap_mgr = HybridSpecSnapshotManager(cfg, torch.device(dev), max_drafts=slots)
+        except Exception:
+            snap_mgr = None
+
+    for mod in engine.model.modules():
+        if type(mod).__name__ == "Qwen3_5RMSNorm":
+            eps_val = float(mod.eps)
+
+            def make_rn_fwd(e_v):
+                def _rnf(self, x):
+                    if x.is_cuda and x.dtype == torch.bfloat16 and self.weight.dtype == torch.bfloat16:
+                        return gk.rmsnorm_zero_centered(x, self.weight, e_v)
+                    out = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + e_v)
+                    return (out * (1.0 + self.weight.float())).type_as(x)
+
+                return _rnf
+
+            mod.forward = types.MethodType(make_rn_fwd(eps_val), mod)
+
+    for layer in engine._decoder_layers():
+        lat = getattr(layer, "linear_attn", None)
+        if lat is None:
+            continue
+        orig_lat_fwd = lat.forward
+
+        def make_q1_lat_fwd(orig_lf):
+            def _q1_lfwd(self, hidden_states, cache=None, attention_mask=None, **kw):
+                c_obj = cache if cache is not None else kw.get("cache_params")
+                B, S, _ = hidden_states.shape
+                if (
+                    hidden_states.is_cuda
+                    and hidden_states.dtype == torch.bfloat16
+                    and B == 1
+                    and 1 <= S <= 4
+                    and attention_mask is None
+                    and c_obj is not None
+                    and getattr(self.conv1d, "bias", None) is None
+                    and not c_obj.is_recording_past(self.layer_idx)
+                ):
+                    cs = c_obj.get_conv_state(self.layer_idx, state_idx=0)
+                    rs = c_obj.get_recurrent_state(self.layer_idx, state_idx=0)
+                    if (
+                        cs is not None
+                        and rs is not None
+                        and cs.is_contiguous()
+                        and rs.is_contiguous()
+                        and cs.shape == (1, 8192, 4)
+                        and rs.shape == (1, 32, 128, 128)
+                        and cs.dtype == torch.bfloat16
+                        and rs.dtype == torch.float32
+                    ):
+                        return fused_deltanet_q1_multirow(gk, self, hidden_states, cs, rs, snap_mgr=snap_mgr)
+                if cache is not None:
+                    return orig_lf(hidden_states, cache=cache, attention_mask=attention_mask, **kw)
+                return orig_lf(hidden_states, attention_mask=attention_mask, **kw)
+
+            return _q1_lfwd
+
+        lat.forward = types.MethodType(make_q1_lat_fwd(orig_lat_fwd), lat)
+
+    engine._q1_snap_mgr = snap_mgr
+    engine._q1_qwen35_fast_installed = True
+    return snap_mgr
 
 
 class QuintessentiaNativeMTPHead:
@@ -1358,13 +1579,66 @@ class QuintessentiaKVPrefixSession:
         self.parked_bytes = total_bytes
         return self.park_ms
 
-    def kv_prefix_reuse(self, new_prompt_ids: list[int]) -> int:
+    def can_truncate_parked_prefix(self) -> bool:
+        """True iff parked KV layers are pure full-attention tensors that can be truncated to an earlier prefix.
+
+        Recurrent layers (`linear_states`, e.g. GatedDeltaNet/Mamba), sliding-window caches
+        (`cumulative_length`), and bridged MTP caches cannot be rewound cleanly without full replay.
+        """
+        if self.tainted or self.parked_backbone is None or self.parked_mtp is not None:
+            return False
+        if not self.parked_backbone:
+            return False
+        for entry in self.parked_backbone.values():
+            if entry.get("linear_states") or ("cumulative_length" in entry):
+                return False
+        return True
+
+    def truncate_parked_prefix(self, new_len: int) -> bool:
+        """Trim parked pure-attention KV tensors in-place to `new_len` tokens."""
+        n = int(new_len)
+        if not self.can_truncate_parked_prefix() or n <= 0 or n > len(self.fed):
+            return False
+        if n == len(self.fed):
+            self.unfed_tail = []
+            return True
+        total_bytes = 0
+        assert self.parked_backbone is not None
+        for entry in self.parked_backbone.values():
+            if "keys" in entry and "values" in entry:
+                is_bshd = entry.get("layout") == "bshd"
+                k_t = entry["keys"]
+                v_t = entry["values"]
+                seq_dim = 1 if is_bshd else 2
+                if k_t.shape[seq_dim] < n or v_t.shape[seq_dim] < n:
+                    return False
+                if is_bshd:
+                    entry["keys"] = k_t[:, :n, :, :].contiguous()
+                    entry["values"] = v_t[:, :n, :, :].contiguous()
+                else:
+                    entry["keys"] = k_t[:, :, :n, :].contiguous()
+                    entry["values"] = v_t[:, :, :n, :].contiguous()
+                total_bytes += entry["keys"].nbytes + entry["values"].nbytes
+        self.fed = list(self.fed[:n])
+        self.unfed_tail = []
+        self.parked_bytes = total_bytes
+        return True
+
+    def kv_prefix_reuse(self, new_prompt_ids: list[int], *, allow_truncate: bool = True) -> int:
         L = len(self.fed)
-        if self.tainted or L <= 0 or L >= len(new_prompt_ids) or self.parked_backbone is None:
+        if self.tainted or L <= 0 or self.parked_backbone is None:
             return 0
-        if new_prompt_ids[:L] != self.fed:
-            return 0
-        return L
+        if L < len(new_prompt_ids) and new_prompt_ids[:L] == self.fed:
+            return L
+        if allow_truncate and self.can_truncate_parked_prefix():
+            # Find exact longest common token prefix, keeping >= 1 new token for prefill
+            limit = min(L, len(new_prompt_ids) - 1)
+            common = 0
+            while common < limit and new_prompt_ids[common] == self.fed[common]:
+                common += 1
+            if common > 0 and self.truncate_parked_prefix(common):
+                return common
+        return 0
 
     def unpark_to_gpu(
         self,
@@ -1931,6 +2205,8 @@ def plan_for_checkpoint(
     q1_planes: int | None = None,
     auto_fit_q1_planes: bool = False,
     min_q1_planes: int = 3,
+    max_q1_planes: int = 8,
+    lm_head_planes: int | None = None,
 ) -> tuple[dict[str, Any], VRAMPlan, bool]:
     """Plan from headers and meta modules, including the actual packed projections.
 
@@ -1990,8 +2266,10 @@ def plan_for_checkpoint(
         has_mtp = "mtp.fc.weight" in mtp_sh
     elif selected_format == "q1_cubes":
         q1_p_req = int(q1_p)
+        lm_req = int(lm_head_planes) if lm_head_planes is not None else None
+        k_ceil = max(q1_p_req, min(16, int(max_q1_planes)))
         layer_bytes, packed_count, lm_head_bytes, lm_cubes = _q1_cubes_storage_bytes(
-            layers, globals_sh, cfg, cfg_hidden, q1_p_req
+            layers, globals_sh, cfg, cfg_hidden, q1_p_req, lm_head_planes=lm_req
         )
         # Adaptive Binary Halving under VRAM constraints:
         # When the full model does not fit at `q1_p_req`, step down strictly by whole halving
@@ -2027,8 +2305,11 @@ def plan_for_checkpoint(
                 k_floor = max(1, min(q1_p_req, int(min_q1_planes)))
                 chosen = None
                 for k_cand in range(q1_p_req - 1, k_floor - 1, -1):
-                    # First try preserving high-precision lm_head, then halve lm_head to match k_cand.
-                    lm_candidates = [max(5, k_cand), k_cand] if q1_p_req >= 5 and k_cand < 5 else [k_cand]
+                    # First try preserving requested/high-precision lm_head, then halve lm_head to match k_cand.
+                    if lm_req is not None:
+                        lm_candidates = [lm_req, min(lm_req, k_cand)] if k_cand < lm_req else [lm_req]
+                    else:
+                        lm_candidates = [max(5, k_cand), k_cand] if q1_p_req >= 5 and k_cand < 5 else [k_cand]
                     for lm_cand in lm_candidates:
                         c_layers, c_packed, c_lm_b, c_lm_k = _q1_cubes_storage_bytes(
                             layers, globals_sh, cfg, cfg_hidden, k_cand, lm_head_planes=lm_cand
@@ -2045,17 +2326,17 @@ def plan_for_checkpoint(
                     # maximum layers remain resident and streamed layers transfer faster over PCIe.
                     q1_p = k_floor
                     layer_bytes, packed_count, lm_head_bytes, lm_cubes = _q1_cubes_storage_bytes(
-                        layers, globals_sh, cfg, cfg_hidden, k_floor, lm_head_planes=k_floor
+                        layers, globals_sh, cfg, cfg_hidden, k_floor, lm_head_planes=(lm_req if lm_req is not None else k_floor)
                     )
-            elif avail_budget > 0 and not is_moe_model and q1_p_req < 8:
-                # Mirror-balance depth refinement (step-up): when a compact dense checkpoint fits
+            elif avail_budget > 0 and not is_moe_model and q1_p_req < k_ceil:
+                # Auto depth refinement (step-up): when a compact dense checkpoint fits
                 # comfortably inside <= 35% of the available VRAM budget even at higher bit-plane
-                # depth (up to full 8-bit cube root k=8), step up automatically so outlier-heavy or
-                # heavily quantized small models keep crisp fidelity while leaving >= 65% VRAM free.
+                # depth (up to `max_q1_planes`, default 8), step up automatically so outlier-heavy
+                # small models keep BF16-level fidelity while leaving >= 65% VRAM free.
                 refine_cap = int(target_budget * 0.35)
-                for k_cand in range(8, q1_p_req, -1):
+                for k_cand in range(k_ceil, q1_p_req, -1):
                     c_layers, c_packed, c_lm_b, c_lm_k = _q1_cubes_storage_bytes(
-                        layers, globals_sh, cfg, cfg_hidden, k_cand, lm_head_planes=k_cand
+                        layers, globals_sh, cfg, cfg_hidden, k_cand, lm_head_planes=(lm_req if lm_req is not None else k_cand)
                     )
                     if (sum(c_layers) + c_lm_b) <= refine_cap:
                         q1_p, layer_bytes, packed_count, lm_head_bytes, lm_cubes = (
@@ -2071,7 +2352,7 @@ def plan_for_checkpoint(
         profile["q1_cubes_layer_bytes"] = list(layer_bytes)
         profile["q1_cubes_lm_head_bytes"] = int(lm_head_bytes)
         mtp_bytes = 0
-        has_mtp = False
+        has_mtp = "mtp.fc.weight" in mtp_sh
     else:
         quant_map = {}
         sel_bits = 0
@@ -2114,7 +2395,7 @@ def plan_for_checkpoint(
         else:
             lm_head_bytes = bf16_bytes_for_shape(shape)
         mtp_bytes = 0
-        has_mtp = False
+        has_mtp = "mtp.fc.weight" in mtp_sh
     eff_allow_cube_sub = bool(allow_cube_subdivision and not prefill_wavefront and selected_format != "q1_cubes")
     try:
         plan = plan_vram(
@@ -2181,7 +2462,7 @@ def plan_for_checkpoint(
         )
     profile = dict(profile)
     profile["mtp_weights"] = has_mtp
-    profile["mtp_enabled"] = bool(has_mtp and fast and enable_mtp and plan.enable_mtp)
+    profile["mtp_enabled"] = bool(has_mtp and enable_mtp and (plan.enable_mtp if fast else True))
     profile["sub_layer_cubes"] = bool(plan.sub_layer_cubes)
     profile["streamed_lm_head"] = bool(plan.streamed_lm_head)
     return profile, plan, has_mtp and fast
@@ -2409,7 +2690,7 @@ class QuintessentiaUnifiedEngine:
         vram_mode: str = "normal",
         enable_mtp: bool = True,
         enable_vocab_pruner: bool = False,
-        max_drafts: int = 2,
+        max_drafts: int = 3,
         verbose: bool = True,
         max_context_tokens: int | None = None,
         prefill_chunk_tokens: int | None = None,
@@ -2421,7 +2702,7 @@ class QuintessentiaUnifiedEngine:
         device: str = "auto",
         speculation: str = "auto",
         mtp_head_path: str | Path | None = None,
-        mtp_head_budget_mib: int = 128,
+        mtp_head_budget_mib: int = 512,
         prune_regions: bool = True,
         thought_anchor: bool = False,
         max_slot_mib: float | int | None = None,
@@ -2444,6 +2725,13 @@ class QuintessentiaUnifiedEngine:
         q1_graphify_feedback: Any = False,
         auto_fit_q1_planes: bool | None = None,
         min_q1_planes: int = 3,
+        max_q1_planes: int = 8,
+        lm_head_planes: int | None = None,
+        q1_kl_target: float | None = None,
+        enable_rssf_balance: bool = True,
+        enable_token_ledger: bool = True,
+        token_ledger_dir: str | Path | None = None,
+        session_id: str = "default",
     ):
         if device not in ("auto", "cpu"):
             raise ValueError("device must be auto or cpu")
@@ -2514,14 +2802,26 @@ class QuintessentiaUnifiedEngine:
         self._q1_cubes_runner = None
         self.thought_anchor_enabled = bool(thought_anchor)
         self._session_thought_anchor = None
+        self.enable_rssf_balance = bool(enable_rssf_balance)
+        self.enable_token_ledger = bool(enable_token_ledger)
+        self._token_ledger_dir = token_ledger_dir
+        self.session_id = str(session_id or "default")
+        self.token_ledger: Any = None
+        self._last_ledger_recovery: dict[str, Any] = {
+            "kind": "fresh",
+            "matched_turn_index": -1,
+            "disk_prefix_tokens": 0,
+            "kv_reused_tokens": 0,
+        }
         from src.rssf_dynamic_operators import GenerationBalanceTracker
-        self.generation_balance = GenerationBalanceTracker()
+        self.generation_balance = GenerationBalanceTracker() if self.enable_rssf_balance else None
         self._active_sampling: SamplingConfig | None = None
         self._sampling_rng: torch.Generator | None = None
         self.max_slot_bytes = resolved_slot_bytes
         self.q1_planes = int(q1_planes)
+        self.q1_planes_loaded = int(q1_planes)
         self.q1_planes_requested = int(q1_planes)
-        self.q1_lm_head_planes: int | None = None
+        self.q1_lm_head_planes: int | None = (int(lm_head_planes) if lm_head_planes is not None else None)
         self.cube_root_bits = int(cube_root_bits)
         self.cube_relay = bool(cube_relay)
         from src.stanok_contour import load_cube_blueprint
@@ -2532,7 +2832,15 @@ class QuintessentiaUnifiedEngine:
             raise ValueError("A cube blueprint requires weight_format=q1_cubes")
         if bp_max_depth > 0:
             self.q1_planes = max(self.q1_planes, bp_max_depth)
+            self.q1_planes_loaded = self.q1_planes
         self.min_q1_planes = max(1, int(min_q1_planes))
+        self.max_q1_planes = max(self.min_q1_planes, min(16, int(max_q1_planes)))
+        self.q1_kl_target: float | None = (
+            max(1e-4, float(q1_kl_target)) if (q1_kl_target is not None and float(q1_kl_target) > 0) else None
+        )
+        self.q1_kl_calibration: dict[str, Any] | None = None
+        if self.max_q1_planes > self.cube_root_bits and weight_format == "q1_cubes":
+            self.cube_root_bits = 16 if self.max_q1_planes > 8 else 8
         self.auto_fit_q1_planes = (
             bool(weight_format == "q1_cubes" and self.cube_blueprint is None)
             if auto_fit_q1_planes is None
@@ -2601,6 +2909,9 @@ class QuintessentiaUnifiedEngine:
         if weight_format == "q1_cubes":
             extra_plan_kw["auto_fit_q1_planes"] = self.auto_fit_q1_planes
             extra_plan_kw["min_q1_planes"] = self.min_q1_planes
+            extra_plan_kw["max_q1_planes"] = self.max_q1_planes
+            if self.q1_lm_head_planes is not None:
+                extra_plan_kw["lm_head_planes"] = self.q1_lm_head_planes
         self.profile, self.plan, has_mtp = plan_for_checkpoint(
             self.model_dir,
             mode=vram_mode,
@@ -2621,8 +2932,11 @@ class QuintessentiaUnifiedEngine:
         )
         if self.profile.get("weight_format") == "q1_cubes":
             self.q1_planes = int(self.profile.get("q1_planes", self.q1_planes))
+            self.q1_planes_loaded = int(self.q1_planes)
             self.q1_planes_requested = int(self.profile.get("q1_planes_requested", self.q1_planes_requested))
             self.q1_lm_head_planes = self.profile.get("q1_lm_head_planes")
+            if self.q1_planes_loaded > self.cube_root_bits:
+                self.cube_root_bits = 16 if self.q1_planes_loaded > 8 else 8
         self.fast_qwen = bool(self.profile["fast_qwen"])
         self.vram_mode = vram_mode
         self.prefill_chunk_tokens = self.plan.prefill_chunk_tokens
@@ -2907,7 +3221,28 @@ class QuintessentiaUnifiedEngine:
             warm_ids = self.engine.tokenizer("Привет!", return_tensors="pt").input_ids[0].tolist()
             for _ in self._stream_token_ids(warm_ids, max_new_tokens=4, stop_on_eos=True, cached_prefix_len=0, past_kv=None):
                 pass
-            self.reset_session()
+            self.reset_session(clear_ledger=False)
+        self._init_token_ledger()
+        if self.q1_kl_target is not None and self.profile.get("weight_format") == "q1_cubes":
+            try:
+                self.q1_kl_calibration = self.calibrate_q1_planes_by_kl(
+                    kl_target=self.q1_kl_target,
+                    min_k=self.min_q1_planes,
+                )
+                if verbose and self.q1_kl_calibration.get("ok"):
+                    print(
+                        f"[Quintessentia] KL-calibrated Q1 depth: k={self.q1_kl_calibration['chosen_k']}/"
+                        f"{self.q1_kl_calibration['reference_k']} (target KL<={self.q1_kl_target}, "
+                        f"actual KL={self.q1_kl_calibration['chosen_kl']})",
+                        flush=True,
+                    )
+            except Exception:
+                pass
+
+        if not self.fast_qwen:
+            self._configure_general_stream(
+                speculation, mtp_head_path, mtp_head_budget_mib, bool(prune_regions and not is_q1_cubes)
+            )
 
         self.boot_seconds = round(time.perf_counter() - t_boot0, 2)
         self.resident_vram_mib = round(torch.cuda.memory_allocated(self.device) / MiB, 2)
@@ -2929,17 +3264,20 @@ class QuintessentiaUnifiedEngine:
                 ec_str = f", Q1MoECache: L1/L2 ({ec['total_model_experts']} experts)"
             else:
                 ec_str = ""
+            mtp_str = "off"
+            if self.mtp_enabled:
+                nat = getattr(self.speculator, "native", None) if self.speculator is not None else None
+                if nat is not None:
+                    mtp_str = f"on ({nat.device.type}, {nat.weight_bytes / MiB:.0f} MiB)"
+                else:
+                    mtp_str = "on"
             print(
                 f"[Quintessentia] Ready in {self.boot_seconds}s | Resident VRAM: {self.resident_vram_mib} MiB "
-                f"(backend {self.profile['backend']}, MTP: {'on' if self.mtp_enabled else 'off'}, "
+                f"(backend {self.profile['backend']}, MTP: {mtp_str}, "
                 f"FastVocab: {self.enable_vocab_pruner}{ec_str})",
                 flush=True,
             )
 
-        if not self.fast_qwen:
-            self._configure_general_stream(
-                speculation, mtp_head_path, mtp_head_budget_mib, bool(prune_regions and not is_q1_cubes)
-            )
         if getattr(self, "_hud_beacon", None) is not None:
             self._hud_beacon.publish_engine_ready(self)
 
@@ -3019,6 +3357,17 @@ class QuintessentiaUnifiedEngine:
                     mirror_mode=(self.q1_graphify_feedback == "mirror_scales"),
                 )
                 self.mtp_enabled = self.speculator.native is not None
+            if (
+                self.profile.get("weight_format") == "q1_cubes"
+                and self.device.type == "cuda"
+                and self.engine is not None
+            ):
+                snap_slots = max(3, int(self.max_drafts or 0)) if self.speculator is not None else 0
+                self.snap_mgr = install_q1_qwen35_fast_decode_unifications(
+                    self.engine,
+                    max_drafts=snap_slots,
+                    full_residency=bool(getattr(self.plan, "full_residency", False)),
+                )
         except BaseException:
             self.close()
             raise
@@ -3187,6 +3536,7 @@ class QuintessentiaUnifiedEngine:
         except BaseException:
             self.close()
             raise
+        self._init_token_ledger()
         self.boot_seconds = round(time.perf_counter() - boot, 2)
         metric_device = self._gpu_metric_device()
         self.resident_vram_mib = round(torch.cuda.memory_allocated(metric_device)/MiB, 2) if metric_device is not None else 0.0
@@ -3346,13 +3696,47 @@ class QuintessentiaUnifiedEngine:
             raise ValueError('Enable unified memory before generation')
         return self.engine.enable_unified_memory(**kwargs)
 
-    def reset_session(self) -> None:
+    def _init_token_ledger(self) -> None:
+        if not getattr(self, "enable_token_ledger", True):
+            self.token_ledger = None
+            return
+        try:
+            tok = self.tokenizer
+        except Exception:
+            tok = None
+        if tok is None:
+            self.token_ledger = None
+            return
+        from .token_ledger import DiskTokenLedger, compute_tokenizer_fingerprint
+
+        base_dir = (
+            Path(self._token_ledger_dir)
+            if getattr(self, "_token_ledger_dir", None) is not None
+            else (self.root / "sessions")
+        )
+        max_ctx = int(getattr(getattr(self, "plan", None), "max_context_tokens", 0) or 0) or None
+        self.token_ledger = DiskTokenLedger(
+            storage_dir=base_dir,
+            model_id=getattr(self, "model_id", "model"),
+            tokenizer_fingerprint=compute_tokenizer_fingerprint(tok),
+            session_id=getattr(self, "session_id", "default"),
+            enabled=True,
+            max_active_tokens=max_ctx,
+        )
+
+    def reset_session(self, *, clear_ledger: bool = True) -> None:
         self.session.reset()
         self._session_messages.clear()
         self._session_prompt_messages.clear()
         self._session_last_tool_calls.clear()
         self._session_tools_sig = ""
         self._session_thought_anchor = None
+        self._last_ledger_recovery = {
+            "kind": "fresh",
+            "matched_turn_index": -1,
+            "disk_prefix_tokens": 0,
+            "kv_reused_tokens": 0,
+        }
         warmup = getattr(self.engine, "probability_warmup", None)
         if warmup is not None:
             warmup.reset()
@@ -3360,7 +3744,258 @@ class QuintessentiaUnifiedEngine:
             self.survivor_tracker.reset()
         if getattr(self, "generation_balance", None) is not None:
             self.generation_balance.reset_session()
+        if clear_ledger and getattr(self, "token_ledger", None) is not None:
+            self.token_ledger.clear_active_window(reason="session_reset")
         self._release_transient_state()
+
+    def compact_session(
+        self,
+        summary_text: str,
+        *,
+        keep_last_turns: int = 1,
+        system_prompt: str | None = None,
+        max_active_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Archive the current epoch in `ledger.jsonl` and rewrite `active_window.json` with a compact epoch.
+
+        Stores the exact token sequence (`[system] + [summary] + [last K turns]`) sized to fit the
+        active context so subsequent turns (and any server restart) retokenize 100% deterministically.
+        """
+        summary = str(summary_text or "").strip()
+        if not summary:
+            raise ValueError("summary_text must be non-empty")
+        from .tool_calling import normalize_messages
+
+        existing_msgs = list(getattr(self, "_session_messages", []) or [])
+        if not existing_msgs and getattr(self, "token_ledger", None) is not None and self.token_ledger.turns:
+            existing_msgs = list(self.token_ledger.turns[-1].get("messages") or [])
+        existing_msgs = normalize_messages(existing_msgs, parse_tool_args_as_dict=False)
+
+        compacted_msgs: list[dict[str, Any]] = []
+        if system_prompt is not None and str(system_prompt).strip():
+            compacted_msgs.append({"role": "system", "content": str(system_prompt).strip()})
+        else:
+            for m in existing_msgs:
+                if m.get("role") == "system":
+                    compacted_msgs.append(m)
+                    break
+
+        compacted_msgs.append({"role": "user", "content": f"[Context Summary]\n{summary}"})
+        compacted_msgs.append({"role": "assistant", "content": "Understood. Continuing from the compacted context."})
+
+        keep_k = max(0, int(keep_last_turns))
+        if keep_k > 0:
+            non_sys = [m for m in existing_msgs if m.get("role") != "system"]
+            # Collect complete trailing (user .. assistant) turn pairs
+            tail_pairs: list[dict[str, Any]] = []
+            i = len(non_sys) - 1
+            pairs = 0
+            while i >= 1 and pairs < keep_k:
+                if non_sys[i].get("role") == "assistant" and non_sys[i - 1].get("role") == "user":
+                    tail_pairs = [non_sys[i - 1], non_sys[i]] + tail_pairs
+                    pairs += 1
+                    i -= 2
+                else:
+                    i -= 1
+            compacted_msgs.extend(tail_pairs)
+
+        # Render exact closed assistant prefix (no trailing generation prompt) for bit-exact ledger storage
+        tok = self.tokenizer
+        rendered: str | None = None
+        if getattr(tok, "chat_template", None):
+            try:
+                rendered = tok.apply_chat_template(
+                    compacted_msgs, tokenize=False, add_generation_prompt=False
+                )
+            except Exception:
+                rendered = None
+        if rendered is None:
+            parts: list[str] = []
+            for m in compacted_msgs:
+                r = m["role"]
+                c = m.get("content", "")
+                if r == "system":
+                    parts.append(f"System: {c}\n\n")
+                elif r == "assistant":
+                    parts.append(f"Assistant:{c}")
+                else:
+                    parts.append(f"User: {c}\n\n")
+            rendered = "".join(parts)
+
+        compacted_ids = tok(rendered, return_tensors="pt").input_ids[0].tolist()
+        eos_ids = self._effective_eos_token_ids()
+        eos_ended = bool(compacted_ids and compacted_ids[-1] in eos_ids)
+
+        # Drop old parked RAM KV (prefix changed to the new compact epoch), keep disk archive intact
+        self.session.reset()
+        self._session_messages = list(compacted_msgs)
+        self._session_prompt_messages = list(compacted_msgs[:-1]) if compacted_msgs else []
+        self._session_last_tool_calls.clear()
+        self._session_thought_anchor = None
+        self._release_transient_state()
+
+        if getattr(self, "token_ledger", None) is not None:
+            report = self.token_ledger.compact_active_window(
+                compacted_messages=compacted_msgs,
+                compacted_token_ids=compacted_ids,
+                eos_ended=eos_ended,
+                tools_sig=getattr(self, "_session_tools_sig", ""),
+                reason="compact_session",
+                max_active_tokens=max_active_tokens,
+            )
+        else:
+            report = {
+                "closed_epoch": 0,
+                "new_epoch": 1,
+                "old_tokens": 0,
+                "new_tokens": len(compacted_ids),
+                "trimmed_to_cap": False,
+                "active_path": None,
+                "archive_path": None,
+            }
+        report["compacted_messages"] = compacted_msgs
+        return report
+
+    def set_active_q1_planes(self, k: int, *, lm_head_k: int | None = None) -> dict[str, Any]:
+        """Instant 0-ms live switching of active Q1 bit-plane depth (`1 <= k <= q1_planes_loaded`) without reloading."""
+        if self.profile.get("weight_format") != "q1_cubes":
+            raise ValueError(
+                f"Live Q1 plane switching requires weight_format='q1_cubes' (current: {self.profile.get('weight_format')!r})"
+            )
+        loaded = max(1, int(getattr(self, "q1_planes_loaded", getattr(self, "q1_planes", 5))))
+        target_k = int(k)
+        if not 1 <= target_k <= loaded:
+            raise ValueError(f"k must be between 1 and {loaded} (loaded planes), got {target_k}")
+
+        from src.binary_halving_q1 import BinaryHalvingQ1Linear, BinaryHalvingMoEExperts
+
+        updated = 0
+        lm_updated = False
+        model = getattr(self.engine, "model", None)
+        if model is not None:
+            lm_ref = getattr(model, "lm_head", None)
+            for mod in model.modules():
+                is_q1 = isinstance(mod, (BinaryHalvingQ1Linear, BinaryHalvingMoEExperts)) or (
+                    hasattr(mod, "active_cubes")
+                    and hasattr(mod, "root_bits")
+                    and getattr(mod, "packed_lo", None) is not None
+                )
+                if is_q1:
+                    if mod is lm_ref:
+                        if lm_head_k is not None:
+                            lk = max(1, min(int(mod.root_bits), int(lm_head_k)))
+                            mod.active_cubes = lk
+                            self.q1_lm_head_planes = lk
+                            lm_updated = True
+                        else:
+                            mod.active_cubes = min(int(mod.root_bits), max(target_k, int(self.q1_lm_head_planes or target_k)))
+                    else:
+                        mod.active_cubes = min(int(mod.root_bits), target_k)
+                    updated += 1
+
+        runner = getattr(self, "_q1_cubes_runner", None)
+        if runner is not None:
+            for attr in ("active_cubes", "n_cubes"):
+                if hasattr(runner, attr):
+                    try:
+                        setattr(runner, attr, target_k)
+                    except Exception:
+                        pass
+            moe_cache = getattr(runner, "moe_cache", None)
+            if moe_cache is not None:
+                for attr in ("active_cubes", "n_cubes", "moe_cubes"):
+                    if hasattr(moe_cache, attr):
+                        try:
+                            setattr(moe_cache, attr, target_k)
+                        except Exception:
+                            pass
+
+        self.q1_planes = target_k
+        self.profile["q1_planes"] = target_k
+        return {
+            "q1_planes": target_k,
+            "q1_planes_loaded": loaded,
+            "cube_root_bits": int(getattr(self, "cube_root_bits", 8)),
+            "lm_head_planes": self.q1_lm_head_planes,
+            "lm_head_updated": lm_updated,
+            "updated_modules": updated,
+        }
+
+    def calibrate_q1_planes_by_kl(
+        self,
+        *,
+        kl_target: float = 0.05,
+        min_k: int | None = None,
+        probe_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Select the smallest active Q1 plane depth `k` whose mean KL divergence vs the full
+        loaded depth (`q1_planes_loaded`) stays at or below `kl_target` on a calibration passage.
+
+        Never touches `embed_tokens` (stays native BF16) and switches `active_cubes` in-place in O(1).
+        """
+        if self.profile.get("weight_format") != "q1_cubes":
+            return {"ok": False, "reason": "not_q1_cubes"}
+        k_ref = max(1, int(getattr(self, "q1_planes_loaded", getattr(self, "q1_planes", 5))))
+        k_lo = max(1, min(k_ref, int(min_k if min_k is not None else getattr(self, "min_q1_planes", 3))))
+        if k_lo >= k_ref:
+            return {"ok": True, "reference_k": k_ref, "chosen_k": k_ref, "chosen_kl": 0.0, "kl_target": kl_target, "curve": {}}
+
+        text = probe_text or (
+            "The capital of France is Paris, renowned for the Eiffel Tower and the Louvre Museum. "
+            "In computer architecture, memory bandwidth often limits autoregressive decoding because "
+            "each generated token reads billions of parameters from graphics memory. Binary halving "
+            "bit-planes allow selecting the minimal precision depth k that preserves model logits "
+            "without distorting outlier channels or degrading downstream reasoning accuracy. "
+            "Meanwhile, exact disk-backed token ledgers eliminate BPE whitespace drift across turns."
+        )
+        tok = self.tokenizer
+        ids = tok(text, return_tensors="pt").input_ids
+        if ids.shape[1] < 8:
+            return {"ok": False, "reason": "probe_too_short"}
+        dev = self.engine.device
+        ids = ids[:, : min(256, int(ids.shape[1]))].to(dev)
+
+        import torch.nn.functional as F
+
+        self.set_active_q1_planes(k_ref)
+        with torch.no_grad():
+            out_ref = self.engine.model(input_ids=ids, use_cache=False)
+            lg_ref = out_ref.logits[0, :-1].float()
+            lp_ref = F.log_softmax(lg_ref, dim=-1)
+            p_ref = lp_ref.exp()
+            top1_ref = lg_ref.argmax(dim=-1)
+            del out_ref, lg_ref
+
+        curve: dict[str, dict[str, float]] = {}
+        chosen_k = k_ref
+        chosen_kl = 0.0
+        for k_cand in range(k_lo, k_ref):
+            self.set_active_q1_planes(k_cand)
+            with torch.no_grad():
+                out_c = self.engine.model(input_ids=ids, use_cache=False)
+                lg_c = out_c.logits[0, :-1].float()
+                lp_c = F.log_softmax(lg_c, dim=-1)
+                mean_kl = float((p_ref * (lp_ref - lp_c)).sum(dim=-1).mean().item())
+                top1_pct = float((lg_c.argmax(dim=-1) == top1_ref).float().mean().item()) * 100.0
+                del out_c, lg_c, lp_c
+            curve[f"k={k_cand}"] = {"mean_kl": round(mean_kl, 5), "top1_match_pct": round(top1_pct, 2)}
+            if mean_kl <= float(kl_target):
+                chosen_k = k_cand
+                chosen_kl = mean_kl
+                break
+
+        self.set_active_q1_planes(chosen_k)
+        del lp_ref, p_ref, top1_ref, ids
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        return {
+            "ok": True,
+            "kl_target": float(kl_target),
+            "reference_k": k_ref,
+            "chosen_k": chosen_k,
+            "chosen_kl": round(chosen_kl, 5),
+            "curve": curve,
+        }
 
     def runtime_limits(self, *, busy: bool = False) -> dict[str, Any]:
         return compute_runtime_limits(self, busy=busy)
@@ -3413,7 +4048,7 @@ class QuintessentiaUnifiedEngine:
                 temperature=0.0,
             ):
                 pass
-            self.reset_session()
+            self.reset_session(clear_ledger=False)
             if is_cuda:
                 torch.cuda.synchronize(dev)
                 torch.cuda.empty_cache()
@@ -3440,7 +4075,7 @@ class QuintessentiaUnifiedEngine:
                 if ev.get("type") == "done":
                     done_metrics = dict(ev.get("metrics") or {})
 
-            self.reset_session()
+            self.reset_session(clear_ledger=False)
             if is_cuda:
                 torch.cuda.synchronize(dev)
                 torch.cuda.empty_cache()
@@ -3493,7 +4128,7 @@ class QuintessentiaUnifiedEngine:
                 )
             return dict(self.calibration)
         except Exception as exc:
-            self.reset_session()
+            self.reset_session(clear_ledger=False)
             self.calibration = {"ok": False, "error": str(exc)}
             return dict(self.calibration)
 
@@ -3566,6 +4201,14 @@ class QuintessentiaUnifiedEngine:
         if q1_cubes_runner is not None:
             snap["q1_cubes"] = q1_cubes_runner.stats()
             snap["q1_planes"] = getattr(self, "q1_planes", 4)
+        if self.profile.get("weight_format") == "q1_cubes":
+            snap["q1_planes"] = int(getattr(self, "q1_planes", 5))
+            snap["q1_planes_loaded"] = int(getattr(self, "q1_planes_loaded", snap["q1_planes"]))
+            snap["cube_root_bits"] = int(getattr(self, "cube_root_bits", 8))
+            snap["q1_lm_head_planes"] = getattr(self, "q1_lm_head_planes", None)
+            snap["auto_fit_q1_planes"] = bool(getattr(self, "auto_fit_q1_planes", False))
+            if getattr(self, "q1_kl_calibration", None) is not None:
+                snap["q1_kl_calibration"] = self.q1_kl_calibration
         if self.profile.get("weight_format") == "q1":
             snap["q1_planes"] = getattr(self, "q1_planes", 4)
             snap["q1_early_stop_enabled"] = getattr(self, "q1_early_stop", True)
@@ -3579,6 +4222,9 @@ class QuintessentiaUnifiedEngine:
             snap["probability_warmup"] = warmup.stats()
         if getattr(self, "calibration", None) is not None:
             snap["calibration"] = self.calibration
+        if getattr(self, "token_ledger", None) is not None:
+            snap["token_ledger"] = self.token_ledger.stats()
+        snap["rssf_balance_enabled"] = bool(getattr(self, "enable_rssf_balance", True))
         snap["limits"] = self.runtime_limits()
         return snap
 
@@ -3604,6 +4250,7 @@ class QuintessentiaUnifiedEngine:
         tool_choice: Any = None,
     ) -> tuple[list[int], int, Any, float]:
         from .kv_offload import plan_kv_cache
+        from .token_ledger import canonical_message_sig, canonical_message_sigs
         from .tool_calling import (
             apply_chat_template_with_tools,
             normalize_messages,
@@ -3615,6 +4262,14 @@ class QuintessentiaUnifiedEngine:
         eos_ids = self._effective_eos_token_ids()
         norm_msgs = normalize_messages(messages, parse_tool_args_as_dict=False)
         cur_tools_sig = tools_signature(tools, tool_choice)
+        ledger = getattr(self, "token_ledger", None)
+        self._last_ledger_recovery = {
+            "kind": "fresh",
+            "matched_turn_index": -1,
+            "disk_prefix_tokens": 0,
+            "kv_reused_tokens": 0,
+            "epoch": int(ledger.epoch) if ledger is not None else 0,
+        }
         has_parked = (
             use_session_cache
             and cur_tools_sig == getattr(self, "_session_tools_sig", "")
@@ -3636,20 +4291,39 @@ class QuintessentiaUnifiedEngine:
                 chunk_pad=max(1, int(self.prefill_chunk_tokens)),
             )
 
-        # Universal incremental KV continuation for BOTH plain `user` turns AND multi-turn `role="tool"` loops:
-        # reuses the entire parked KV prefix (even when the client stripped `<think>` from the prior assistant turn).
+        def _render_suffix(tail_msgs: list[dict[str, Any]], prev_ended_eos: bool, chatml_fmt: bool) -> str | None:
+            s = render_incremental_turn_suffix(
+                self.tokenizer,
+                tail_msgs,
+                enable_thinking=enable_thinking,
+                prev_ended_with_eos=prev_ended_eos,
+            )
+            if s is None and chatml_fmt and len(tail_msgs) == 1 and tail_msgs[0]["role"] == "user":
+                lead = "" if prev_ended_eos else "<|im_end|>"
+                think_tail = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+                s = (
+                    f"{lead}\n<|im_start|>user\n{tail_msgs[0]['content']}<|im_end|>\n"
+                    f"<|im_start|>assistant\n{think_tail}"
+                )
+            return s
+
+        # Path 1: Fast RAM continuation (whitespace- & `<think>`-tolerant canonical comparison!)
         if has_parked:
             prev_prompt_msgs = getattr(self, "_session_prompt_messages", [])
             prev_n = len(prev_prompt_msgs)
             prev_tool_calls = getattr(self, "_session_last_tool_calls", [])
-            prev_asst_content = (
-                self._session_messages[-1].get("content", "")
+            prev_asst_msg = (
+                self._session_messages[-1]
                 if (self._session_messages and self._session_messages[-1].get("role") == "assistant")
-                else ""
+                else None
             )
             is_direct_continuation = False
             tail_msgs: list[dict[str, Any]] = []
-            if prev_n > 0 and len(norm_msgs) >= prev_n + 2 and norm_msgs[:prev_n] == prev_prompt_msgs:
+            if (
+                prev_n > 0
+                and len(norm_msgs) >= prev_n + 2
+                and canonical_message_sigs(norm_msgs[:prev_n]) == canonical_message_sigs(prev_prompt_msgs)
+            ):
                 asst_msg = norm_msgs[prev_n]
                 cand_tail = norm_msgs[prev_n + 1 :]
                 if asst_msg.get("role") == "assistant" and cand_tail and all(
@@ -3659,7 +4333,7 @@ class QuintessentiaUnifiedEngine:
                         is_direct_continuation = tool_calls_match_signature(
                             asst_msg.get("tool_calls"), prev_tool_calls
                         )
-                    elif asst_msg.get("content", "") == prev_asst_content:
+                    elif prev_asst_msg is not None and canonical_message_sig(asst_msg) == canonical_message_sig(prev_asst_msg):
                         is_direct_continuation = True
                     if is_direct_continuation:
                         tail_msgs = cand_tail
@@ -3667,7 +4341,7 @@ class QuintessentiaUnifiedEngine:
                 not tools
                 and len(norm_msgs) >= 3
                 and norm_msgs[-1]["role"] == "user"
-                and norm_msgs[:-1] == self._session_messages
+                and canonical_message_sigs(norm_msgs[:-1]) == canonical_message_sigs(self._session_messages)
             ):
                 is_direct_continuation = True
                 tail_msgs = [norm_msgs[-1]]
@@ -3675,19 +4349,7 @@ class QuintessentiaUnifiedEngine:
             if is_direct_continuation and tail_msgs:
                 prev_full = self.session.fed + self.session.unfed_tail
                 prev_ended_eos = bool(prev_full and prev_full[-1] in eos_ids)
-                suffix_str = render_incremental_turn_suffix(
-                    self.tokenizer,
-                    tail_msgs,
-                    enable_thinking=enable_thinking,
-                    prev_ended_with_eos=prev_ended_eos,
-                )
-                if suffix_str is None and self.session.chatml_think_format and len(tail_msgs) == 1 and tail_msgs[0]["role"] == "user":
-                    lead = "" if prev_ended_eos else "<|im_end|>"
-                    think_tail = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
-                    suffix_str = (
-                        f"{lead}\n<|im_start|>user\n{tail_msgs[0]['content']}<|im_end|>\n"
-                        f"<|im_start|>assistant\n{think_tail}"
-                    )
+                suffix_str = _render_suffix(tail_msgs, prev_ended_eos, self.session.chatml_think_format)
                 if suffix_str:
                     suffix_ids = self.tokenizer(suffix_str, add_special_tokens=False).input_ids
                     full_ids = prev_full + suffix_ids
@@ -3699,7 +4361,70 @@ class QuintessentiaUnifiedEngine:
                             self.session.chatml_think_format or "<|im_start|>assistant\n<think>" in suffix_str
                         )
                         past_kv, unpark_ms = _unpark_for(full_ids, reused)
+                        self._last_ledger_recovery = {
+                            "kind": "exact_continuation",
+                            "matched_turn_index": (len(ledger.turns) - 1) if (ledger and ledger.turns) else -1,
+                            "disk_prefix_tokens": len(prev_full),
+                            "kv_reused_tokens": reused,
+                            "epoch": int(ledger.epoch) if ledger is not None else 0,
+                        }
+                        if ledger is not None:
+                            ledger.last_recovery_kind = "exact_kv_reuse"
+                            ledger.last_recovered_tokens = reused
                         return full_ids, reused, past_kv, unpark_ms
+
+        # Path 2: Disk Token Ledger recovery (handles server restarts, compacted epochs, and
+        # mid-conversation edits / ordering disruptions with 100% bit-exact historical token IDs
+        # + partial pure-attention KV prefix truncation when available!).
+        if use_session_cache and ledger is not None and ledger.enabled:
+            lm = ledger.match_messages(norm_msgs, tools_sig=cur_tools_sig)
+            if lm.kind in ("exact_continuation", "partial_turn_prefix") and lm.tail_messages:
+                suffix_str = _render_suffix(
+                    lm.tail_messages, lm.prev_ended_with_eos, ledger.chatml_think_format
+                )
+                if suffix_str:
+                    suffix_ids = self.tokenizer(suffix_str, add_special_tokens=False).input_ids
+                    full_ids = list(lm.prefix_token_ids) + list(suffix_ids)
+                    self._check_context_budget(len(full_ids), max_new_tokens)
+                    self._last_prompt_opened_think = suffix_str.rstrip().endswith("<think>")
+                    self._last_prompt_chatml_think = (
+                        ledger.chatml_think_format or "<|im_start|>assistant\n<think>" in suffix_str
+                    )
+                    reused = 0
+                    if len(self.session.fed) > 0 and self.session.parked_backbone is not None:
+                        reused = self.session.kv_prefix_reuse(full_ids, allow_truncate=True)
+                    if reused > 0:
+                        past_kv, unpark_ms = _unpark_for(full_ids, reused)
+                        rec_label = (
+                            "partial_kv_truncate"
+                            if lm.kind == "partial_turn_prefix"
+                            else "exact_kv_reuse"
+                        )
+                        self._last_ledger_recovery = {
+                            "kind": lm.kind,
+                            "recovery_mode": rec_label,
+                            "matched_turn_index": lm.matched_turn_index,
+                            "disk_prefix_tokens": len(lm.prefix_token_ids),
+                            "kv_reused_tokens": reused,
+                            "epoch": lm.epoch,
+                        }
+                        ledger.last_recovery_kind = rec_label
+                        ledger.last_recovered_tokens = len(lm.prefix_token_ids)
+                        return full_ids, reused, past_kv, unpark_ms
+                    # RAM KV unavailable (restart / compacted epoch / recurrent layer rewind):
+                    # still replay 100% bit-exact historical token IDs from disk with zero BPE drift!
+                    self.session.reset()
+                    self._last_ledger_recovery = {
+                        "kind": lm.kind,
+                        "recovery_mode": "ledger_exact_retokenize",
+                        "matched_turn_index": lm.matched_turn_index,
+                        "disk_prefix_tokens": len(lm.prefix_token_ids),
+                        "kv_reused_tokens": 0,
+                        "epoch": lm.epoch,
+                    }
+                    ledger.last_recovery_kind = "ledger_exact_retokenize"
+                    ledger.last_recovered_tokens = len(lm.prefix_token_ids)
+                    return full_ids, 0, None, 0.0
 
         prompt_str = apply_chat_template_with_tools(
             self.tokenizer,
@@ -3719,9 +4444,20 @@ class QuintessentiaUnifiedEngine:
             and self.session.parked_backbone is not None
         )
         if can_reuse_prefix:
-            reused = self.session.kv_prefix_reuse(prompt_ids)
+            reused = self.session.kv_prefix_reuse(prompt_ids, allow_truncate=False)
             if reused > 0:
                 past_kv, unpark_ms = _unpark_for(prompt_ids, reused)
+                self._last_ledger_recovery = {
+                    "kind": "exact_continuation",
+                    "recovery_mode": "exact_kv_reuse",
+                    "matched_turn_index": -1,
+                    "disk_prefix_tokens": 0,
+                    "kv_reused_tokens": reused,
+                    "epoch": int(ledger.epoch) if ledger is not None else 0,
+                }
+                if ledger is not None:
+                    ledger.last_recovery_kind = "exact_kv_reuse"
+                    ledger.last_recovered_tokens = reused
                 return prompt_ids, reused, past_kv, unpark_ms
 
         if use_session_cache:
@@ -4232,6 +4968,10 @@ class QuintessentiaUnifiedEngine:
             penalty_window=int(penalty_window),
             seed=seed,
         )
+        from src.rssf_dynamic_operators import _RSSF_ENABLED_OVERRIDE as _prev_rssf_override, set_rssf_balance_enabled
+        _rssf_scoped = not bool(getattr(self, "enable_rssf_balance", True))
+        if _rssf_scoped:
+            set_rssf_balance_enabled(False)
         try:
             check("queue")
             if max_new_tokens is not None and int(max_new_tokens) < 0:
@@ -4414,6 +5154,20 @@ class QuintessentiaUnifiedEngine:
                     {"role": "assistant", "content": answer_text},
                 ]
                 self._session_tools_sig = tools_signature(tools, tool_choice)
+                ledger_ref = getattr(self, "token_ledger", None)
+                if ledger_ref is not None and ledger_ref.enabled:
+                    rec_info = getattr(self, "_last_ledger_recovery", {}) or {}
+                    ledger_ref.record_turn(
+                        full_messages=self._session_messages,
+                        all_token_ids=final_info["all_ids"],
+                        prompt_token_len=len(prompt_ids),
+                        committed_len=len(self.session.fed),
+                        eos_ended=bool(raw_gen_ids and raw_gen_ids[-1] in eos_ids),
+                        tools_sig=self._session_tools_sig,
+                        chatml_think_format=bool(getattr(self, "_last_prompt_chatml_think", False)),
+                        recovery_kind=str(rec_info.get("kind", "fresh")),
+                        matched_turn_index=int(rec_info.get("matched_turn_index", -1)),
+                    )
             final_info.pop("past", None)
             final_info.pop("last_fed_h", None)
             if not use_session_cache:
@@ -4480,6 +5234,11 @@ class QuintessentiaUnifiedEngine:
                 metrics["q1_puzzle_overlay"] = puz_ctrl.stats()
             if active_anchor_ref is not None:
                 metrics["thought_anchor"] = active_anchor_ref.telemetry.summary()
+            if getattr(self, "token_ledger", None) is not None:
+                metrics["token_ledger"] = {
+                    **self.token_ledger.stats(),
+                    **dict(getattr(self, "_last_ledger_recovery", {}) or {}),
+                }
             if getattr(self, "generation_balance", None) is not None:
                 try:
                     end_free_b, end_total_b = 0, 1
@@ -4572,6 +5331,8 @@ class QuintessentiaUnifiedEngine:
             traceback.clear_frames(exc.__traceback__)
             raise
         finally:
+            if _rssf_scoped:
+                set_rssf_balance_enabled(_prev_rssf_override)
             self._active_sampling = None
             self._sampling_rng = None
             if auto_anchor_installed:
@@ -4599,7 +5360,8 @@ class QuintessentiaUnifiedEngine:
         self._neutral_logprob_cache = None
         self._session_thought_anchor = None
         if getattr(self, "session", None) is not None:
-            self.reset_session()
+            # Preserve disk Token Ledger across clean engine shutdown / server restart!
+            self.reset_session(clear_ledger=False)
         if getattr(self, "survivor_tracker", None) is not None:
             self.survivor_tracker.close()
             self.survivor_tracker = None

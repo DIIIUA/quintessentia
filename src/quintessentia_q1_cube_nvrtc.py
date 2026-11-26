@@ -1327,6 +1327,341 @@ extern "C" __global__ void ideal_q1_popc10_r2_gemv_f32(
     }
 }
 
+/* 7c. Two-Stage Zero-SMEM L1-Cached INT8 __dp4a + Parallel SWAR Ideal Q1 FWHT GEMV (M=1..4)
+ * Stage 1 (ideal_q1_fwht_quant_i8_f32): runs ONCE per layer (1 warp per (m, g) group, ~5 us)
+ *   to compute FWHT(x * col_scale) and write transposed int8x4 qx[(m*16+q4)*ng + g], xsc, xsm.
+ * Stage 2 (ideal_q1_popc10_mr_gemv_f32): ZERO Phase-1 work, ZERO shared memory, ZERO __syncthreads(),
+ *   reads packed_lo/qscale/qzero ONCE from GDDR6 and shares L1-cached qx across both rows & all M tokens!
+ */
+__device__ __forceinline__ unsigned int _q1_nib_to_u8x4(unsigned int nib) {
+    /* Bit-exact 4-bit scatter: b0->bit0, b1->bit8, b2->bit16, b3->bit24 (zero carry overlap for 0..15). */
+    return (nib * 0x00204081u) & 0x01010101u;
+}
+
+__device__ __forceinline__ int _q1_dp4a_s32(int a, int b, int c) {
+#if __CUDA_ARCH__ >= 610
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+#else
+    int a0 = (signed char)(a & 0xff), a1 = (signed char)((a >> 8) & 0xff),
+        a2 = (signed char)((a >> 16) & 0xff), a3 = (signed char)((a >> 24) & 0xff);
+    int b0 = (signed char)(b & 0xff), b1 = (signed char)((b >> 8) & 0xff),
+        b2 = (signed char)((b >> 16) & 0xff), b3 = (signed char)((b >> 24) & 0xff);
+    return c + a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+#endif
+}
+
+__device__ __forceinline__ void q1_write_elem(
+    void* __restrict__ y_out, long long idx, float val, int accumulate, int out_is_bf16
+) {
+    if (accumulate) {
+        if (out_is_bf16) {
+            unsigned short* out_p = reinterpret_cast<unsigned short*>(y_out);
+            out_p[idx] = f32_to_bf16_rne(bf16_to_f32(out_p[idx]) + val);
+        } else {
+            reinterpret_cast<float*>(y_out)[idx] += val;
+        }
+    } else {
+        if (out_is_bf16) reinterpret_cast<unsigned short*>(y_out)[idx] = f32_to_bf16_rne(val);
+        else reinterpret_cast<float*>(y_out)[idx] = val;
+    }
+}
+
+extern "C" __global__ void ideal_q1_fwht_quant_i8_f32(
+    const unsigned short* __restrict__ x_bf16,
+    const unsigned short* __restrict__ col_scale,
+    int* __restrict__ qx_out,
+    float* __restrict__ xsc_out,
+    float* __restrict__ xsm_out,
+    int M, int K
+) {
+    int ng = K >> 6;
+    int tid = threadIdx.x;
+    int warp_global = blockIdx.x * (blockDim.x >> 5) + (tid >> 5);
+    int lane = tid & 31;
+    if (warp_global >= M * ng) return;
+    int m = warp_global / ng;
+    int g = warp_global - m * ng;
+    int base = g << 6;
+    const unsigned short* x_row = x_bf16 + (long long)m * K;
+    float v0 = bf16_to_f32(x_row[base + lane]) * bf16_to_f32(col_scale[base + lane]);
+    float v1 = bf16_to_f32(x_row[base + 32 + lane]) * bf16_to_f32(col_scale[base + 32 + lane]);
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        float p0 = __shfl_xor_sync(0xffffffffu, v0, d);
+        float p1 = __shfl_xor_sync(0xffffffffu, v1, d);
+        v0 = (lane & d) ? (p0 - v0) : (v0 + p0);
+        v1 = (lane & d) ? (p1 - v1) : (v1 + p1);
+    }
+    float y0 = (v0 + v1) * 0.125f;
+    float y1 = (v0 - v1) * 0.125f;
+
+    float g_sum = y0 + y1;
+    float g_amax = fmaxf(fabsf(y0), fabsf(y1));
+    #pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+        g_sum  += __shfl_xor_sync(0xffffffffu, g_sum, d);
+        g_amax  = fmaxf(g_amax, __shfl_xor_sync(0xffffffffu, g_amax, d));
+    }
+    float inv_s = (g_amax > 1e-12f) ? (127.0f / g_amax) : 0.0f;
+    float xsc   = (g_amax > 1e-12f) ? (g_amax * (1.0f / 127.0f)) : 0.0f;
+    int q0 = __float2int_rn(y0 * inv_s);
+    int q1 = __float2int_rn(y1 * inv_s);
+    if (q0 < -127) q0 = -127; else if (q0 > 127) q0 = 127;
+    if (q1 < -127) q1 = -127; else if (q1 > 127) q1 = 127;
+    unsigned int b0 = (unsigned int)(q0 & 0xff);
+    unsigned int b1 = (unsigned int)(q1 & 0xff);
+
+    unsigned int p0_1 = __shfl_down_sync(0xffffffffu, b0, 1);
+    unsigned int p0_2 = __shfl_down_sync(0xffffffffu, b0, 2);
+    unsigned int p0_3 = __shfl_down_sync(0xffffffffu, b0, 3);
+    unsigned int p1_1 = __shfl_down_sync(0xffffffffu, b1, 1);
+    unsigned int p1_2 = __shfl_down_sync(0xffffffffu, b1, 2);
+    unsigned int p1_3 = __shfl_down_sync(0xffffffffu, b1, 3);
+    if ((lane & 3) == 0) {
+        int q4 = lane >> 2;
+        int pack_lo = (int)(b0 | (p0_1 << 8) | (p0_2 << 16) | (p0_3 << 24));
+        int pack_hi = (int)(b1 | (p1_1 << 8) | (p1_2 << 16) | (p1_3 << 24));
+        qx_out[(m * 16 + q4)     * ng + g] = pack_lo;
+        qx_out[(m * 16 + q4 + 8) * ng + g] = pack_hi;
+    }
+    if (lane == 0) {
+        xsc_out[m * ng + g] = xsc;
+        xsm_out[m * ng + g] = g_sum;
+    }
+}
+
+template <int P_STATIC>
+__device__ __forceinline__ int _q1_unpack_nib4_swar(
+    unsigned int w0, unsigned int w1, unsigned int w2,
+    unsigned int w3, unsigned int w4, unsigned int w5, unsigned int w6,
+    int sh, int plane_count
+) {
+    if (P_STATIC == 5) {
+        unsigned int wu = ((((w0 >> sh) & 15u) * 0x02040810u) & 0x10101010u)
+                        | ((((w1 >> sh) & 15u) * 0x01020408u) & 0x08080808u)
+                        | ((((w2 >> sh) & 15u) * 0x00810204u) & 0x04040404u)
+                        | ((((w3 >> sh) & 15u) * 0x00408102u) & 0x02020202u)
+                        | ((((w4 >> sh) & 15u) * 0x00204081u) & 0x01010101u);
+        return (int)wu;
+    } else if (P_STATIC == 4) {
+        unsigned int wu = ((((w0 >> sh) & 15u) * 0x01020408u) & 0x08080808u)
+                        | ((((w1 >> sh) & 15u) * 0x00810204u) & 0x04040404u)
+                        | ((((w2 >> sh) & 15u) * 0x00408102u) & 0x02020202u)
+                        | ((((w3 >> sh) & 15u) * 0x00204081u) & 0x01010101u);
+        return (int)wu;
+    } else if (P_STATIC == 6) {
+        unsigned int wu = ((((w0 >> sh) & 15u) * 0x04081020u) & 0x20202020u)
+                        | ((((w1 >> sh) & 15u) * 0x02040810u) & 0x10101010u)
+                        | ((((w2 >> sh) & 15u) * 0x01020408u) & 0x08080808u)
+                        | ((((w3 >> sh) & 15u) * 0x00810204u) & 0x04040404u)
+                        | ((((w4 >> sh) & 15u) * 0x00408102u) & 0x02020202u)
+                        | ((((w5 >> sh) & 15u) * 0x00204081u) & 0x01010101u);
+        return (int)wu;
+    } else {
+        unsigned int wu = _q1_nib_to_u8x4((w0 >> sh) & 15u);
+        if (plane_count > 1) wu = (wu << 1) | _q1_nib_to_u8x4((w1 >> sh) & 15u);
+        if (plane_count > 2) wu = (wu << 1) | _q1_nib_to_u8x4((w2 >> sh) & 15u);
+        if (plane_count > 3) wu = (wu << 1) | _q1_nib_to_u8x4((w3 >> sh) & 15u);
+        if (plane_count > 4) wu = (wu << 1) | _q1_nib_to_u8x4((w4 >> sh) & 15u);
+        if (plane_count > 5) wu = (wu << 1) | _q1_nib_to_u8x4((w5 >> sh) & 15u);
+        if (plane_count > 6) wu = (wu << 1) | _q1_nib_to_u8x4((w6 >> sh) & 15u);
+        return (int)wu;
+    }
+}
+
+template <int M_STATIC, int P_STATIC>
+__device__ __forceinline__ void ideal_q1_dp4a_mr_body(
+    const int* __restrict__ qx_in,
+    const float* __restrict__ xsc_in,
+    const float* __restrict__ xsm_in,
+    const unsigned char* __restrict__ packed_lo,
+    const unsigned short* __restrict__ qscale,
+    const unsigned short* __restrict__ qzero,
+    const unsigned short* __restrict__ row_scale,
+    const unsigned short* __restrict__ bias_bf16,
+    void* __restrict__ y_out,
+    int N, int K,
+    int plane_count, int accumulate, int out_is_bf16
+) {
+    int ng = K >> 6;
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row0 = (blockIdx.x * warps_per_block + warp_id) * 2;
+    int row1 = row0 + 1;
+    if (row0 >= N) return;
+    bool valid1 = (row1 < N);
+
+    int k8 = K >> 3;
+    long long plane_byte_stride = (long long)N * k8;
+    const unsigned short* z_r0 = qzero  + (long long)row0 * ng;
+    const unsigned short* s_r0 = qscale + (long long)row0 * ng;
+    const unsigned short* z_r1 = valid1 ? (qzero  + (long long)row1 * ng) : nullptr;
+    const unsigned short* s_r1 = valid1 ? (qscale + (long long)row1 * ng) : nullptr;
+
+    float acc0[M_STATIC], acc1[M_STATIC];
+    #pragma unroll
+    for (int m = 0; m < M_STATIC; ++m) { acc0[m] = 0.0f; acc1[m] = 0.0f; }
+
+    const int P = (P_STATIC > 0) ? P_STATIC : plane_count;
+    const float inv_pow = __uint_as_float((unsigned int)(127 + (1 - P)) << 23);
+    const float u_mul = 2.0f * inv_pow;
+    const float u_sub = 2.0f - inv_pow;
+
+    for (int g = lane; g < ng; g += 32) {
+        float xsc[M_STATIC], xsm[M_STATIC];
+        #pragma unroll
+        for (int m = 0; m < M_STATIC; ++m) {
+            xsc[m] = __ldg(&xsc_in[m * ng + g]);
+            xsm[m] = __ldg(&xsm_in[m * ng + g]);
+        }
+
+        const unsigned char* bb0 = packed_lo + (long long)row0 * k8 + (g << 3);
+        uint2 a0 = *reinterpret_cast<const uint2*>(bb0);
+        uint2 a1 = (P > 1) ? *reinterpret_cast<const uint2*>(bb0 + plane_byte_stride) : make_uint2(0u, 0u);
+        uint2 a2 = (P > 2) ? *reinterpret_cast<const uint2*>(bb0 + 2LL * plane_byte_stride) : make_uint2(0u, 0u);
+        uint2 a3 = (P > 3) ? *reinterpret_cast<const uint2*>(bb0 + 3LL * plane_byte_stride) : make_uint2(0u, 0u);
+        uint2 a4 = (P > 4) ? *reinterpret_cast<const uint2*>(bb0 + 4LL * plane_byte_stride) : make_uint2(0u, 0u);
+        uint2 a5 = (P > 5) ? *reinterpret_cast<const uint2*>(bb0 + 5LL * plane_byte_stride) : make_uint2(0u, 0u);
+        uint2 a6 = (P > 6) ? *reinterpret_cast<const uint2*>(bb0 + 6LL * plane_byte_stride) : make_uint2(0u, 0u);
+
+        uint2 b0 = make_uint2(0u, 0u), b1 = make_uint2(0u, 0u), b2 = make_uint2(0u, 0u),
+              b3 = make_uint2(0u, 0u), b4 = make_uint2(0u, 0u), b5 = make_uint2(0u, 0u), b6 = make_uint2(0u, 0u);
+        if (valid1) {
+            const unsigned char* bb1 = packed_lo + (long long)row1 * k8 + (g << 3);
+            b0 = *reinterpret_cast<const uint2*>(bb1);
+            if (P > 1) b1 = *reinterpret_cast<const uint2*>(bb1 + plane_byte_stride);
+            if (P > 2) b2 = *reinterpret_cast<const uint2*>(bb1 + 2LL * plane_byte_stride);
+            if (P > 3) b3 = *reinterpret_cast<const uint2*>(bb1 + 3LL * plane_byte_stride);
+            if (P > 4) b4 = *reinterpret_cast<const uint2*>(bb1 + 4LL * plane_byte_stride);
+            if (P > 5) b5 = *reinterpret_cast<const uint2*>(bb1 + 5LL * plane_byte_stride);
+            if (P > 6) b6 = *reinterpret_cast<const uint2*>(bb1 + 6LL * plane_byte_stride);
+        }
+
+        int idot0[M_STATIC], idot1[M_STATIC];
+        #pragma unroll
+        for (int m = 0; m < M_STATIC; ++m) { idot0[m] = 0; idot1[m] = 0; }
+
+        /* Share L1-cached qx[m] across BOTH row0 and row1 for every q4! */
+        #pragma unroll
+        for (int q4 = 0; q4 < 8; ++q4) {
+            int sh = q4 << 2;
+            int wi0 = _q1_unpack_nib4_swar<P_STATIC>(a0.x, a1.x, a2.x, a3.x, a4.x, a5.x, a6.x, sh, P);
+            int wi1 = valid1 ? _q1_unpack_nib4_swar<P_STATIC>(b0.x, b1.x, b2.x, b3.x, b4.x, b5.x, b6.x, sh, P) : 0;
+            #pragma unroll
+            for (int m = 0; m < M_STATIC; ++m) {
+                int qx = __ldg(&qx_in[(m * 16 + q4) * ng + g]);
+                idot0[m] = _q1_dp4a_s32(wi0, qx, idot0[m]);
+                if (valid1) idot1[m] = _q1_dp4a_s32(wi1, qx, idot1[m]);
+            }
+        }
+        #pragma unroll
+        for (int q4 = 0; q4 < 8; ++q4) {
+            int sh = q4 << 2;
+            int wi0 = _q1_unpack_nib4_swar<P_STATIC>(a0.y, a1.y, a2.y, a3.y, a4.y, a5.y, a6.y, sh, P);
+            int wi1 = valid1 ? _q1_unpack_nib4_swar<P_STATIC>(b0.y, b1.y, b2.y, b3.y, b4.y, b5.y, b6.y, sh, P) : 0;
+            #pragma unroll
+            for (int m = 0; m < M_STATIC; ++m) {
+                int qx = __ldg(&qx_in[(m * 16 + q4 + 8) * ng + g]);
+                idot0[m] = _q1_dp4a_s32(wi0, qx, idot0[m]);
+                if (valid1) idot1[m] = _q1_dp4a_s32(wi1, qx, idot1[m]);
+            }
+        }
+
+        float zv0 = bf16_to_f32(z_r0[g]);
+        float sv0 = bf16_to_f32(s_r0[g]);
+        float z0_eff = zv0 - sv0 * u_sub;
+        float s0_eff = sv0 * u_mul;
+        #pragma unroll
+        for (int m = 0; m < M_STATIC; ++m) {
+            acc0[m] += z0_eff * xsm[m] + s0_eff * ((float)idot0[m] * xsc[m]);
+        }
+        if (valid1) {
+            float zv1 = bf16_to_f32(z_r1[g]);
+            float sv1 = bf16_to_f32(s_r1[g]);
+            float z1_eff = zv1 - sv1 * u_sub;
+            float s1_eff = sv1 * u_mul;
+            #pragma unroll
+            for (int m = 0; m < M_STATIC; ++m) {
+                acc1[m] += z1_eff * xsm[m] + s1_eff * ((float)idot1[m] * xsc[m]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int m = 0; m < M_STATIC; ++m) {
+            acc0[m] += __shfl_down_sync(0xffffffffu, acc0[m], offset);
+            if (valid1) acc1[m] += __shfl_down_sync(0xffffffffu, acc1[m], offset);
+        }
+    }
+
+    if (lane == 0) {
+        float rs0 = bf16_to_f32(row_scale[row0]);
+        float bv0 = (bias_bf16 != nullptr) ? bf16_to_f32(bias_bf16[row0]) : 0.0f;
+        float rs1 = valid1 ? bf16_to_f32(row_scale[row1]) : 0.0f;
+        float bv1 = (valid1 && bias_bf16 != nullptr) ? bf16_to_f32(bias_bf16[row1]) : 0.0f;
+        #pragma unroll
+        for (int m = 0; m < M_STATIC; ++m) {
+            long long base_out = (long long)m * N + row0;
+            q1_write_elem(y_out, base_out, acc0[m] * rs0 + bv0, accumulate, out_is_bf16);
+            if (valid1) q1_write_elem(y_out, base_out + 1, acc1[m] * rs1 + bv1, accumulate, out_is_bf16);
+        }
+    }
+}
+
+template <int M_STATIC>
+__device__ __forceinline__ void ideal_q1_dp4a_mr_dispatch_p(
+    const int* __restrict__ qx_in,
+    const float* __restrict__ xsc_in,
+    const float* __restrict__ xsm_in,
+    const unsigned char* __restrict__ packed_lo,
+    const unsigned short* __restrict__ qscale,
+    const unsigned short* __restrict__ qzero,
+    const unsigned short* __restrict__ row_scale,
+    const unsigned short* __restrict__ bias_bf16,
+    void* __restrict__ y_out,
+    int N, int K,
+    int plane_count, int accumulate, int out_is_bf16
+) {
+    if (plane_count == 5) {
+        ideal_q1_dp4a_mr_body<M_STATIC, 5>(qx_in, xsc_in, xsm_in, packed_lo, qscale, qzero, row_scale, bias_bf16, y_out, N, K, 5, accumulate, out_is_bf16);
+    } else if (plane_count == 4) {
+        ideal_q1_dp4a_mr_body<M_STATIC, 4>(qx_in, xsc_in, xsm_in, packed_lo, qscale, qzero, row_scale, bias_bf16, y_out, N, K, 4, accumulate, out_is_bf16);
+    } else if (plane_count == 6) {
+        ideal_q1_dp4a_mr_body<M_STATIC, 6>(qx_in, xsc_in, xsm_in, packed_lo, qscale, qzero, row_scale, bias_bf16, y_out, N, K, 6, accumulate, out_is_bf16);
+    } else {
+        ideal_q1_dp4a_mr_body<M_STATIC, 0>(qx_in, xsc_in, xsm_in, packed_lo, qscale, qzero, row_scale, bias_bf16, y_out, N, K, plane_count, accumulate, out_is_bf16);
+    }
+}
+
+extern "C" __global__ void ideal_q1_popc10_mr_gemv_f32(
+    const int* __restrict__ qx_in,
+    const float* __restrict__ xsc_in,
+    const float* __restrict__ xsm_in,
+    const unsigned char* __restrict__ packed_lo,
+    const unsigned short* __restrict__ qscale,
+    const unsigned short* __restrict__ qzero,
+    const unsigned short* __restrict__ row_scale,
+    const unsigned short* __restrict__ bias_bf16,
+    void* __restrict__ y_out,
+    int M, int N, int K, int plane_count, int accumulate, int out_is_bf16
+) {
+    if (M == 1) {
+        ideal_q1_dp4a_mr_dispatch_p<1>(qx_in, xsc_in, xsm_in, packed_lo, qscale, qzero, row_scale, bias_bf16, y_out, N, K, plane_count, accumulate, out_is_bf16);
+    } else if (M == 2) {
+        ideal_q1_dp4a_mr_dispatch_p<2>(qx_in, xsc_in, xsm_in, packed_lo, qscale, qzero, row_scale, bias_bf16, y_out, N, K, plane_count, accumulate, out_is_bf16);
+    } else if (M == 3) {
+        ideal_q1_dp4a_mr_dispatch_p<3>(qx_in, xsc_in, xsm_in, packed_lo, qscale, qzero, row_scale, bias_bf16, y_out, N, K, plane_count, accumulate, out_is_bf16);
+    } else if (M == 4) {
+        ideal_q1_dp4a_mr_dispatch_p<4>(qx_in, xsc_in, xsm_in, packed_lo, qscale, qzero, row_scale, bias_bf16, y_out, N, K, plane_count, accumulate, out_is_bf16);
+    }
+}
+
 /* Verification kernel for Ampere PTX mma.sync.aligned.m8n8k128.row.col.s32.b1.b1.s32.and.popc */
 extern "C" __global__ void b1_mma_m8n8k128_verify_u32(
     const unsigned int* __restrict__ a_bits,  /* [8, 4] uint32 */
@@ -2237,6 +2572,8 @@ _KERNEL_NAMES = (
     b"q1_packed_trunc_gemv_f32",
     b"ideal_q1_fwht_gemv_f32",
     b"ideal_q1_popc10_r2_gemv_f32",
+    b"ideal_q1_fwht_quant_i8_f32",
+    b"ideal_q1_popc10_mr_gemv_f32",
     b"b1_mma_m8n8k128_verify_u32",
     b"ideal_q1_b1_mma_gemm_f32",
     b"quintessentia_q2_fwht_gemv_f32",
@@ -2574,6 +2911,68 @@ def launch_q1_packed_trunc_gemv(
         raise RuntimeError(f"cuLaunchKernel(q1_packed_trunc_gemv_f32) failed with CUresult={rc}")
 
 
+_Q1_DP4A_SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_Q1_DP4A_ARGS_CACHE: dict[int, tuple] = {}
+_Q1_DP4A_M1_ENV: str | None = None
+
+
+def _get_q1_dp4a_scratch(dev: torch.device, m: int, ng: int):
+    dev_idx = 0 if dev.index is None else int(dev.index)
+    need_qx = m * 16 * ng
+    need_sc = m * ng
+    cur = _Q1_DP4A_SCRATCH.get(dev_idx)
+    if cur is None or cur[0].numel() < need_qx or cur[1].numel() < need_sc:
+        cap_qx = max(need_qx, 4 * 16 * 512)   # 128 KiB (covers M<=4, K<=32768)
+        cap_sc = max(need_sc, 4 * 512)        # 8 KiB
+        qx = torch.empty((cap_qx,), dtype=torch.int32, device=dev)
+        xsc = torch.empty((cap_sc,), dtype=torch.float32, device=dev)
+        xsm = torch.empty((cap_sc,), dtype=torch.float32, device=dev)
+        cur = (qx, xsc, xsm)
+        _Q1_DP4A_SCRATCH[dev_idx] = cur
+    return cur
+
+
+def _get_q1_dp4a_argbuf(dev_idx: int):
+    buf = _Q1_DP4A_ARGS_CACHE.get(dev_idx)
+    if buf is None:
+        p_x = ctypes.c_void_p(0)
+        p_cs = ctypes.c_void_p(0)
+        p_qx = ctypes.c_void_p(0)
+        p_xsc = ctypes.c_void_p(0)
+        p_xsm = ctypes.c_void_p(0)
+        p_lo = ctypes.c_void_p(0)
+        p_s = ctypes.c_void_p(0)
+        p_z = ctypes.c_void_p(0)
+        p_rs = ctypes.c_void_p(0)
+        p_bias = ctypes.c_void_p(0)
+        p_y = ctypes.c_void_p(0)
+        c_M = ctypes.c_int(0)
+        c_N = ctypes.c_int(0)
+        c_K = ctypes.c_int(0)
+        c_pc = ctypes.c_int(0)
+        c_acc = ctypes.c_int(0)
+        c_ob = ctypes.c_int(0)
+        c_stream = ctypes.c_void_p(0)
+        args_prep = (ctypes.c_void_p * 7)(
+            ctypes.addressof(p_x), ctypes.addressof(p_cs),
+            ctypes.addressof(p_qx), ctypes.addressof(p_xsc), ctypes.addressof(p_xsm),
+            ctypes.addressof(c_M), ctypes.addressof(c_K),
+        )
+        args_mr = (ctypes.c_void_p * 15)(
+            ctypes.addressof(p_qx), ctypes.addressof(p_xsc), ctypes.addressof(p_xsm),
+            ctypes.addressof(p_lo), ctypes.addressof(p_s), ctypes.addressof(p_z),
+            ctypes.addressof(p_rs), ctypes.addressof(p_bias), ctypes.addressof(p_y),
+            ctypes.addressof(c_M), ctypes.addressof(c_N), ctypes.addressof(c_K),
+            ctypes.addressof(c_pc), ctypes.addressof(c_acc), ctypes.addressof(c_ob),
+        )
+        buf = (
+            p_x, p_cs, p_qx, p_xsc, p_xsm, p_lo, p_s, p_z, p_rs, p_bias, p_y,
+            c_M, c_N, c_K, c_pc, c_acc, c_ob, c_stream, args_prep, args_mr,
+        )
+        _Q1_DP4A_ARGS_CACHE[dev_idx] = buf
+    return buf
+
+
 def launch_ideal_q1_fwht_gemv(
     x_bf16: torch.Tensor,
     packed_lo: torch.Tensor,
@@ -2604,6 +3003,68 @@ def launch_ideal_q1_fwht_gemv(
     cand_cnt = int(cand_rows.numel()) if cand_rows is not None else 0
     out_rows = cand_cnt if cand_cnt > 0 else N
     out_is_bf16 = 1 if y_out.dtype == torch.bfloat16 else 0
+    shared_sc = 1 if (qscale.ndim == 2 or (qscale.ndim == 3 and int(qscale.shape[0]) == 1 and (total_planes > 1 or plane_start > 0))) else 0
+
+    use_popc10_r2 = (
+        int(group_size) == 64
+        and K <= 32768
+        and shared_sc == 1
+        and cand_cnt == 0
+        and int(plane_start) == 0
+    )
+    use_dp4a_m1 = (M == 1 and os.environ.get("QUINTESSENTIA_DP4A_M1") == "1")
+    if use_popc10_r2 and ((2 <= M <= 4) or use_dp4a_m1) and p_cnt <= 7:
+        ng = K >> 6
+        dev_idx = 0 if dev.index is None else int(dev.index)
+        qx, xsc, xsm = _get_q1_dp4a_scratch(dev, M, ng)
+        (
+            p_x, p_cs, p_qx, p_xsc, p_xsm, p_lo, p_s, p_z, p_rs, p_bias, p_y,
+            c_M, c_N, c_K, c_pc, c_acc, c_ob, c_stream, args_prep, args_mr,
+        ) = _get_q1_dp4a_argbuf(dev_idx)
+        p_x.value = x_bf16.data_ptr()
+        p_cs.value = col_scale.data_ptr()
+        p_qx.value = qx.data_ptr()
+        p_xsc.value = xsc.data_ptr()
+        p_xsm.value = xsm.data_ptr()
+        p_lo.value = packed_lo.data_ptr()
+        p_s.value = qscale.data_ptr()
+        p_z.value = qzero.data_ptr()
+        p_rs.value = row_scale.data_ptr()
+        p_bias.value = 0 if bias is None else bias.data_ptr()
+        p_y.value = y_out.data_ptr()
+        c_M.value = M
+        c_N.value = N
+        c_K.value = K
+        c_pc.value = p_cnt
+        c_acc.value = 1 if accumulate else 0
+        c_ob.value = out_is_bf16
+        c_stream.value = torch.cuda.current_stream(dev).cuda_stream
+
+        rc = nvcuda.cuLaunchKernel(
+            fns[b"ideal_q1_fwht_quant_i8_f32"],
+            (M * ng + 7) // 8, 1, 1, 256, 1, 1, 0, c_stream, args_prep, None,
+        )
+        if rc != 0:
+            raise RuntimeError(f"cuLaunchKernel(ideal_q1_fwht_quant_i8_f32) failed with CUresult={rc}")
+        rc = nvcuda.cuLaunchKernel(
+            fns[b"ideal_q1_popc10_mr_gemv_f32"],
+            (out_rows + 15) // 16, 1, 1, 256, 1, 1, 0, c_stream, args_mr, None,
+        )
+        if rc != 0:
+            raise RuntimeError(f"cuLaunchKernel(ideal_q1_popc10_mr_gemv_f32) failed with CUresult={rc}")
+        return
+    if use_popc10_r2 and 5 <= M <= 7 and p_cnt <= 7:
+        launch_ideal_q1_fwht_gemv(
+            x_bf16[:4], packed_lo, qscale, qzero, row_scale, col_scale, y_out[:4],
+            group_size=group_size, total_planes=total_planes, plane_start=plane_start,
+            plane_count=p_cnt, cand_rows=cand_rows, bias=bias, accumulate=accumulate,
+        )
+        launch_ideal_q1_fwht_gemv(
+            x_bf16[4:], packed_lo, qscale, qzero, row_scale, col_scale, y_out[4:],
+            group_size=group_size, total_planes=total_planes, plane_start=plane_start,
+            plane_count=p_cnt, cand_rows=cand_rows, bias=bias, accumulate=accumulate,
+        )
+        return
 
     p_x = ctypes.c_void_p(x_bf16.data_ptr())
     p_lo = ctypes.c_void_p(packed_lo.data_ptr())
@@ -2618,7 +3079,6 @@ def launch_ideal_q1_fwht_gemv(
     c_M, c_N, c_K, c_gs = ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(group_size)
     c_pt, c_ps, c_pc = ctypes.c_int(total_planes), ctypes.c_int(plane_start), ctypes.c_int(p_cnt)
     c_cc, c_acc, c_ob = ctypes.c_int(cand_cnt), ctypes.c_int(1 if accumulate else 0), ctypes.c_int(out_is_bf16)
-    shared_sc = 1 if (qscale.ndim == 2 or (qscale.ndim == 3 and int(qscale.shape[0]) == 1 and (total_planes > 1 or plane_start > 0))) else 0
     c_ss = ctypes.c_int(shared_sc)
 
     args = (ctypes.c_void_p * 20)(
@@ -2629,14 +3089,6 @@ def launch_ideal_q1_fwht_gemv(
         ctypes.addressof(c_M), ctypes.addressof(c_N), ctypes.addressof(c_K), ctypes.addressof(c_gs),
         ctypes.addressof(c_pt), ctypes.addressof(c_ps), ctypes.addressof(c_pc),
         ctypes.addressof(c_cc), ctypes.addressof(c_acc), ctypes.addressof(c_ob), ctypes.addressof(c_ss),
-    )
-
-    use_popc10_r2 = (
-        int(group_size) == 64
-        and K <= 32768
-        and shared_sc == 1
-        and cand_cnt == 0
-        and int(plane_start) == 0
     )
     if use_popc10_r2:
         ng = K >> 6

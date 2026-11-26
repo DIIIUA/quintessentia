@@ -3121,15 +3121,31 @@ class GGUFModelSource:
         self._stored: dict[str, tuple[str, str]] = {}
         self._mtp: dict[str, tuple[str, str]] = {}
 
+        from transformers.integrations.gguf.gguf_conversion_mapping import SubtractOne
+        from transformers.core_model_loading import WeightConverter
+
+        _qwen35_zero_centered_norms = hf_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
+        _nextn_map = {
+            "nextn.eh_proj.weight": ("mtp.fc.weight", False),
+            "nextn.enorm.weight": ("mtp.pre_fc_norm_embedding.weight", _qwen35_zero_centered_norms),
+            "nextn.hnorm.weight": ("mtp.pre_fc_norm_hidden.weight", _qwen35_zero_centered_norms),
+            "nextn.shared_head_norm.weight": ("mtp.norm.weight", _qwen35_zero_centered_norms),
+        }
+
         default_shard_str = str(self.gguf_path)
         for t in raw_tensors:
             gguf_name = t["name"]
             if gguf_name.startswith(("v.", "mm.", "audio.", "mtp.")):
                 continue
-            blk_m = re.match(r"^blk\.(\d+)\.", gguf_name)
+            blk_m = re.match(r"^blk\.(\d+)\.(.+)$", gguf_name)
+            is_mtp_blk = False
             if blk_m and expected_layers > 0 and int(blk_m.group(1)) >= expected_layers:
-                # Skip extra MTP/NextN block stored past block_count - nextn_predict_layers.
-                continue
+                # Extra MTP/NextN block stored at blk.<expected_layers>.* (e.g. Qwen3.5 / Qwythos blk.32.*).
+                # Keep the primary MTP head (mtp_idx == 0) in self._mtp; skip deeper MTP blocks if any.
+                if int(blk_m.group(1)) == expected_layers:
+                    is_mtp_blk = True
+                else:
+                    continue
 
             gt = int(t["ggml_type"])
             if (
@@ -3148,6 +3164,43 @@ class GGUFModelSource:
             info["shard_path"] = shard_str
             info["torch_shape"] = torch_shape
             self._tensor_info[gguf_name] = info
+
+            if is_mtp_blk and blk_m is not None:
+                blk_idx = int(blk_m.group(1))
+                leaf_raw = blk_m.group(2)
+                if leaf_raw in _nextn_map:
+                    mtp_canon, need_sub1 = _nextn_map[leaf_raw]
+                    self._canonical_by_gguf[gguf_name] = mtp_canon
+                    if need_sub1:
+                        pat = re.escape(leaf_raw)
+                        wc = WeightConverter(
+                            source_patterns=[pat],
+                            target_patterns=[mtp_canon],
+                            operations=[SubtractOne()],
+                        )
+                        self._converter_by_gguf[gguf_name] = (wc, pat)
+                    else:
+                        self._converter_by_gguf[gguf_name] = None
+                    self._post_shapes[gguf_name] = torch_shape
+                    self._mtp[mtp_canon] = (shard_str, gguf_name)
+                    continue
+                # Standard decoder-layer tensor inside the MTP block (e.g. attn_q, ffn_gate, attn_norm...)
+                canonical, src_pat = rename_source_key(gguf_name, renamings, converters)
+                conv = pattern_to_converter.get(src_pat) if src_pat is not None else None
+                self._canonical_by_gguf[gguf_name] = canonical
+                self._converter_by_gguf[gguf_name] = (conv, src_pat) if conv is not None else None
+                ops = getattr(conv, "operations", ()) if conv is not None else ()
+                self._post_shapes[gguf_name] = _apply_shape_ops(torch_shape, ops)
+                m_mtp = _LAYER_RE.match(canonical)
+                if m_mtp and int(m_mtp.group(1)) == blk_idx:
+                    mtp_canon = f"mtp.layers.0.{m_mtp.group(2)}"
+                    self._mtp[mtp_canon] = (shard_str, gguf_name)
+                elif canonical.startswith("mtp.layers."):
+                    self._mtp[canonical] = (shard_str, gguf_name)
+                elif canonical.startswith("mtp."):
+                    leaf = canonical.removeprefix("mtp.")
+                    self._mtp[f"mtp.layers.0.{leaf}"] = (shard_str, gguf_name)
+                continue
 
             eb_m = _GGUF_EXPS_BIAS_RE.match(gguf_name)
             if eb_m:
@@ -3334,7 +3387,7 @@ class GGUFModelSource:
         return dict(self._mtp)
 
     def has_mtp(self) -> bool:
-        return False
+        return "mtp.fc.weight" in self._mtp
 
     def post_shape(self, gguf_name: str) -> tuple[int, ...]:
         return self._post_shapes[gguf_name]

@@ -304,8 +304,8 @@ class LiveTelemetryBeacon:
                     "avg_tok_s": round(avg_tok_s, 2),
                     "peak_tok_s": round(max(self._peak_tok_s, avg_tok_s), 2),
                     "ttft_ms": round(ttft_ms, 1),
-                    "answer_preview": answer_tail[-1400:],
-                    "thinking_preview": thinking_tail[-500:],
+                    "answer_preview": answer_tail[-8000:],
+                    "thinking_preview": thinking_tail[-4000:],
                 }
             )
             self._dirty = True
@@ -391,8 +391,8 @@ class LiveTelemetryBeacon:
                     "moe_host_hits": moe_host_hits,
                     "moe_misses": moe_misses,
                     "finish_reason": str(metrics.get("finish_reason", "stop")),
-                    "answer_preview": answer_text[-1400:],
-                    "thinking_preview": thinking_text[-500:],
+                    "answer_preview": answer_text[-8000:],
+                    "thinking_preview": thinking_text[-4000:],
                 }
             )
             self._dirty = True

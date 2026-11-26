@@ -640,3 +640,39 @@ def test_pinned_offloaded_kv_cache_parity_and_crop():
                 assert snap_h.vram_bytes == 0
                 assert GeneralSpeculation._snapshot_bytes(hyb) == 0
                 release_kv_cache_gpu_buffers(hyb)
+
+
+def test_explicit_unknown_tool_call_is_emitted_not_leaked_as_raw_xml():
+    """Regression: explicit `<tool_call><function=browser_agent_inspect_all>` must be emitted as a structured
+    OpenAI tool_call (so the client returns an 'unknown tool' error for self-correction) instead of leaking
+    raw XML markup into user prose and halting the agent loop.
+    """
+    raw = (
+        "<tool_call>\n"
+        "<function=browser_agent_inspect_all>\n"
+        "<parameter=tab_id>\n"
+        "venice\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    clean, calls = parse_tool_calls(raw, tools=SAMPLE_TOOLS)
+    assert clean == ""
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "browser_agent_inspect_all"
+    assert _args(calls[0]) == {"tab_id": "venice"}
+
+    # Streaming guard must also emit structured tool_call and leak zero XML prose
+    guard = StreamingToolCallGuard(tools=SAMPLE_TOOLS, structured_mode=True)
+    emitted = []
+    for part in ("<tool_", "call>\n<function=browser_agent_inspect_all>\n", "<parameter=tab_id>\nvenice\n</parameter>\n</function>\n</tool_call>"):
+        emitted.extend(guard.push(part))
+    rem, scalls = guard.finish()
+    assert ("".join(emitted) + rem).strip() == ""
+    assert len(scalls) == 1 and scalls[0]["function"]["name"] == "browser_agent_inspect_all"
+    assert _args(scalls[0]) == {"tab_id": "venice"}
+
+    # Meanwhile, bare/untagged JSON with an unknown name must STILL NOT trigger a false tool call
+    bare_clean, bare_calls = parse_tool_calls('{"name": "not_a_tool", "x": 1}', tools=SAMPLE_TOOLS, allow_bare_json=True)
+    assert bare_calls == []
+    assert '"not_a_tool"' in bare_clean

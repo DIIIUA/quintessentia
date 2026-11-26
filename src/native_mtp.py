@@ -13,7 +13,7 @@ from accelerate.utils import set_module_tensor_to_device
 
 
 class NativeMTPHead(nn.Module):
-    def __init__(self, engine, path=None, budget_bytes=128*2**20):
+    def __init__(self, engine, path=None, budget_bytes=512*2**20):
         super().__init__()
         from quintessentia_cli.model_source import PreadSafetensorsReader, read_safetensors_header
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -33,37 +33,68 @@ class NativeMTPHead(nn.Module):
             entries = {name: (str(Path(path)), name) for name in header if name.startswith("mtp.")}
         if not entries:
             raise FileNotFoundError("Checkpoint has no trained mtp.* tensors")
+        use_gguf_source = (
+            path is None
+            and source is not None
+            and hasattr(source, "read_converted_tensor")
+            and hasattr(source, "tensor_shape")
+        )
         shapes = {}
-        for name, (filename, stored) in entries.items():
-            header, _ = read_safetensors_header(filename)
-            shapes[name] = tuple(header[stored]["shape"])
+        if use_gguf_source:
+            for name, entry in entries.items():
+                shapes[name] = tuple(source.tensor_shape(entry))
+        else:
+            for name, (filename, stored) in entries.items():
+                header, _ = read_safetensors_header(filename)
+                shapes[name] = tuple(header[stored]["shape"])
         item_bytes = torch.empty((), dtype=self.dtype).element_size()
         required_bytes = sum(math.prod(shape)*item_bytes for shape in shapes.values())
         if required_bytes > budget_bytes:
             raise ValueError(f"Native MTP weights need {required_bytes} bytes; head budget is {budget_bytes}")
+        # Prefer CUDA when plenty of free VRAM is available (e.g. Q1-Cubes resident model), else CPU
+        target_dev = torch.device("cpu")
+        eng_dev = getattr(engine, "device", None)
+        if eng_dev is not None and torch.device(eng_dev).type == "cuda" and torch.cuda.is_available():
+            try:
+                free_vram, _ = torch.cuda.mem_get_info(eng_dev)
+                if free_vram >= required_bytes + 1536 * 2**20:
+                    target_dev = torch.device(eng_dev)
+            except Exception:
+                target_dev = torch.device("cpu")
+        self.device = target_dev
         with torch.device("meta"):
             self.layer = Qwen3_5DecoderLayer(cfg, layer_idx=0)
             self.fc = nn.Linear(2*cfg.hidden_size, cfg.hidden_size, bias=False)
             self.embedding_norm = Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
             self.hidden_norm = Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
             self.output_norm = Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.rotary = Qwen3_5TextRotaryEmbedding(cfg)
+        self.rotary = Qwen3_5TextRotaryEmbedding(cfg).to(self.device)
         aliases = {"mtp.fc.weight": "fc.weight", "mtp.pre_fc_norm_embedding.weight": "embedding_norm.weight",
                    "mtp.pre_fc_norm_hidden.weight": "hidden_norm.weight", "mtp.norm.weight": "output_norm.weight"}
         mapped = {aliases.get(name, name.replace("mtp.layers.0.", "layer.")): entry
                   for name, entry in entries.items()}
         expected = dict(self.named_parameters())
         if set(mapped) != set(expected):
-            raise ValueError("Native MTP tensor names do not match the configured trained head")
-        self.reader = PreadSafetensorsReader(max_handles=2)
-        try:
+            raise ValueError(
+                f"Native MTP tensor names do not match the configured trained head "
+                f"(missing={sorted(set(expected) - set(mapped))}, extra={sorted(set(mapped) - set(expected))})"
+            )
+        if use_gguf_source:
             for name, entry in mapped.items():
-                value = self.reader.read_tensor(*entry)
+                value = source.read_converted_tensor(entry[1], dtype=self.dtype, device=self.device)
                 if value.shape != expected[name].shape:
-                    raise ValueError(f"Native MTP shape mismatch: {name}")
-                set_module_tensor_to_device(self, name, "cpu", value=value, dtype=self.dtype, clear_cache=False)
-        finally:
-            self.reader.close()
+                    raise ValueError(f"Native MTP shape mismatch: {name} ({tuple(value.shape)} != {tuple(expected[name].shape)})")
+                set_module_tensor_to_device(self, name, self.device, value=value, dtype=self.dtype, clear_cache=False)
+        else:
+            self.reader = PreadSafetensorsReader(max_handles=2)
+            try:
+                for name, entry in mapped.items():
+                    value = self.reader.read_tensor(*entry)
+                    if value.shape != expected[name].shape:
+                        raise ValueError(f"Native MTP shape mismatch: {name}")
+                    set_module_tensor_to_device(self, name, self.device, value=value, dtype=self.dtype, clear_cache=False)
+            finally:
+                self.reader.close()
         self.weight_bytes = sum(p.nbytes for p in self.parameters())
         self.eval()
         self.reset()
@@ -91,7 +122,7 @@ class NativeMTPHead(nn.Module):
         mask = None
         if count > 1:
             mask = torch.zeros((count, start+count), dtype=self.dtype, device=self.device)
-            mask[:, start:] = torch.triu(torch.full((count, count), float("-inf"), dtype=self.dtype), diagonal=1)
+            mask[:, start:] = torch.triu(torch.full((count, count), float("-inf"), dtype=self.dtype, device=self.device), diagonal=1)
             mask = mask[None, None]
         result = self.layer(x, attention_mask=mask, position_ids=positions[None],
                             past_key_values=self.cache, use_cache=True, position_embeddings=rotary)
@@ -123,16 +154,27 @@ class NativeMTPHead(nn.Module):
     def draft(self, count):
         if not count or self.last_normed is None:
             return [], []
+        import os
         self._trim(self.committed)
         hidden = self.last_normed
         tokens, confidences = [], []
-        for i in range(count):
-            logits = self.engine.model.get_output_embeddings()(hidden.to(self.engine.device)).float()[0, -1]
-            probability, token = torch.softmax(logits, dim=-1).max(dim=-1)
-            tokens.append(int(token.item()))
-            confidences.append(float(probability.item()))
-            if i+1 < count:
-                hidden = self._pairs(hidden, [tokens[-1]])[:, -1:]
+        lm_head = self.engine.model.get_output_embeddings()
+        draft_planes_env = int(os.environ.get("QUINTESSENTIA_MTP_DRAFT_PLANES", "0") or 0)
+        old_cubes = None
+        if draft_planes_env > 0 and hasattr(lm_head, "active_cubes") and int(lm_head.active_cubes) > draft_planes_env:
+            old_cubes = int(lm_head.active_cubes)
+            lm_head.active_cubes = draft_planes_env
+        try:
+            for i in range(count):
+                logits = lm_head(hidden.to(self.engine.device)).float()[0, -1]
+                probability, token = torch.softmax(logits, dim=-1).max(dim=-1)
+                tokens.append(int(token.item()))
+                confidences.append(float(probability.item()))
+                if i+1 < count:
+                    hidden = self._pairs(hidden, [tokens[-1]])[:, -1:]
+        finally:
+            if old_cubes is not None:
+                lm_head.active_cubes = old_cubes
         return tokens, confidences
 
     def close(self):

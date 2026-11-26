@@ -8,6 +8,8 @@ __pycache__/
 models/
 data/
 logs/
+sessions/
+cli_config.json
 *.safetensors
 *.bin
 *.log
@@ -20,6 +22,10 @@ logs/
 /quintessentia.local.json
 /QUINTESSENTIA_KNOWLEDGE.txt
 /doctor_report.json
+/HANDOFF_*.md
+/Start_Quintessentia.cmd
+/launch_quintessentia_ui.sh
+/quintessentia.ico
 
 # Local tooling
 .gemini/

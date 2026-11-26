@@ -301,3 +301,165 @@ def test_kv_offload_supports_asymmetric_mla_k_v_dims():
         assert torch.allclose(ok[:, :, 5:, :], k2)
         assert torch.allclose(ov[:, :, 5:, :], v2)
 
+
+def test_fast_linear_cache_snapshot_restore_roundtrip():
+    """Fast direct-clone path for Qwen3.5 LinearAttentionLayer avoids deepcopy and restores exact tensors in-place."""
+    from types import SimpleNamespace
+    from quintessentia_cli.thought_buffer import capture_cache_snapshot, restore_cache_snapshot
+
+    class _MockLinearLayer:
+        def __init__(self):
+            self.conv_states = {0: torch.arange(32, dtype=torch.bfloat16).reshape(1, 8, 4)}
+            self.recurrent_states = {0: torch.linspace(-1.0, 1.0, 64, dtype=torch.float32).reshape(1, 4, 4, 4)}
+            self.has_previous_state = {0: True}
+            self.conv_kernel_size = {0: 4}
+
+    lay = _MockLinearLayer()
+    past = SimpleNamespace(layers=[lay])
+    orig_conv = lay.conv_states[0].clone()
+    orig_rec = lay.recurrent_states[0].clone()
+
+    snap = capture_cache_snapshot(past)
+    assert 0 in snap.fast_linear_layers
+    assert snap.layer_states[0]["has_previous_state"] == {0: True}
+    assert snap.vram_bytes == orig_conv.nbytes + orig_rec.nbytes
+
+    # Mutate live cache in-place
+    lay.conv_states[0].zero_()
+    lay.recurrent_states[0].fill_(99.0)
+    lay.has_previous_state[0] = False
+
+    restore_cache_snapshot(past, snap)
+    assert torch.equal(lay.conv_states[0], orig_conv)
+    assert torch.equal(lay.recurrent_states[0], orig_rec)
+    assert lay.has_previous_state[0] is True
+
+
+def test_hybrid_spec_snapshot_manager_begin_save_rollback():
+    """HybridSpecSnapshotManager restores linear states and crops full-attention layers without replay."""
+    from types import SimpleNamespace
+    from quintessentia_cli.unified_runtime import HybridSpecSnapshotManager
+
+    cfg = SimpleNamespace(
+        layer_types=["linear_attention", "full_attention"],
+        linear_key_head_dim=4,
+        linear_num_key_heads=2,
+        linear_value_head_dim=4,
+        linear_num_value_heads=4,
+        linear_conv_kernel_dim=4,
+    )
+    mgr = HybridSpecSnapshotManager(cfg, torch.device("cpu"), max_drafts=3)
+
+    class _FakeFullLayer:
+        def __init__(self, seq_len=10):
+            self.seq_len = seq_len
+
+        def crop(self, delta):
+            self.seq_len += delta
+
+    conv_cur = torch.ones((1, 32, 4), dtype=torch.bfloat16)
+    rec_cur = torch.ones((1, 4, 4, 4), dtype=torch.float32)
+    full_lay = _FakeFullLayer(seq_len=13)
+
+    class _FakePast:
+        def __init__(self):
+            self.layers = [SimpleNamespace(), full_lay]
+
+        def get_conv_state(self, idx, state_idx=0):
+            return conv_cur
+
+        def get_recurrent_state(self, idx, state_idx=0):
+            return rec_cur
+
+    past = _FakePast()
+    # Incomplete capture must safely return False
+    mgr.begin_capture()
+    assert mgr.rollback_to_accepted(past, accepted_drafts=0, total_drafts=2) is False
+
+    # Save row 0 (value=2) and row 1 (value=3), then advance live state to value=4
+    conv_cur.fill_(2)
+    rec_cur.fill_(2.0)
+    mgr.save_row(0, 0, conv_cur, rec_cur)
+    conv_cur.fill_(3)
+    rec_cur.fill_(3.0)
+    mgr.save_row(0, 1, conv_cur, rec_cur)
+    conv_cur.fill_(4)
+    rec_cur.fill_(4.0)
+    mgr.end_capture()
+
+    # Rollback to accepted_drafts=1 out of total_drafts=2 (1 rejected token)
+    ok = mgr.rollback_to_accepted(past, accepted_drafts=1, total_drafts=2)
+    assert ok is True
+    assert torch.all(conv_cur == 3)
+    assert torch.all(rec_cur == 3.0)
+    assert full_lay.seq_len == 12
+
+
+def test_q1_dp4a_multirow_bit_exact_self_parity_cuda():
+    """Verify two-stage zero-smem dp4a Q1 kernel gives bit-exact M=1 == M=2..4 parity and high accuracy vs popc10."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Q1 dp4a NVRTC parity check")
+    import os
+    from src.binary_halving_q1 import BinaryHalvingQ1Linear, halve_weight_to_q1_tree
+
+    torch.manual_seed(7)
+    dev = torch.device("cuda")
+    w = torch.randn(512, 256, device=dev, dtype=torch.bfloat16) * 0.03
+    tensors, meta = halve_weight_to_q1_tree(
+        w, root_bits=8, group_size=64, law="positional_halving", use_fwht=True, compute_diagnostics=False
+    )
+    layer = BinaryHalvingQ1Linear(256, 512, tensors, meta)
+    layer.active_cubes = 5
+    x4 = torch.randn(4, 256, device=dev, dtype=torch.bfloat16)
+
+    prev_env = os.environ.get("QUINTESSENTIA_DP4A_M1")
+    try:
+        os.environ["QUINTESSENTIA_DP4A_M1"] = "0"
+        with torch.no_grad():
+            ref_popc = torch.cat([layer(x4[i : i + 1]).float() for i in range(4)], dim=0)
+        os.environ["QUINTESSENTIA_DP4A_M1"] = "1"
+        with torch.no_grad():
+            ref_dp4a_m1 = torch.cat([layer(x4[i : i + 1]).float() for i in range(4)], dim=0)
+            for m in (2, 3, 4):
+                y_m = layer(x4[:m].contiguous()).float()
+                assert torch.equal(y_m, ref_dp4a_m1[:m]), f"M={m} dp4a must be bit-identical to M=1 dp4a"
+                cos = torch.nn.functional.cosine_similarity(y_m.flatten(), ref_popc[:m].flatten(), dim=0).item()
+                assert cos > 0.999, f"Expected cos > 0.999 vs popc10, got {cos}"
+    finally:
+        if prev_env is None:
+            os.environ.pop("QUINTESSENTIA_DP4A_M1", None)
+        else:
+            os.environ["QUINTESSENTIA_DP4A_M1"] = prev_env
+
+
+def test_qwen3_next_gguf_mapping_preserves_grouped_ssm_order():
+    """Regression test: llama.cpp qwen3next GGUFs store ssm_a/dt_bias/conv1d/out_proj in HF grouped order."""
+    from types import SimpleNamespace
+    from quintessentia_cli.gguf_arch_registry import (
+        LogNegate,
+        TiledToGroupedInputs,
+        TiledToGroupedRows,
+        Unsqueeze,
+        WeightConverter,
+        get_extended_gguf_mapping,
+    )
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_next",
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    rules = get_extended_gguf_mapping("qwen3next", cfg)
+    convs = [r for r in rules if isinstance(r, WeightConverter)]
+    for conv in convs:
+        for op in conv.operations:
+            assert not isinstance(op, (TiledToGroupedRows, TiledToGroupedInputs)), (
+                f"qwen3_next converter {conv.source_patterns} must not apply TiledToGrouped permutation"
+            )
+    a_log_conv = next(c for c in convs if c.target_patterns == ["linear_attn.A_log"])
+    assert any(isinstance(op, LogNegate) for op in a_log_conv.operations)
+    conv1d_conv = next(c for c in convs if c.target_patterns == ["linear_attn.conv1d.weight"])
+    assert any(isinstance(op, Unsqueeze) for op in conv1d_conv.operations)
+

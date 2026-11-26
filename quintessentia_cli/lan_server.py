@@ -27,14 +27,17 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import os
 from pathlib import Path
 import select
 import socket
+import sys
 import threading
 import time
 import traceback
 from typing import Any
 import uuid
+from .i18n import get_lang, tr
 from .runtime_config import compute_runtime_limits, model_context_limit
 from .tool_calling import (
     StreamingToolCallGuard,
@@ -279,7 +282,7 @@ def format_connection_passport(passport: dict[str, Any]) -> str:
         "  2) Quick curl test (streaming SSE):\n"
         f'       curl -N {oai_url}/chat/completions -H "Content-Type: application/json" '
         f'-H "Authorization: Bearer {api_key}" '
-        f'-d "{{\\"model\\":\\"{model_id}\\",\\"stream\\":true,\\"messages\\":[{{\\"role\\":\\"user\\",\\"content\\":\\"Привет!\\"}}]}}"\n\n'
+        f'-d "{{\\"model\\":\\"{model_id}\\",\\"stream\\":true,\\"messages\\":[{{\\"role\\":\\"user\\",\\"content\\":\\"{tr("Hello!", "Привет!")}\\"}}]}}"\n\n'
         "  3) Connect Cursor / Continue / OpenWebUI / Python `openai`:\n"
         f'       client = OpenAI(base_url="{oai_url}", api_key="{api_key}")\n'
         "--------------------------------------------------------------------------------\n"
@@ -291,7 +294,7 @@ def format_connection_passport(passport: dict[str, Any]) -> str:
 
 
 WEB_UI_HTML = r"""<!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -303,8 +306,10 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
   header { padding:12px 18px; background:var(--panel); border-bottom:1px solid var(--border); display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; }
   .brand { font-weight:700; font-size:16px; display:flex; align-items:center; gap:8px; }
   .dot { width:9px; height:9px; border-radius:50%; background:var(--ok); display:inline-block; box-shadow:0 0 8px var(--ok); }
-  .badges { display:flex; flex-wrap:wrap; gap:8px; font-size:12px; color:var(--muted); }
+  .badges { display:flex; flex-wrap:wrap; gap:8px; font-size:12px; color:var(--muted); align-items:center; }
   .badge { background:#1a2436; border:1px solid var(--border); padding:4px 9px; border-radius:999px; }
+  .lang-btn { background:#1e293b; color:#e6edf7; border:1px solid var(--border); border-radius:999px; padding:4px 10px; height:auto; font-size:12px; font-weight:700; cursor:pointer; }
+  .lang-btn:hover { border-color:var(--acc); color:var(--acc); }
   main { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:14px; max-width:940px; width:100%; margin:0 auto; }
   .msg { padding:13px 16px; border-radius:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; }
   .user { align-self:flex-end; background:#1e3a5f; border:1px solid #2d5488; max-width:82%; }
@@ -322,15 +327,15 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <div class="brand"><span class="dot"></span> Quintessentia LAN Node</div>
-  <div class="badges" id="badges">Загрузка паспорта узла...</div>
+  <div class="brand"><span class="dot"></span> Quintessentia LAN Node <button class="lang-btn" id="langBtn" title="Switch language / Сменить язык">EN / RU</button></div>
+  <div class="badges" id="badges">Loading node passport...</div>
 </header>
 <main id="chat"></main>
 <footer>
   <div class="bar">
     <label class="chk"><input type="checkbox" id="thinkChk" checked> &lt;think&gt;</label>
-    <textarea id="inp" placeholder="Напиши запрос модели в локальной сети... (Enter — отправить, Shift+Enter — перенос)"></textarea>
-    <button id="sendBtn">Отправить</button>
+    <textarea id="inp" placeholder="Ask the local LAN model... (Enter to send, Shift+Enter for newline)"></textarea>
+    <button id="sendBtn">Send</button>
   </div>
 </footer>
 <script>
@@ -339,22 +344,90 @@ const inp = document.getElementById('inp');
 const sendBtn = document.getElementById('sendBtn');
 const badges = document.getElementById('badges');
 const thinkChk = document.getElementById('thinkChk');
+const langBtn = document.getElementById('langBtn');
 let historyMsgs = [];
 
+const I18N = {
+  en: {
+    loading: 'Loading node passport...',
+    placeholder: 'Ask the local LAN model... (Enter to send, Shift+Enter for newline)',
+    send: 'Send',
+    stop: 'Stop',
+    thinking: 'Thinking (<think>)...',
+    showThinking: 'Show thinking (<think>)',
+    stopped: 'Stopped',
+    connErr: 'Connection error: ',
+    ready: 'ready',
+    btn: 'EN -> RU',
+  },
+  ru: {
+    loading: 'Загрузка паспорта узла...',
+    placeholder: 'Напиши запрос модели в локальной сети... (Enter — отправить, Shift+Enter — перенос)',
+    send: 'Отправить',
+    stop: 'Стоп',
+    thinking: 'Размышление (<think>)...',
+    showThinking: 'Показать размышление (<think>)',
+    stopped: 'Остановлено',
+    connErr: 'Ошибка соединения: ',
+    ready: 'готов',
+    btn: 'RU -> EN',
+  }
+};
+
+let uiLang = localStorage.getItem('quint_lang') || ((navigator.language || '').toLowerCase().startsWith('ru') ? 'ru' : 'en');
+function T(k) { return (I18N[uiLang] || I18N.en)[k] || I18N.en[k]; }
+function applyLang(l, persist) {
+  uiLang = (l === 'ru') ? 'ru' : 'en';
+  document.documentElement.lang = uiLang;
+  if (persist) { try { localStorage.setItem('quint_lang', uiLang); } catch (e) {} }
+  inp.placeholder = T('placeholder');
+  sendBtn.textContent = activeCtrl ? T('stop') : T('send');
+  langBtn.textContent = T('btn');
+}
+langBtn.onclick = () => { applyLang(uiLang === 'en' ? 'ru' : 'en', true); refreshInfo(); };
+
+async function setLiveK(k) {
+  try {
+    const r = await fetch('/api/q1', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({q1_planes: k})
+    });
+    if (r.ok) await refreshInfo();
+  } catch (e) {}
+}
+
+let serverLangApplied = false;
 async function refreshInfo() {
   try {
     const r = await fetch('/api/info');
     const d = await r.json();
+    if (!serverLangApplied && !localStorage.getItem('quint_lang') && (d.language === 'en' || d.language === 'ru')) {
+      serverLangApplied = true;
+      applyLang(d.language, false);
+    }
     const st = d.engine || {};
     const lm = st.last_metrics || {};
-    const tps = lm.decode_tok_per_s ? `${lm.decode_tok_per_s} tok/s` : 'ready';
+    const tps = lm.decode_tok_per_s ? `${lm.decode_tok_per_s} tok/s` : T('ready');
     const rb = lm.rssf_generation_balance || {};
     const tb = rb.turn_end_balance || {};
     const kvBadge = (lm.kv_gpu_layers || lm.kv_offloaded_layers) ? `<span class="badge">KV: ${lm.kv_gpu_layers || 0}G/${lm.kv_offloaded_layers || 0}R</span>` : '';
     const balBadge = (tb.d3_margin !== undefined) ? `<span class="badge">Balance: d3=${tb.d3_margin} (${tb.regime || 'OK'})</span>` : '';
+    let kCtrl = '';
+    if (d.weight_format === 'q1_cubes' && d.q1_planes_loaded) {
+      const curK = d.q1_planes || d.q1_planes_loaded;
+      const maxK = d.q1_planes_loaded;
+      let btns = '';
+      for (let i = 1; i <= maxK; i++) {
+        const active = (i === curK) ? 'background:#2563eb;color:#fff;border-color:#60a5fa;' : 'background:#1e293b;color:#cbd5e1;border-color:#334155;';
+        btns += `<button onclick="setLiveK(${i})" style="margin-left:3px;padding:1px 6px;border-radius:4px;border:1px solid;cursor:pointer;font-size:11px;height:auto;${active}">${i}</button>`;
+      }
+      kCtrl = `<span class="badge">Q1 K (root ${d.cube_root_bits || 8}b): ${btns}</span>`;
+    }
     badges.innerHTML = `
       <span class="badge">Model: ${d.model_id}</span>
       <span class="badge">Format: ${d.weight_format || 'auto'}</span>
+      ${kCtrl}
       <span class="badge">GPU: ${d.gpu_name} (${d.vram_mode})</span>
       <span class="badge">VRAM: ${st.allocated_vram_mib || 0} MiB</span>
       <span class="badge">Speed: ${tps}</span>
@@ -362,9 +435,11 @@ async function refreshInfo() {
       <span class="badge">OpenAI API: ${d.openai_base_url}</span>`;
   } catch (e) {}
 }
-refreshInfo();
 
 let activeCtrl = null;
+applyLang(uiLang, false);
+refreshInfo();
+
 inp.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!activeCtrl) sendPrompt(); }
 });
@@ -380,7 +455,7 @@ async function sendPrompt() {
   if (!text || activeCtrl) return;
   inp.value = '';
   activeCtrl = new AbortController();
-  sendBtn.textContent = 'Стоп';
+  sendBtn.textContent = T('stop');
   historyMsgs.push({role: 'user', content: text});
 
   const uDiv = document.createElement('div');
@@ -395,7 +470,7 @@ async function sendPrompt() {
   details.open = true;
   details.style.display = 'none';
   const summary = document.createElement('summary');
-  summary.textContent = 'Размышление (<think>)...';
+  summary.textContent = T('thinking');
   const thinkBody = document.createElement('div');
   details.appendChild(summary);
   details.appendChild(thinkBody);
@@ -442,7 +517,7 @@ async function sendPrompt() {
         }
         if (delta.content) {
           if (details.open) details.open = false;
-          summary.textContent = 'Показать размышление (<think>)';
+          summary.textContent = T('showThinking');
           fullAns += delta.content;
           ansBody.textContent = fullAns;
         }
@@ -465,14 +540,14 @@ async function sendPrompt() {
     historyMsgs.push({role: 'assistant', content: fullAns});
   } catch (err) {
     if (err.name === 'AbortError') {
-      metaFoot.textContent = 'Остановлено';
+      metaFoot.textContent = T('stopped');
       historyMsgs.push({role: 'assistant', content: fullAns});
     } else {
-      ansBody.textContent = 'Ошибка соединения: ' + err;
+      ansBody.textContent = T('connErr') + err;
     }
   } finally {
     activeCtrl = null;
-    sendBtn.textContent = 'Отправить';
+    sendBtn.textContent = T('send');
     refreshInfo();
   }
 }
@@ -498,24 +573,26 @@ class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
 
 def setup_server_logger(log_file: str | Path | None) -> logging.Logger:
-    """Creates the `quintessentia.server` logger writing to a rotating UTF-8 file (10 MB x 5)."""
+    """Creates the `quintessentia.server` logger writing INFO+ to both console and rotating UTF-8 file."""
     log = logging.getLogger("quintessentia.server")
     log.setLevel(logging.INFO)
     log.propagate = False
     for h in list(log.handlers):
         log.removeHandler(h)
         h.close()
-    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+    file_fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+    console_fmt = logging.Formatter("%(asctime)s [SRV] %(message)s", datefmt="%H:%M:%S")
     if log_file:
         path = Path(log_file)
         path.parent.mkdir(parents=True, exist_ok=True)
         fh = SafeRotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8", delay=True)
-        fh.setFormatter(fmt)
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(file_fmt)
         log.addHandler(fh)
-    eh = logging.StreamHandler()
-    eh.setLevel(logging.WARNING)
-    eh.setFormatter(fmt)
-    log.addHandler(eh)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(console_fmt)
+    log.addHandler(ch)
     return log
 
 
@@ -700,6 +777,10 @@ class QuintessentiaLANServer:
             "model_id": st["model_id"],
             "backend": st.get("backend"),
             "weight_format": st.get("weight_format"),
+            "q1_planes": st.get("q1_planes"),
+            "q1_planes_loaded": st.get("q1_planes_loaded"),
+            "cube_root_bits": st.get("cube_root_bits"),
+            "rssf_balance_enabled": st.get("rssf_balance_enabled", True),
             "gpu_name": st["gpu_name"],
             "vram_mode": st["vram_mode"],
             "mtp_enabled": st["mtp_enabled"],
@@ -825,6 +906,7 @@ class QuintessentiaLANServer:
 
                 if path in ("/health", "/api/info"):
                     info = srv.passport()
+                    info["language"] = get_lang()
                     info["engine"] = srv.engine.status_snapshot()
                     info["generation"] = srv.coordinator.snapshot()
                     info["limits"] = srv.runtime_limits()
@@ -948,7 +1030,15 @@ class QuintessentiaLANServer:
 
             def do_POST(self) -> None:
                 path = self.path.split("?", 1)[0]
-                if path not in ("/v1/chat/completions", "/v1/chat/stop", "/api/stop", "/api/reset", "/api/show"):
+                if path not in (
+                    "/v1/chat/completions",
+                    "/v1/chat/stop",
+                    "/api/stop",
+                    "/api/reset",
+                    "/api/compact",
+                    "/api/q1",
+                    "/api/show",
+                ):
                     self._send_error(HTTPStatus.NOT_FOUND, f"Unknown endpoint {path}", "not_found", close=True)
                     return
                 if not self._check_auth():
@@ -1007,6 +1097,69 @@ class QuintessentiaLANServer:
                     except GenerationCancelled:
                         pass
                     self._send_json({"ok": True})
+                    return
+
+                if path == "/api/compact":
+                    summary = str(body.get("summary") or "").strip()
+                    if not summary:
+                        self._send_error(HTTPStatus.BAD_REQUEST, "`summary` must be a non-empty string")
+                        return
+                    keep_last = max(0, int(body.get("keep_last_turns", 1)))
+                    sys_prompt = body.get("system_prompt")
+                    max_tok = body.get("max_active_tokens")
+                    ticket = srv.coordinator.new_ticket("compact")
+                    try:
+                        with srv.coordinator.gpu(ticket):
+                            info = srv.engine.compact_session(
+                                summary,
+                                keep_last_turns=keep_last,
+                                system_prompt=(str(sys_prompt) if sys_prompt is not None else None),
+                                max_active_tokens=(int(max_tok) if max_tok is not None else None),
+                            )
+                    except GenerationCancelled:
+                        self._send_json({"ok": False, "cancelled": True})
+                        return
+                    srv.log.info(
+                        "compact from %s: epoch %s -> %s | tokens=%s -> %s",
+                        self.address_string(),
+                        info.get("closed_epoch"),
+                        info.get("new_epoch"),
+                        info.get("old_tokens"),
+                        info.get("new_tokens"),
+                    )
+                    self._send_json({"ok": True, **info})
+                    return
+
+                if path == "/api/q1":
+                    ticket = srv.coordinator.new_ticket("q1_switch")
+                    try:
+                        with srv.coordinator.gpu(ticket):
+                            if body.get("calibrate_kl_target") is not None:
+                                kl_t = float(body["calibrate_kl_target"])
+                                min_k = int(body["min_q1_planes"]) if body.get("min_q1_planes") is not None else None
+                                info = srv.engine.calibrate_q1_planes_by_kl(kl_target=kl_t, min_k=min_k)
+                                srv.log.info(
+                                    "q1 auto-KL from %s: target<=%.3f -> chosen_k=%s (kl=%s)",
+                                    self.address_string(), kl_t, info.get("chosen_k"), info.get("chosen_kl"),
+                                )
+                            elif body.get("q1_planes") is not None:
+                                k_val = int(body["q1_planes"])
+                                lm_k = int(body["lm_head_planes"]) if body.get("lm_head_planes") is not None else None
+                                info = srv.engine.set_active_q1_planes(k_val, lm_head_k=lm_k)
+                                srv.log.info(
+                                    "q1 live switch from %s: K=%s/%s (modules=%s)",
+                                    self.address_string(), info.get("q1_planes"), info.get("q1_planes_loaded"), info.get("updated_modules"),
+                                )
+                            else:
+                                self._send_error(HTTPStatus.BAD_REQUEST, "Provide `q1_planes` or `calibrate_kl_target`")
+                                return
+                    except ValueError as exc:
+                        self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                        return
+                    except GenerationCancelled:
+                        self._send_json({"ok": False, "cancelled": True})
+                        return
+                    self._send_json({"ok": True, **info})
                     return
 
                 self._chat_completions(body)
@@ -1350,17 +1503,151 @@ class QuintessentiaLANServer:
             self.host, self.http_port, self.log_file, self.max_request_bytes, self.require_auth, self.coordinator.preempt,
         )
 
+    def _handle_console_key(self, ch: str) -> bool:
+        """Process a single interactive console hotkey while serving. Returns True to stop server."""
+        if not ch:
+            return False
+        low = ch.lower()
+        if ch in ("\x03", "\x1b") or low in ("q", "m"):
+            self.log.info("shutdown requested via keyboard (%r)", ch if ch.isprintable() else "CTRL_C/ESC")
+            return True
+        if low == "o":
+            url = f"http://127.0.0.1:{self.http_port}"
+            try:
+                from .cli import open_url_in_browser
+                ok = open_url_in_browser(url)
+                self.log.info("open browser %s -> %s", url, "ok" if ok else "failed")
+            except Exception as exc:
+                self.log.warning("open browser failed: %s", exc)
+            return False
+        if low == "h":
+            try:
+                from .cli import launch_desktop_hud
+                ok = launch_desktop_hud(quiet=False, bind_to_console=True)
+                self.log.info("desktop HUD launch -> %s", "ok" if ok else "failed")
+            except Exception as exc:
+                self.log.warning("desktop HUD launch failed: %s", exc)
+            return False
+        if ch.isdigit() and ch != "0":
+            k_val = int(ch)
+            loaded = int(getattr(self.engine, "q1_planes_loaded", 0) or 0)
+            if loaded >= 1 and hasattr(self.engine, "set_active_q1_planes"):
+                if k_val <= loaded:
+                    ticket = self.coordinator.new_ticket("console_q1_switch")
+                    try:
+                        with self.coordinator.gpu(ticket):
+                            res = self.engine.set_active_q1_planes(k_val)
+                        self.log.info(
+                            "console Q1 switch: K=%s/%s (modules=%s)",
+                            res.get("q1_planes"), res.get("q1_planes_loaded"), res.get("updated_modules"),
+                        )
+                    except Exception as exc:
+                        self.log.warning("console Q1 switch K=%s failed: %s", k_val, exc)
+                else:
+                    self.log.info("K=%s exceeds loaded Q1 planes (%s)", k_val, loaded)
+        return False
+
     def serve_forever(self) -> None:
         self.start_background()
         print(format_connection_passport(self.full_passport_for_console()), flush=True)
         if self.log_file:
             print(f"  Server log: {Path(self.log_file).resolve()}", flush=True)
+        interactive_tty = False
         try:
-            while True:
-                time.sleep(0.5)
+            interactive_tty = bool(sys.stdin.isatty() and sys.stdout.isatty())
+        except Exception:
+            interactive_tty = False
+
+        if interactive_tty:
+            q1_loaded = int(getattr(self.engine, "q1_planes_loaded", 0) or 0)
+            k_hint = (
+                tr(
+                    f"  [1..{min(9, q1_loaded)}] switch Q1 K  |",
+                    f"  [1..{min(9, q1_loaded)}] переключить Q1 K  |",
+                )
+                if q1_loaded >= 2
+                else ""
+            )
+            print(
+                tr(
+                    "  Hotkeys: [M / Q / Esc / Ctrl+C] stop server & return to menu  |"
+                    "  [O] open Web UI  |  [H] Desktop HUD  |{k_hint}",
+                    "  Горячие клавиши: [M / Q / Esc / Ctrl+C] выключить сервер и вернуться в меню  |"
+                    "  [O] открыть Web UI  |  [H] Desktop HUD  |{k_hint}",
+                    k_hint=k_hint,
+                ),
+                flush=True,
+            )
+            print(tr("  Live server log:", "  Живой лог сервера:"), flush=True)
+
+        old_term = None
+        posix_fd: int | None = None
+        try:
+            if interactive_tty and os.name != "nt":
+                import select
+                import termios
+                import tty
+
+                posix_fd = sys.stdin.fileno()
+                old_term = termios.tcgetattr(posix_fd)
+                tty.setcbreak(posix_fd)
+                while not self._shutdown.is_set():
+                    r, _, _ = select.select([posix_fd], [], [], 0.25)
+                    if not r:
+                        continue
+                    b0 = os.read(posix_fd, 1)
+                    if not b0:
+                        break
+                    if b0 == b"\x1b":
+                        # Distinguish bare Esc from arrow/focus escape sequences
+                        r2, _, _ = select.select([posix_fd], [], [], 0.08)
+                        if r2:
+                            # Drain the escape sequence without exiting
+                            while True:
+                                rn, _, _ = select.select([posix_fd], [], [], 0.02)
+                                if not rn:
+                                    break
+                                os.read(posix_fd, 32)
+                            continue
+                        if self._handle_console_key("\x1b"):
+                            break
+                        continue
+                    ch = b0.decode("utf-8", errors="ignore")
+                    if self._handle_console_key(ch):
+                        break
+            elif interactive_tty and os.name == "nt":
+                import msvcrt
+
+                while not self._shutdown.is_set():
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getwch()
+                        if ch in ("\x00", "\xe0"):
+                            if msvcrt.kbhit():
+                                msvcrt.getwch()
+                            continue
+                        if self._handle_console_key(ch):
+                            break
+                    else:
+                        time.sleep(0.15)
+            else:
+                while not self._shutdown.is_set():
+                    time.sleep(0.5)
         except KeyboardInterrupt:
-            print("\n[Quintessentia] Shutting down LAN server...", flush=True)
+            print(tr("\n[Quintessentia] Stopping LAN server...", "\n[Quintessentia] Останавливаю LAN-сервер..."), flush=True)
         finally:
+            if old_term is not None and posix_fd is not None:
+                try:
+                    import termios
+                    termios.tcsetattr(posix_fd, termios.TCSADRAIN, old_term)
+                except Exception:
+                    pass
+            print(
+                tr(
+                    "\n[Quintessentia] Shutting down LAN server and releasing VRAM...",
+                    "\n[Quintessentia] Выключаю LAN-сервер и освобождаю видеопамять...",
+                ),
+                flush=True,
+            )
             self.stop()
 
     def stop(self) -> None:

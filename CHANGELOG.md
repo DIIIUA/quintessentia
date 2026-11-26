@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.2.0 — 2026-11-27
+
+### Bilingual English & Russian CLI, Interactive TUI & Web UI
+- **Button-driven zero-dependency Interactive TUI (`quintessentia_cli/tui.py` — `quint`, `quint menu` / `ui` / `tui`):**
+  - Cross-platform raw single-key navigation (`msvcrt` + VT100 on Windows; unbuffered POSIX `os.read` PTY escape-sequence parser on Linux/WSL 2 fixing ConPTY split-arrow sequences).
+  - Live searchable local model picker, quick presets (`auto`, `auto_kl`, `quality`, `balanced`, `speed`, `bf16`, `custom`), full Q1 controls (`--q1-planes`, `--cube-root-bits`, `--lm-head-planes`, `--min/max-q1-planes`, `--q1-kl-target`, `--no-auto-fit-q1`), persistent `cli_config.json`, and one-key launch of Chat, LAN Server, Benchmark, Doctor, and Hugging Face Download.
+- **Full English & Russian (`EN / RU`) localization (`quintessentia_cli/i18n.py`, `cli.py`, `tui.py`, `lan_server.py`):**
+  - Global `--lang en|ru` flag (before or after any subcommand, including `--help`), `QUINTESSENTIA_LANG=en|ru`, saved `cli_config.json` preference, and automatic OS locale detection.
+  - Instant one-keypress **`[L]`** toggle and top-row **`Language / Язык`** selector in the TUI, `/lang en|ru` slash command in `quint chat`, localized LAN server console hotkeys/messages, and an **`EN / RU`** switcher button in the built-in LAN Web UI (`localStorage` + `/api/info` `"language"`).
+
+### Resident Q1 Native MTP Acceleration (up to 1.91× speedup on 9B BF16)
+- **Native GGUF NextN/MTP extraction & GPU-resident MTP head (`quintessentia_cli/model_source.py`, `src/native_mtp.py`):**
+  - Extracts `blk.<layers>.nextn.*` weights (`eh_proj`, `enorm`, `hnorm`, `shared_head_norm`, and `mtp.layers.0.*`) directly from GGUF checkpoints (`Qwythos-9B-v2-MTP-BF16` `blk.32.*`) with zero-centered RMSNorm handling and raised 512 MiB default MTP head budget.
+- **Two-stage zero-SMEM SWAR `__dp4a` multi-row (`M=2..4`) Q1 CUDA kernels (`src/quintessentia_q1_cube_nvrtc.py`):**
+  - Splits Phase-1 FWHT + INT8 quantization (`ideal_q1_fwht_quant_i8_f32`) from zero-SMEM L1 `__ldg` register-only SWAR `__dp4a` multi-row GEMV (`ideal_q1_popc10_mr_gemv_f32`) with a zero-alloc `ctypes` argument cache, while keeping `M=1` on bank-conflict-free 10-bit `popc10_r2`.
+- **Fused multi-row Q1 DeltaNet & zero-replay speculative rollback (`quintessentia_cli/unified_runtime.py`, `src/general_speculation.py`, `quintessentia_cli/thought_buffer.py`):**
+  - Added `fused_deltanet_q1_multirow`, `install_q1_qwen35_fast_decode_unifications`, `HybridSpecSnapshotManager` zero-replay slots, fast direct-clone linear-attention cache snapshot/restore, raised default `--max-drafts 3`, and enabled automatic native MTP on resident `q1_cubes` (`doctor` reports `MTP head: weights present, on`).
+  - Verified on RTX 3060 Ti 8 GB (`Qwythos-9B-v2-MTP-BF16`, `k=5`, 256 tokens greedy): **`21.17 tok/s`** (MTP off) → **`30.82 tok/s`** (`d=2`) → **`33.70 tok/s`** (auto-MTP `d=3`, `75.7%` accept, `0` replays, bit-exact `256/256` match — **1.91×** vs 2.1.0 `17.61 tok/s`).
+
+### 80B-A3B `qwen3_next` GGUF Fix & Verification on 8 GB VRAM
+- **Fixed `qwen3_next` GGUF SSM head ordering (`quintessentia_cli/gguf_arch_registry.py`):**
+  - Removed erroneous `TiledToGroupedRows` / `TiledToGroupedInputs` transforms on `qwen3_next` `A_log`, `dt_bias`, `conv1d.weight`, and `out_proj.weight` (unlike `qwen35`, `qwen3next` GGUFs preserve Hugging Face grouped `[16, 2]` head order across all 6 SSM tensors).
+  - Verified live on **`Huihui-Qwen3-Next-80B-A3B-Instruct-abliterated.i1-Q4_K_M`** (`46 GiB`, 48 layers, 512 experts/layer = `24,576` experts) on an 8 GB RTX 3060 Ti: boots in **`4.82 s`** with all 48 trunk layers resident and generates coherently in **`5.38–5.93 GiB` VRAM** (**`2.61 / 2.50 tok/s`**, `kv2_hit=182`, `8.96–14.53%` experts carved on demand, `0` OOM).
+
+### Disk-Backed Token Ledger, Live 0-ms Q1 Controls & Resizable Live HUD
+- **Two-layer persistent Token Ledger & context compaction (`quintessentia_cli/token_ledger.py`, `unified_runtime.py`, `tool_calling.py`, `lan_server.py`):**
+  - Append-only `ledger.jsonl` archive + atomic `active_window.json` slice bound by tokenizer SHA-256 fingerprint for deterministic 100% retokenization across restarts, `.strip()` whitespace differences, `<think>` stripping, and mid-chat edits (`partial_turn_prefix` + pure-attention KV truncation).
+  - Non-destructive epoch compaction via `/compact <summary>` in `quint chat` and `POST /api/compact`, incremental turn suffix fallback for base checkpoints without `chat_template`, and preserving explicit `<tool_call>` blocks even on unknown tool names.
+- **Live 0-ms Q1 precision switching, KL calibration & `--rssf on|off` ablation (`unified_runtime.py`, `lan_server.py`, `src/rssf_dynamic_operators.py`):**
+  - Switch active `q1_planes` on the fly in 0 ms via `/k <1..loaded>`, LAN console hotkeys `1..9`, Web UI buttons, or `POST /api/q1`; auto-calibrate smallest `k` within a KL budget via `--q1-kl-target` (`calibrate_q1_planes_by_kl`) without modifying `embed_tokens`.
+  - Added clean process-level `--rssf on|off` (`QUINTESSENTIA_RSSF`) ablation switch across all active RSSF/Volterra/FDS scales (`M0–M8` + `KV`).
+- **Resizable Desktop Live HUD & console lifecycle binding (`quintessentia_cli/hud/`, `live_hud_beacon.py`, `cli.py`):**
+  - Uniform vector-scaled resizable WPF HUD (`CanResize`, `MinWidth=440`, `MinHeight=414`, persisted geometry), clean Windows-native host RAM & branding without misleading WSL2 labels, expanded 8,000-char answer / 4,000-char thinking scrollable preview, and automatic `console_owner_alive.flag` heartbeat so HUD closes cleanly when its parent CLI/TUI console exits.
+  - Added interactive LAN server console hotkeys (`[M/Q/Esc]` stop & return to menu, `[O]` open Web UI, `[H]` Desktop HUD, `[1..9]` live Q1 `K`) and raised default `--max-request-bytes` to 16 MiB.
+
+### Verified test results (RTX 3060 Ti 8 GB, WSL 2 ext4 & Windows Native)
+- **Windows Native `.venv` (CUDA + CPU):** **84 passed, 1 skipped** (POSIX PTY skip) across all 10 core CLI/TUI/i18n/Token Ledger/RSSF/Tool Calling/LAN/VRAM/v21-22 suites (`0` failed).
+- **WSL 2 (CUDA + CPU):** **223 / 223** passing across the 19 core release suites (`test_tui_and_q1_controls`, `test_token_ledger`, `test_v21_fixes`, `test_cli_lan`, `test_rssf_dynamic_operators`, `test_tool_calling`, `test_lan_server_cancel`, `test_vram_plan`, `test_gguf_tokenizer_types`, `test_context_budget`, `test_binary_halving_q1`, `test_mirror_scales_v4`, `test_q1_cube_engine`, `test_general_speculation`, `test_speculation_joint`, `test_thought_buffer`, `test_session_state`, `test_download_preparation`, `test_model_management`); full repository census `460 passed, 10 skipped` (`0` regressions from 2.2.0).
+- **Static checks:** `120 / 120` Python files compile cleanly (`py_compile`, `0` errors); PowerShell AST syntax check of `quintessentia_hud.ps1` passed (`0` errors).
+
 ## 2.1.0 — 2026-11-26
 
 ### Unified 4-layer solver-free multi-scale balance (M0–M8 + KV + Prefill/Turn)

@@ -8,11 +8,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache 2.0"></a>
 </p>
 
-**Quintessentia** is a local inference engine for **Hugging Face and GGUF language models** built around **pure Q1 binary-halving cubes (V4)**, unified **4-layer multi-scale balance (M0–M8 + KV)**, self-contained **NVRTC CUDA kernels**, hybrid VRAM/pinned-RAM KV caching, a live **Windows/WSL 2 Desktop HUD**, and an OpenAI-compatible LAN server.
+**Quintessentia** is a local inference engine for **Hugging Face and GGUF language models** built around **pure Q1 binary-halving cubes (V4)**, resident **native Multi-Token Prediction (MTP)**, unified **4-layer multi-scale balance (M0–M8 + KV)**, self-contained **NVRTC CUDA kernels**, disk-backed **Token Ledger** persistence, a bilingual **EN / RU interactive TUI & CLI**, a resizable **Windows/WSL 2 Desktop Live HUD**, and an OpenAI-compatible LAN server.
 
-> **Default CUDA runtime (`V4` / `--weight-format auto`):** On NVIDIA GPUs, Quintessentia automatically runs checkpoints through pure **Q1 binary-halving cubes** (`q1_cubes`, `root_bits=8`) with bidirectional mirror-balance depth auto-fit (`k=5` default, stepping down `4->3` under tight VRAM or refining up to `k=8` for compact models fitting inside `<= 35%` VRAM budget), 4-layer solver-free balance across all runtime scales (`M0–M8`, hybrid KV placement, and chunked prefill), bank-conflict-free NVRTC CUDA kernels, and zero-OOM adaptive streaming.
+> **Default CUDA runtime (`V4` / `--weight-format auto`):** On NVIDIA GPUs, Quintessentia automatically runs checkpoints through pure **Q1 binary-halving cubes** (`q1_cubes`, `root_bits=8`) with bidirectional mirror-balance depth auto-fit (`k=5` default, stepping down `4->3` under tight VRAM or refining up to `k=8` for compact models fitting inside `<= 35%` VRAM budget), automatic native **MTP speculative decoding** when MTP weights are present, 4-layer solver-free balance across all runtime scales (`M0–M8`, hybrid KV placement, and chunked prefill), bank-conflict-free NVRTC CUDA kernels, and zero-OOM adaptive streaming.
 >
-> **Validated across 39 / 45 present local checkpoints (3-turn isolated suite per model, 0 OOM, 0 crashes)** on a single **8 GB RTX 3060 Ti** (WSL 2 native ext4): from **124M–350M** (`48–106 tok/s`) and **1B** (`39–41 tok/s`) to **2B–4B MLA/BitNet/VLM** (`6.7–22.5 tok/s`), **7B–9B BF16** fully resident in 5.86–5.95 GiB (`18.9–19.8 tok/s`), **20B MXFP4 MoE** in 3.77 GiB, and **35B 256-expert MoE** in 5.40 GiB (`3.3 tok/s`). Explicit `q1`, `q2`, `q4`, `q6`, `q8`, `bf16`, `--feedback-mode off`, and `--device cpu` modes remain available; see [model support](MODEL_SUPPORT.md) for the complete 3x per-checkpoint matrix.
+> **Validated across 40 / 46 present local checkpoints (multi-turn isolated suites, 0 OOM, 0 crashes)** on a single **8 GB RTX 3060 Ti** (WSL 2 native ext4): from **124M–350M** (`48–106 tok/s`) and **1B** (`39–41 tok/s`) to **2B–4B MLA/BitNet/VLM** (`6.7–22.5 tok/s`), **7B–9B BF16** fully resident in 5.86–5.95 GiB (**`33.70 tok/s`** with native MTP `d=3` / **`21.17 tok/s`** without MTP), **20B MXFP4 MoE** in 3.77 GiB, **35B 256-expert MoE** in 5.40 GiB (`3.3 tok/s`), and **80B-A3B 24,576-expert MoE (`46 GiB` GGUF)** in **5.38–5.93 GiB VRAM** (`2.61 tok/s`, 4.82 s startup). Explicit `q1`, `q2`, `q4`, `q6`, `q8`, `bf16`, `--rssf off`, `--feedback-mode off`, and `--device cpu` modes remain available; see [model support](MODEL_SUPPORT.md) for the complete per-checkpoint matrix.
 
 <a href="https://buymeacoffee.com/silentfish">
   <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="217" height="60">
@@ -49,7 +49,7 @@ on demand rather than loading all experts into memory.
 Supported input weight encodings adapted on the fly into Q1 cubes (or explicit runtime formats):
 - **Hugging Face `.safetensors`:** BF16/FP16, block FP8, AWQ GEMM INT4, GPTQ INT4, bitsandbytes 8-bit (`SCB`, without requiring `bitsandbytes`), and packed MXFP4 MoE experts.
 - **GGUF (single or split shards):** standard and K/I-quant blocks (`Q2_K`, `Q3_K_M`, `Q4_0`, `Q4_1`, `Q4_K_M`, `Q5_*`, `Q6_K`, `Q8_*`, `IQ1_S`..`IQ4_NL`, `TQ1_0`/`TQ2_0`, and native `bitnet.cpp` `I2_S` type 36) across 35+ GGUF families without the external `gguf` PyPI package.
-- **Architectures covered:** Dense Transformers (`Llama`, `Qwen2/3/3.5`, `Qwen2-VL` text, `Gemma 2/3`, `Phi-3/4`, `Cohere2`, `OLMo2`, `Nemotron`, `Granite`, `SmolLM3`, `ERNIE-4.5`, `BitNet-b1.58`, `GPT-2 Conv1D`, `GPT-NeoX`, `BLOOM`), MLA (`MiniCPM3`), pure SSM (`Mamba`, `Mamba2`), hybrid SSM/Attention/Griffin (`Zamba2`, `Falcon-H1`, `RecurrentGemma`, `LFM2`), and sparse/hybrid MoE (`Qwen3.5/3.6-MoE`, `Granite-MoE`, `Granite-4.0-Hybrid`, `GPT-OSS MXFP4`).
+- **Architectures covered:** Dense Transformers (`Llama`, `Qwen2/3/3.5`, `Qwen2-VL` text, `Gemma 2/3`, `Phi-3/4`, `Cohere2`, `OLMo2`, `Nemotron`, `Granite`, `SmolLM3`, `ERNIE-4.5`, `BitNet-b1.58`, `GPT-2 Conv1D`, `GPT-NeoX`, `BLOOM`), MLA (`MiniCPM3`), pure SSM (`Mamba`, `Mamba2`), hybrid SSM/Attention/Griffin (`Zamba2`, `Falcon-H1`, `RecurrentGemma`, `LFM2`), and sparse/hybrid MoE (`Qwen3-Next-80B-A3B`, `Qwen3.5/3.6-MoE`, `Granite-MoE`, `Granite-4.0-Hybrid`, `GPT-OSS MXFP4`).
 
 An adapter or recognized architecture ID is not a blanket guarantee that every checkpoint
 of that family works. Multimodal checkpoints, where usable, expose only the language
@@ -62,25 +62,34 @@ repositories requiring `trust_remote_code` are outside the validated scope.
 
 ## Usage
 
-One-button launchers pick the local environment automatically: `./quint` on Linux / WSL 2, `.\quint.cmd` or `.\quintessentia.cmd` on Windows, or `python quintessentia.py`.
+One-button launchers pick the local environment automatically: `./quint` on Linux / WSL 2, `.\quint.cmd` or `.\quintessentia.cmd` on Windows, or `python quintessentia.py`. Running `./quint` with no arguments on a terminal opens the **interactive button-driven TUI** (`menu` / `ui` / `tui`).
+
+**Bilingual English & Russian (`EN / RU`) interface:** Pass `--lang en` or `--lang ru` (or set `QUINTESSENTIA_LANG=en|ru`) on any command (including `--help`), press **`[L]`** inside the interactive TUI, run `/lang en|ru` inside `quint chat`, or click the **`EN / RU`** button in the LAN Web UI.
 
 ```bash
-./quint doctor                                                # GPU, model, V4 Q1 + RSSF balance plan, HUD, LAN
+./quint                                                       # interactive button-driven TUI (arrow keys, [L] EN/RU)
+./quint --lang ru menu                                        # launch interactive TUI directly in Russian
+./quint --lang en --help                                      # full CLI help in English (or --lang ru for Russian)
+./quint doctor                                                # GPU, model, V4 Q1, MTP head, RSSF plan, HUD, LAN
 ./quint models                                                # numbered local model catalog
 ./quint ask --model 1 "Hello"                                 # default V4 Q1 cubes + anti-loop profile
 echo "Summarize this" | ./quint ask --model 1 --no-think      # piped stdin prompt support
-./quint ask --model 1 --q1-planes 6 --no-think "Explain..."   # explicit Q1 depth, direct answer
+./quint ask --model 1 --q1-planes 6 --lm-head-planes 8 "Hi"   # explicit trunk K & independent lm_head precision
+./quint ask --model 1 --q1-kl-target 0.05 "Explain..."        # auto-calibrate smallest K with KL <= 0.05 nats
 ./quint ask --model 1 --mode custom --temperature 0 "Hi"      # manual greedy sampling control
 ./quint bench --model 1 --runs 3                              # multi-run throughput, KV reuse & balance benchmark
-./quint chat                                                  # multi-turn chat (/balance, /hud, /reset, /stats)
-./quint serve --hud                                           # web chat + OpenAI API on :8787 + live Desktop HUD
-./quint hud                                                   # launch Desktop HUD widget (Windows Native & WSL 2)
+./quint chat                                                  # multi-turn chat (/k, /compact, /lang, /balance, /hud)
+./quint serve --hud                                           # web chat (EN/RU + live K) + OpenAI API :8787 + HUD
+./quint hud                                                   # resizable Desktop HUD widget (Windows Native & WSL 2)
 ./quint hud --status | --stop | --install-desktop             # HUD status JSON, instant stop, or Desktop install
 ./quint discover                                              # find Quintessentia servers on the LAN
 ```
 
+- **Live 0-ms Q1 precision switching:** change active Q1 bit-planes on the fly without reloading weights via `/k <1..loaded>` in `quint chat`, keys `1..9` in the `serve` console, clickable `Q1 K` buttons in the Web UI, or `POST /api/q1`.
+- **Disk-backed Token Ledger & context compaction (`--token-ledger` / `--session-id`):** persists exact committed `token_ids` (`active_window.json`) and non-destructive history (`ledger.jsonl`) bound by tokenizer SHA-256 fingerprint for 100% deterministic retokenization across restarts and edits, with non-destructive epoch compaction via `/compact <summary>` or `POST /api/compact`.
 - **`--mode default` (default):** unlimited output until natural EOS (`--max-tokens 0`) with anti-loop GPU sampling tuned separately for `<think>` and `--no-think`. Any explicit sampling flag (`--temperature`, `--top-p`, `--top-k`, `--presence-penalty`, `--repetition-penalty`, `--seed`) overrides the profile.
 - **`--mode custom`:** raw manual control (deterministic greedy unless sampling flags are passed).
+- **`--rssf on|off`:** cleanly enables or disables the 4-layer RSSF/Volterra/FDS dynamic balance operators for A/B testing.
 
 ### Model downloads and preparation
 
@@ -127,19 +136,22 @@ default 512 tokens), projecting only the last position onto vocabulary logits wh
 |---|---|
 | `POST /v1/chat/completions` | OpenAI-compatible, JSON or `stream: true` SSE (`reasoning_content` for `<think>`) |
 | `POST /v1/chat/stop` | stops the running generation immediately |
-| `GET /v1/models`, `GET /api/info` | model list, backend/format, context length (`/api/v0/models`, `/props`, `/api/extra/true_max_context_length`), node status |
-| `GET /` | built-in zero-CDN web chat |
+| `POST /api/q1` | live 0-ms Q1 bit-plane depth (`q1_planes`) switching without reloading weights |
+| `POST /api/compact` | non-destructive Token Ledger epoch compaction (`active_window.json` + `ledger.jsonl`) |
+| `GET /v1/models`, `GET /api/info` | model list, backend/format, active Q1 `k`, language, context length (`/api/v0/models`, `/props`, `/api/extra/true_max_context_length`), node status |
+| `GET /` | built-in zero-CDN EN/RU web chat with live `Q1 K` switcher |
 
 - One generation runs at a time. A new request — or a disconnected client, detected even during prefill — cancels the running one and frees VRAM before starting the next (`--no-preempt` queues instead).
-- Request bodies above `--max-request-bytes` (default 8 MiB) return HTTP 413.
+- Request bodies above `--max-request-bytes` (default 16 MiB) return HTTP 413.
+- Console hotkeys while running `serve`: `[M / Q / Esc / Ctrl+C]` stop & return to menu, `[O]` open Web UI, `[H]` toggle Desktop HUD, `[1..9]` switch Q1 `K`.
 - `--require-auth` enforces a Bearer API key (open on LAN by default).
 - Server logs rotate in `logs/server.log` (10 MB × 5; `--log-file`, `--no-log-file`).
 
 ## Accuracy and speed
 
-### Q1 Cubes V4 + 4-Layer RSSF Balance (`--weight-format auto`) — 2026-11-26
+### Q1 Cubes V4 + Resident Native MTP + 4-Layer RSSF Balance (`--weight-format auto`) — 2026-11-27
 
-Measured live on **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 native `ext4`, isolated 3-turn suite per checkpoint: cold factual `R1`, KV/SSM continuation `R2`, post-reset structured `R3`; peak decode throughput & peak VRAM):
+Measured live on **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 native `ext4`, isolated multi-turn suites; peak decode throughput & peak VRAM):
 
 | Scale | Checkpoint | Disk | Q1 / Placement | Best Decode | Peak VRAM | Notes |
 |---|---|---:|---|---:|---:|---|
@@ -152,9 +164,10 @@ Measured live on **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 native `ext4`, isola
 | 2B Griffin | `33_hf_recurrentgemma-2b-it-8bit` | 3.15 GiB | `k=6` 26/26 res | **22.5 tok/s** | 2,372 MiB | Direct 8-bit `SCB` -> Q1 cubes |
 | 4B MLA | `10_gguf_MiniCPM3-4B-MLA-Q4_K_M` | 2.30 GiB | `k=5` 62/62 res | **6.7 tok/s** | 2,943 MiB | Full 62-layer compressed MLA KV (`kv2_hit=26`) |
 | 7B | `08_gguf_command-r7b-12-2024-IQ3_XS` | 3.47 GiB | `k=5` 32/32 res | **19.8 tok/s** | 5,953 MiB | Fully resident in 5.95 GiB, crisp EOS |
-| 9B BF16 | `Qwythos-9B-v2-MTP-BF16` (`k=5`) | 17.14 GiB | `k=5` 32/32 res | **18.9 tok/s** | 5,861 MiB | Full 9B BF16 resident; `60K` `13.06`, `80K` `10.17 tok/s` |
+| 9B BF16 | `Qwythos-9B-v2-MTP-BF16` (`k=5`) | 17.14 GiB | `k=5` 32/32 res | **33.70 tok/s** | 5,861 MiB | Auto-MTP `d=3` (75.7% accept, bit-exact 256/256; `21.17` OFF) |
 | 20B MoE | `45_hf_gpt-oss-20b-MXFP4` | 12.84 GiB | `k=5` 24/24 + MoE | **1.0 tok/s** | 3,772 MiB | Packed MXFP4 experts on demand (`kv2_hit=127`) |
 | 35B MoE | `Qwen3.6-35B-A3B` (256 experts) | 23.87 GiB | `k=5` 40/40 + MoE | **3.3 tok/s** | 5,404 MiB | +73% vs 2.0.0 (`1.91 tok/s`), `kv2_hit=32`, 0 OOM |
+| 80B MoE | `Qwen3-Next-80B-A3B` (24,576 experts) | 46.00 GiB | `k=5` 48/48 + MoE | **2.61 tok/s** | 6,070 MiB | 46 GiB GGUF in 5.38–5.93 GiB VRAM, 4.82 s boot, `kv2_hit=182` |
 
 - **Reconstruction precision:** Q1 binary-halving cubes are progressive and lossy at low plane counts (`k=4..6`), converging monotonically toward source weights as `k` increases (single-layer cosine similarity on 9B BF16: `0.9961` at `k=4`, `0.9991` at `k=5`, `0.9998` at `k=6`, `1.0000` at `k=16`). Source quantization quality still caps final output quality (for example, ultra-low-bit source GGUFs like `IQ1_S` cannot be recovered beyond their stored weights).
 - **Release validation & historical baselines:** see [model_support_2_1_0.json](benchmarks/model_support_2_1_0.json) for 2.1.0, [RELEASE_2_0_0.md](benchmarks/RELEASE_2_0_0.md) and [model_support_2_0_0.json](benchmarks/model_support_2_0_0.json) for 2.0.0, and [RELEASE_1_1_0.md](benchmarks/RELEASE_1_1_0.md), [RELEASE_1_2_0.md](benchmarks/RELEASE_1_2_0.md), and [STREAMING_DECODE_20261118.md](benchmarks/STREAMING_DECODE_20261118.md) for historical Q4/Q6 baselines.

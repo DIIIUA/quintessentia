@@ -27,7 +27,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os as _os
 from typing import Any, Dict, Optional, Tuple
+
+
+_RSSF_ENABLED_OVERRIDE: Optional[bool] = None
+
+
+def set_rssf_balance_enabled(enabled: Optional[bool]) -> None:
+    """Explicit process-level toggle for clean A/B ablation (`--rssf on|off`).
+
+    Pass `None` to defer to the `QUINTESSENTIA_RSSF` environment variable (default: enabled).
+    """
+    global _RSSF_ENABLED_OVERRIDE
+    _RSSF_ENABLED_OVERRIDE = None if enabled is None else bool(enabled)
+
+
+def is_rssf_balance_enabled() -> bool:
+    """Return True iff the RSSF/EC/FDS dynamic balance operators are active."""
+    if _RSSF_ENABLED_OVERRIDE is not None:
+        return _RSSF_ENABLED_OVERRIDE
+    raw = str(_os.environ.get("QUINTESSENTIA_RSSF", "on")).strip().lower()
+    return raw not in ("0", "off", "false", "no", "disabled")
 
 
 # ---------------------------------------------------------------------------

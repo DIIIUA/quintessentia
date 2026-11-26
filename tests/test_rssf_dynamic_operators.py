@@ -136,22 +136,29 @@ def test_production_m1_early_leak_detection_2d_scars_and_scale_relativity():
         assert d.dispatch_mode != "THROTTLE_DAMP"
 
 
-def test_production_m7_speculation_balance_adapts_depth_on_scale_break():
-    """Live production M7 (`MirrorSpeculationScale`) exposes 8-force balance and clamps depth to 1
-    when draft confidence & acceptance collapse into SCALE_BREAK."""
+def test_production_m7_speculation_l4_and_pure_balance_operator():
+    """Live production M7 (`MirrorSpeculationScale`) clamps depth to 1 via tighter canonical L4 SPLIT
+    (redundant M7 SCALE_BREAK branch removed after audit), while the pure `observe_speculation_step_balance`
+    operator remains valid as a standalone diagnostic."""
+    from src.rssf_dynamic_operators import observe_speculation_step_balance
+
     m7 = MirrorSpeculationScale(max_drafts=3)
-    # High confidence -> full depth allowed, healthy positive d3_margin
+    # High confidence -> full depth allowed
     k_ok = m7.pick_depth([0.96, 0.94, 0.92], max_allowed=3)
     assert k_ok == 3
-    assert m7.stats()["rssf_balance"]["d3_margin"] > 0.0
 
-    # Simulate repeated severe rejections (huge logp_gap, 0 accepted) -> drives balance into SCALE_BREAK
+    # Repeated rejections -> canonical L4 SPLIT clamps depth to 1 (tighter than logp_gap > 2.5)
     for step in range(4):
         m7.record_verification(proposed=3, accepted=0, position=10 + step, drafts=[1, 2, 3], verified_token=99)
     m7.last_logp_gap = 3.5
     k_bad = m7.pick_depth([0.20, 0.15, 0.10], max_allowed=3)
     assert k_bad == 1
-    assert m7.stats()["balance_scale_breaks"] >= 1
+
+    # Pure operator sanity check
+    b_ok = observe_speculation_step_balance(depth_ratio=0.5, mean_prob=0.95, accept_ema=0.90, logp_gap=0.05)
+    b_bad = observe_speculation_step_balance(depth_ratio=1.0, mean_prob=0.15, accept_ema=0.05, logp_gap=4.0)
+    assert b_ok.d3_margin > 0.0
+    assert b_bad.regime == "SCALE_BREAK" and b_bad.d3_margin <= 0.0
 
 
 def test_generation_balance_tracker_full_turn_lifecycle():
@@ -421,7 +428,7 @@ def test_all_mirror_scales_m0_m2_m3_m4_m5b_m6_m8_rssf_balance():
     dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     gen = torch.Generator(device="cpu").manual_seed(2027)
 
-    # 1. M0: carve_trunk_mirror_q1 fills balance_out cleanly on CPU & CUDA
+    # 1. M0: carve_trunk_mirror_q1 records k_opt and rem_rel cleanly (dead M0 SCALE_BREAK removed after audit)
     w = (torch.randn((128, 128), generator=gen, dtype=torch.float32) * 0.08).to(device=dev, dtype=torch.bfloat16)
     m0_bal = {}
     _t, _m, k_opt, _rem = carve_trunk_mirror_q1(
@@ -429,7 +436,7 @@ def test_all_mirror_scales_m0_m2_m3_m4_m5b_m6_m8_rssf_balance():
         use_fwht=True, sinkhorn_iters=2, balance_out=m0_bal,
     )
     assert 3 <= k_opt <= 5
-    assert "d3_margin" in m0_bal and "info_efficiency_t4" in m0_bal and m0_bal["k_opt"] == k_opt
+    assert m0_bal["k_opt"] == k_opt and "rem_rel" in m0_bal
 
     # 2. M5b: pure-math + Q1 cube balance preserves boundary contracts
     assert mirror_cube_depth_math(0.05, 0.0, 3, 5) == 3
@@ -533,5 +540,68 @@ def test_all_mirror_scales_m0_m2_m3_m4_m5b_m6_m8_rssf_balance():
     assert st8["rssf_balance"] is not None
     assert st8["rssf_balance"]["steps"] == 2
     assert st8["rssf_balance"]["mean_d3_margin"] > 0.0
+
+
+def test_rssf_ablation_toggle_cleanly_disables_all_active_scales():
+    """Verify `--rssf off` (`set_rssf_balance_enabled(False)`) cleanly disables every active RSSF branch."""
+    import torch
+    from src.mirror_scales_v4 import (
+        MirrorColdWarmupScale,
+        MirrorLoadDispatcher,
+        MirrorPostPrefillRegionWarmupScale,
+        MirrorRegionBreathingPool,
+    )
+    from src.rssf_dynamic_operators import is_rssf_balance_enabled, set_rssf_balance_enabled
+    from quintessentia_cli.thought_buffer import InitialProbabilityAnchor
+
+    set_rssf_balance_enabled(False)
+    try:
+        assert not is_rssf_balance_enabled()
+
+        # M1: quiet leak does NOT trigger EC/FDS early damp when RSSF is off
+        MiB, GiB = 1024 ** 2, 1024 ** 3
+        s_leak = [(int((2400 - 60 * t) * MiB), 8 * GiB, 15.0, 18.0, 0, "mock") for t in range(18)]
+        idx = {"k": 0}
+        m1 = MirrorLoadDispatcher(
+            device="cpu", enabled=True, safety_reserve_bytes=int(0.10 * 8 * GiB),
+            sensor_fn=lambda: s_leak[min(idx.__setitem__("k", idx["k"] + 1) or idx["k"] - 1, len(s_leak) - 1)],
+        )
+        for _ in range(18):
+            m1.evaluate_load(cached_bytes=1 * GiB, current_budget_bytes=2 * GiB)
+        assert m1.last_balance is None
+        assert m1.ec_fds_damp_steps == 0
+
+        # M2, M3, M4 skip RSSF balance when off
+        m2 = MirrorRegionBreathingPool(device=torch.device("cpu"), max_pool_bytes=1000, max_warm_regions=4)
+        m2.admit_region(("a", 0), {"v": 1}, gpu_bytes=100, recurring_hint=True)
+        m2.finish_region(("a", 0), keep_if_reusable=True)
+        assert m2.stats()["rssf_balance"] is None
+        m2.close()
+
+        m3 = MirrorColdWarmupScale()
+        m3.evaluate_step(20.0, warmed_so_far=1, total_targets=5, elapsed_seconds=0.1)
+        m3.evaluate_step(15.0, warmed_so_far=2, total_targets=5, elapsed_seconds=0.2)
+        assert m3.stats()["rssf_balance"] is None
+
+        m4 = MirrorPostPrefillRegionWarmupScale(num_layers=2, max_region_experts=4)
+        m4.record_prefill_layer(0, body_weights={1: 1.0}, tail_weights={1: 1.0})
+        m4.observe_and_plan_next(0, [1], [1.0], lambda l, e: False)
+        assert m4.stats()["rssf_balance"] is None
+
+        # M8 skips tensor balance modulation when off
+        anc = InitialProbabilityAnchor(mirror_mode=True)
+        phi0 = torch.zeros(16, dtype=torch.float32)
+        phi0[2] = 2.0
+        anc.phi0 = phi0.clone()
+        anc.phi_buf = phi0.clone()
+        z = torch.zeros((1, 16), dtype=torch.float32)
+        z[0, 2] = 1.0
+        z[0, 3] = 1.0
+        anc.transform_logits(z, None, step_index=1)
+        assert anc.mirror_stats()["rssf_balance"] is None
+    finally:
+        set_rssf_balance_enabled(None)
+    assert is_rssf_balance_enabled()
+
 
 

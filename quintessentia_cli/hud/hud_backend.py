@@ -522,9 +522,9 @@ def read_live_telemetry(cfg: Dict[str, Any], *, wsl_running: bool = False) -> Di
             "moe_hits": 0,
             "moe_host_hits": 0,
             "moe_misses": 0,
-            "env": "WSL2 Ubuntu" if wsl_running else "Windows",
+            "env": "Windows",
             "age_s": 0.0,
-            "answer_preview": "Run `quint ask`, `quint chat`, or `quint serve` (Windows or WSL2) — live speed, layers, balance, PCIe flow and text will appear here.",
+            "answer_preview": "Run `quint ask`, `quint chat`, or `quint serve` — live speed, layers, memory, PCIe flow and scrollable output history will appear here.",
             "thinking_preview": "",
         }
 

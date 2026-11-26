@@ -1,11 +1,14 @@
-# Model support in Quintessentia 2.1.0
+# Model support in Quintessentia 2.2.0
 
-**Support is checkpoint-specific.** The fresh **2026-11-26** local census ran an isolated **3-turn suite** (Run 1: cold factual greedy; Run 2: direct multi-turn KV/SSM prefix continuation; Run 3: post-reset structured generation at `temp=0.25, rep=1.05`) across all **46** folders in the WSL 2 `ext4` test zoo on an **NVIDIA GeForce RTX 3060 Ti 8 GB** under **V4 pure Q1 cubes + 4-layer RSSF balance**:
+**Support is checkpoint-specific.** Building on the **2026-11-26** local census (isolated **3-turn suite**: Run 1 cold factual greedy, Run 2 direct multi-turn KV/SSM prefix continuation, Run 3 post-reset structured generation at `temp=0.25, rep=1.05`) plus **2026-11-27** verification of **80B-A3B `qwen3_next`** and **resident Q1 native MTP** on an **NVIDIA GeForce RTX 3060 Ti 8 GB** (WSL 2 `ext4`) under **V4 pure Q1 cubes + 4-layer RSSF balance**:
 
-- **39 / 45** present weight folders passed end-to-end 3-turn execution with **0 OOM, 0 timeouts, and 0 crashes** (37 clean `PASS` + 2 base-model greedy-repeat notices on `gpt2-124m` and `bloom-560m` that generate cleanly under R3 sampling).
-- **4 newly unlocked checkpoints** compared to 2.0.0: `10_gguf_MiniCPM3-4B-MLA-Q4_K_M` (62-layer MLA), `24_gguf_BitNet-b1.58-2B-TQ2_0`, `25_gguf_BitNet-b1.58-2B-i2_s` (native `I2_S` type 36), and `41_hf_Qwen2-VL-2B-Instruct-AWQ` (Qwen2 text backbone).
-- **5** expected `UnsupportedModelError` rejections (`gemma3n`, `rwkv7`, `xlstm`, `OpenELM`, `internlm2`), **1** legacy pickle `.bin`-only folder (`RWKV4-169m-bin`), and **1** empty 0-byte transfer folder (`14_gguf_granite-4.0-tiny-hybrid-IQ3_XXS`, previously verified passing in 2.0.0; `13_gguf_Falcon-H1-0.5B-Q4_K_M` was not present in this 46-folder zoo and was verified in 2.0.0).
-- Machine-readable 3-run results: [benchmarks/model_support_2_1_0.json](benchmarks/model_support_2_1_0.json).
+- **40 / 46** present weight folders passed end-to-end multi-turn execution with **0 OOM, 0 timeouts, and 0 crashes** (38 clean `PASS` including **80B-A3B** + 2 base-model greedy-repeat notices on `gpt2-124m` and `bloom-560m` that generate cleanly under R3 sampling).
+- **Newly verified in 2.2.0:**
+  - **`Huihui-Qwen3-Next-80B-A3B-Instruct-abliterated.i1-Q4_K_M` (`qwen3_next`, 46 GiB, 48 layers, 512 experts/layer = 24,576 experts):** fixed `qwen3_next` GGUF grouped SSM head order across all 36 GatedDeltaNet layers; boots in **4.82 s** with all 48 trunk layers resident and generates coherently in **5.38–5.93 GiB VRAM** (`2.61 / 2.50 tok/s`, `kv2_hit=182`, `8.96–14.53%` experts carved on demand).
+  - **`Qwythos-9B-v2-MTP-BF16` (`qwen3_5_text`, 17.14 GiB):** native resident Q1 MTP (`blk.32.nextn.*`) + two-stage SWAR `__dp4a` multi-row CUDA kernels accelerated greedy 256-token decode from `17.61 tok/s` to **`21.17 tok/s`** (MTP off) and **`33.70 tok/s`** (auto-MTP `max_drafts=3`, `75.7%` accept, 0 replays, bit-exact `256/256` match — **1.91×**).
+- **4 checkpoints unlocked in 2.1.0:** `10_gguf_MiniCPM3-4B-MLA-Q4_K_M` (62-layer MLA), `24_gguf_BitNet-b1.58-2B-TQ2_0`, `25_gguf_BitNet-b1.58-2B-i2_s` (native `I2_S` type 36), and `41_hf_Qwen2-VL-2B-Instruct-AWQ` (Qwen2 text backbone).
+- **5** expected `UnsupportedModelError` rejections (`gemma3n`, `rwkv7`, `xlstm`, `OpenELM`, `internlm2`), **1** legacy pickle `.bin`-only folder (`RWKV4-169m-bin`), and **1** empty 0-byte transfer folder (`14_gguf_granite-4.0-tiny-hybrid-IQ3_XXS`, previously verified passing in 2.0.0; `13_gguf_Falcon-H1-0.5B-Q4_K_M` was verified in 2.0.0).
+- Machine-readable 3-run census baseline: [benchmarks/model_support_2_1_0.json](benchmarks/model_support_2_1_0.json).
 
 | # | Checkpoint | Result | Arch (`model_type`) | Disk | Q1 / Placement | Decode R1/R2/R3 (tok/s) | KV2 Hit | Peak VRAM | Notes |
 | :-: | :--- | :---: | :--- | ---: | :---: | :---: | ---: | ---: | :--- |
@@ -54,7 +57,8 @@
 | 43 | `44_hf_internlm2_5-1_8b-chat` | failed | — | 3.52G | — | — | — | — | load: `UnsupportedModelError` (`auto_map` / `trust_remote_code=False`, safe fail) |
 | 44 | `45_hf_gpt-oss-20b-MXFP4` | passed | `gpt_oss` | 12.82G | `k=5` 24/24 +MoE | 1.0 / 1.0 / 0.9 | 127 | 3,772M | 20B packed MXFP4 MoE in 3.77 GiB VRAM (`kv2_hit=127`, native Harmony channels) |
 | 45 | `Qwen3.6-35B-A3B-uncensored-heretic-APEX-Balanced` | passed | `qwen3_5_moe_text` | 23.86G | `k=5` 40/40 +MoE | 2.2 / 2.4 / 3.3 | 32 | 5,404M | 35B 256-expert MoE in 5.40 GiB VRAM (**3.3 tok/s**, +73% vs 2.0.0), clean 3/3 |
-| 46 | `Qwythos-9B-v2-MTP-BF16` | passed | `qwen3_5_text` | 17.14G | `k=5` 32/32 | 15.4 / 18.9 / 17.0 | 62 | 5,861M | 9B BF16 fully resident at `k=5` (**18.9 tok/s**, `kv2_hit=62`, 5.86 GiB VRAM) |
+| 46 | `Qwythos-9B-v2-MTP-BF16` | passed | `qwen3_5_text` | 17.14G | `k=5` 32/32 | **21.2** OFF / **33.7** MTP | 62 | 5,861M | 9B BF16 fully resident at `k=5`; **33.70 tok/s** auto-MTP `d=3` (75.7% accept, 256/256 bit-exact) |
+| 47 | `Huihui-Qwen3-Next-80B-A3B-Instruct-abliterated.i1-Q4_K_M` | passed | `qwen3_next` | 46.00G | `k=5` 48/48 +MoE | **2.61 / 2.50** | 182 | 6,070M | **Newly verified in 2.2.0** — 80B 24,576-expert MoE in 5.38–5.93 GiB VRAM (4.82 s boot, fixed grouped SSM order) |
 
 ## Historical baselines
 

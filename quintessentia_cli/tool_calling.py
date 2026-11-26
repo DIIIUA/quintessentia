@@ -373,11 +373,25 @@ def render_incremental_turn_suffix(
     prev_ended_with_eos: bool = True,
 ) -> str | None:
     """Render ONLY the continuation suffix (e.g. `<tool_response>` or next `user` turn + generation prompt)
-    using the model's own `chat_template`, so parked multi-turn KV caches can be reused without
-    re-prefilling the entire conversation history (even when `<think>` from the prior turn was stripped).
+    using the model's own `chat_template` (or the plain `User:/Assistant:` fallback for base checkpoints
+    without a `chat_template`), so parked multi-turn KV caches and disk Token Ledgers can be reused
+    without re-tokenizing old turns or drifting across BPE whitespace boundaries.
     """
-    if not new_messages or not getattr(tokenizer, "chat_template", None):
+    if not new_messages:
         return None
+    if not getattr(tokenizer, "chat_template", None):
+        parts: list[str] = ["\n\n"]
+        for m in normalize_messages(new_messages, parse_tool_args_as_dict=False):
+            role = m["role"]
+            content = m.get("content", "")
+            if role == "tool":
+                parts.append(f"Tool ({m.get('name') or 'result'}): {content}\n\n")
+            elif role == "assistant":
+                parts.append(f"Assistant:{content}\n\n")
+            else:
+                parts.append(f"User: {content}\n\n")
+        parts.append("Assistant:")
+        return "".join(parts)
     marker_a = "__QUINT_INC_ASST_9c2b__"
     norm_new = normalize_messages(new_messages, parse_tool_args_as_dict=True)
     dummy = [
@@ -684,6 +698,7 @@ def _parse_qwen35_xml_inner(
     *,
     allowed_names: set[str] | None = None,
     param_schemas: dict[str, dict[str, Any]] | None = None,
+    allow_unknown: bool = False,
 ) -> list[tuple[str, dict[str, Any]]]:
     calls: list[tuple[str, dict[str, Any]]] = []
     for fm in _RE_QWEN35_FUNC.finditer(inner):
@@ -692,7 +707,7 @@ def _parse_qwen35_xml_inner(
             short = fname.rsplit(".", 1)[-1]
             if short in allowed_names:
                 fname = short
-            else:
+            elif not allow_unknown:
                 continue
         body = fm.group(2)
         f_schema = (param_schemas or {}).get(fname, {})
@@ -741,27 +756,38 @@ def parse_tool_calls(
     spans_to_remove: list[tuple[int, int]] = []
 
     # 1. Tagged blocks (<tool_call>, <toolcall>, <|tool_call|>...</|/tool_call|>, <|tool_call_start|>, <|START_ACTION|>, <|action_start|>)
+    # Note: Inside EXPLICIT tool-call markup tags, if the model hallucinates a slightly wrong tool name
+    # (e.g. `browser_agent_inspect_all` instead of `browser_agent_inspect`), we STILL emit it as a
+    # structured OpenAI tool_call so the client orchestrator can return a proper "unknown tool" error
+    # back to the model instead of leaking raw `<tool_call>` XML into user-visible prose and halting!
     for rx in _RE_TAGGED_CALL_BLOCKS:
         for m in rx.finditer(text):
             inner = m.group(1).strip()
             block_calls: list[tuple[str, dict[str, Any]]] = []
             if "<function=" in inner.lower():
                 block_calls = _parse_qwen35_xml_inner(
-                    inner, allowed_names=allowed_names, param_schemas=param_schemas
+                    inner, allowed_names=allowed_names, param_schemas=param_schemas, allow_unknown=True
                 )
             if not block_calls:
                 for obj in _extract_json_objects(inner):
                     block_calls.extend(_normalize_call_dict(obj, allowed_names=allowed_names))
+                if not block_calls and allowed_names:
+                    for obj in _extract_json_objects(inner):
+                        block_calls.extend(_normalize_call_dict(obj, allowed_names=None))
             if not block_calls:
                 block_calls = _parse_pythonic_calls(inner, allowed_names=allowed_names)
+                if not block_calls and allowed_names:
+                    block_calls = _parse_pythonic_calls(inner, allowed_names=None)
             if block_calls:
                 found.extend(block_calls)
                 spans_to_remove.append(m.span())
 
-    # 2. Standalone Qwen 3.5/3.6 <function=...> without outer <tool_call> wrapper
+    # 2. Standalone Qwen 3.5/3.6 <function=...> without outer <tool_call> wrapper (or with unclosed <tool_call>)
     if not found and "<function=" in text.lower():
         for fm in _RE_QWEN35_FUNC.finditer(text):
-            c = _parse_qwen35_xml_inner(fm.group(0), allowed_names=allowed_names, param_schemas=param_schemas)
+            c = _parse_qwen35_xml_inner(
+                fm.group(0), allowed_names=allowed_names, param_schemas=param_schemas, allow_unknown=True
+            )
             if c:
                 found.extend(c)
                 spans_to_remove.append(fm.span())
@@ -896,8 +922,9 @@ def parse_tool_calls(
         kept_parts.append(text[cursor:])
     clean_text = "".join(kept_parts).strip()
 
-    # Strip leftover Harmony final-channel framing if present
-    clean_text = re.sub(r"<\|channel\|>final\s*<\|message\|>", "", clean_text).strip()
+    # Strip leftover Harmony final-channel framing or dangling unclosed <tool_call> wrapper
+    clean_text = re.sub(r"<\|channel\|>final\s*<\|message\|>", "", clean_text)
+    clean_text = re.sub(r"</?tool_call>", "", clean_text, flags=re.IGNORECASE).strip()
     return clean_text, _build_openai_tool_calls(found)
 
 

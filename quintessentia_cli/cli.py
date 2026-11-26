@@ -29,6 +29,14 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+from quintessentia_cli.i18n import (
+    SUPPORTED_LANGS,
+    get_lang,
+    normalize_lang,
+    resolve_cli_lang,
+    set_lang,
+    tr,
+)
 from quintessentia_cli.lan_server import (
     DEFAULT_BEACON_PORT,
     DEFAULT_HTTP_PORT,
@@ -334,7 +342,7 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--speculation", choices=("auto", "off", "lookup", "native", "q1"), default="auto",
                    help="Shared streamed verification: native MTP head, prompt lookup, or Q1 2-plane self-speculation")
     p.add_argument("--mtp-head", type=str, default=None, help="Separate trained MTP safetensors for the selected model")
-    p.add_argument("--mtp-head-budget-mib", type=int, default=128)
+    p.add_argument("--mtp-head-budget-mib", type=int, default=512)
     p.add_argument("--region-pruning", action=argparse.BooleanOptionalAction, default=True,
                    help="Exclude proven zero-weight routed experts and cancel obsolete current-scope preparation")
     p.add_argument("--thought-anchor", action=argparse.BooleanOptionalAction, default=False,
@@ -346,7 +354,19 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto",
                    help="Runtime weights: auto selects pure Q1 cubes V4 (k=5) on CUDA or standard CPU path; explicit q1_cubes/q1/q2/q4/q6/q8/bf16")
     p.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None,
-                   help="Explicit prefix depth; auto V4 / q1_cubes defaults to 5 planes (root_bits=8), legacy q1 to 4")
+                   help="Explicit prefix depth k (1..16); auto V4 / q1_cubes defaults to auto-fit from 5 planes")
+    p.add_argument("--cube-root-bits", type=int, choices=(2, 4, 8, 16), default=None,
+                   help="Explicit Binary Halving Q1 tree root width (2, 4, 8, or 16; default: auto from k)")
+    p.add_argument("--lm-head-planes", type=int, choices=tuple(range(1, 17)), default=None,
+                   help="Explicit Q1 bit-plane depth for lm_head independently of trunk layers (1..16)")
+    p.add_argument("--min-q1-planes", type=int, choices=tuple(range(1, 17)), default=3,
+                   help="Lower bound for auto-fit Q1 depth step-down (default: 3)")
+    p.add_argument("--max-q1-planes", type=int, choices=tuple(range(1, 17)), default=8,
+                   help="Upper bound for auto-fit Q1 depth step-up (default: 8)")
+    p.add_argument("--auto-fit-q1", action=argparse.BooleanOptionalAction, default=None,
+                   help="Enable/disable automatic VRAM-based Q1 depth fitting (default: auto when --q1-planes is omitted)")
+    p.add_argument("--q1-kl-target", type=float, default=None,
+                   help="Auto-calibrate smallest Q1 k whose mean KL vs loaded max planes stays <= target (e.g. 0.05)")
     p.add_argument("--cube-blueprint", help="Method 1 JSON map selecting Method 2 cube prefixes per projection")
     p.add_argument("--q1-early-stop", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable dynamic Plane-0 vocabulary early-stop on Ideal Q1 LM head (default: on)")
@@ -372,7 +392,7 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Custom MoE cold-expert mirror rest tolerance (requires q1_cubes / V4; default: 0.24)",
     )
-    p.add_argument("--max-drafts", type=int, default=2, help="Max speculative draft depth (1..3, default: 2)")
+    p.add_argument("--max-drafts", type=int, default=3, help="Max speculative draft depth (1..3, default: 3)")
     p.add_argument(
         "--fast-vocab",
         action="store_true",
@@ -382,6 +402,24 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         "--hud",
         action="store_true",
         help="Open the live visual Quintessentia Desktop HUD window alongside CLI execution",
+    )
+    p.add_argument(
+        "--rssf",
+        choices=("on", "off"),
+        default="on",
+        help="Enable or disable the RSSF/EC/FDS dynamic balance operators for clean ablation (default: on)",
+    )
+    p.add_argument(
+        "--token-ledger",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Persist disk-backed Token Ledger (archive + active window) for deterministic retokenization (default: enabled)",
+    )
+    p.add_argument(
+        "--session-id",
+        type=str,
+        default="default",
+        help="Disk Token Ledger session identifier (default: default)",
     )
 
 
@@ -405,7 +443,7 @@ def _add_generation_args(p: argparse.ArgumentParser) -> None:
 def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
     from quintessentia_cli.unified_runtime import QuintessentiaUnifiedEngine
     if getattr(args, "hud", False):
-        launch_desktop_hud(quiet=True)
+        launch_desktop_hud(quiet=True, bind_to_console=True)
     model = args.model
     root = find_quintessentia_root(args.quintessentia_root)
     if getattr(args, "download_dir", None):
@@ -442,12 +480,29 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         q1_planes=getattr(args, "q1_planes", None),
         device=dev_arg,
     )
+    eff_q1_planes = v4_plan["q1_planes"]
+    eff_root_bits = int(v4_plan["cube_root_bits"])
+    user_root = getattr(args, "cube_root_bits", None)
+    if user_root is not None:
+        eff_root_bits = int(user_root)
+        if eff_q1_planes is not None and int(eff_q1_planes) > eff_root_bits:
+            eff_q1_planes = eff_root_bits
+    user_auto_fit = getattr(args, "auto_fit_q1", None)
+    eff_auto_fit = bool(v4_plan.get("auto_fit_q1_planes", False)) if user_auto_fit is None else bool(user_auto_fit)
+    kl_target = getattr(args, "q1_kl_target", None)
+    max_q1_p = int(getattr(args, "max_q1_planes", 8) or 8)
+    min_q1_p = int(getattr(args, "min_q1_planes", 3) or 3)
+    if kl_target is not None and v4_plan["weight_format"] == "q1_cubes" and getattr(args, "q1_planes", None) is None:
+        # Load at `max_q1_planes` (stepped down if needed by auto_fit) so KL calibration can pick minimal k!
+        eff_q1_planes = max_q1_p
+        eff_root_bits = max(eff_root_bits, 16 if max_q1_p > 8 else 8)
+        eff_auto_fit = True
     if v4_plan.get("auto_v4_selected") and v4_plan.get("reason") == "auto_large_moe_exceeds_vram":
         print(
             f"[Quintessentia Auto-V4] Large MoE ({v4_plan.get('num_experts')} experts, "
             f"{v4_plan.get('weight_gib')} GiB > 1.25x {v4_plan.get('free_vram_gib')} GiB free VRAM) "
             f"-> weight_format={v4_plan['weight_format']}, feedback_mode={v4_plan['feedback_mode']} (M0-M8), "
-            f"q1_planes={v4_plan['q1_planes']}, cube_root_bits={v4_plan['cube_root_bits']}",
+            f"q1_planes={eff_q1_planes}, cube_root_bits={eff_root_bits}",
             file=sys.stderr,
             flush=True,
         )
@@ -468,12 +523,12 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         device=getattr(args, "device", "auto"),
         speculation=getattr(args, "speculation", "auto"),
         mtp_head_path=getattr(args, "mtp_head", None),
-        mtp_head_budget_mib=getattr(args, "mtp_head_budget_mib", 128),
+        mtp_head_budget_mib=getattr(args, "mtp_head_budget_mib", 512),
         prune_regions=getattr(args, "region_pruning", True),
         thought_anchor=getattr(args, "thought_anchor", False),
         max_slot_mib=getattr(args, "max_slot_mib", None),
-        q1_planes=v4_plan["q1_planes"],
-        cube_root_bits=v4_plan["cube_root_bits"],
+        q1_planes=eff_q1_planes,
+        cube_root_bits=eff_root_bits,
         cube_blueprint=getattr(args, "cube_blueprint", None),
         q1_early_stop=getattr(args, "q1_early_stop", True),
         puzzle_overlay=getattr(args, "puzzle_overlay", False),
@@ -485,7 +540,14 @@ def _engine_from_args(args: argparse.Namespace) -> QuintessentiaUnifiedEngine:
         ),
         q1_imprint_puzzle=bool(v4_plan["q1_imprint_puzzle"]),
         q1_graphify_feedback=v4_plan["feedback_mode"],
-        auto_fit_q1_planes=bool(v4_plan.get("auto_fit_q1_planes", False)),
+        auto_fit_q1_planes=eff_auto_fit,
+        min_q1_planes=min_q1_p,
+        max_q1_planes=max_q1_p,
+        lm_head_planes=getattr(args, "lm_head_planes", None),
+        q1_kl_target=kl_target,
+        enable_rssf_balance=(str(getattr(args, "rssf", "on") or "on").strip().lower() != "off"),
+        enable_token_ledger=bool(getattr(args, "token_ledger", True)),
+        session_id=str(getattr(args, "session_id", "default") or "default"),
     )
 
 
@@ -622,7 +684,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             layout = f"{plan.resident_layers}/{plan.layers_total} resident + {plan.ring_slots}-slot ring"
         print(
             f"  VRAM plan ({plan.mode:6s}): total {plan.total_bytes / 2**30:.2f} GiB, free {plan.free_bytes / 2**30:.2f} GiB, "
-            f"reserve {plan.reserve_bytes / 2**30:.2f} GiB -> {layout}, MTP {'on' if plan.enable_mtp else 'off'}"
+            f"reserve {plan.reserve_bytes / 2**30:.2f} GiB -> {layout}, MTP {'on' if (plan.enable_mtp or profile.get('mtp_enabled')) else 'off'}"
         )
     elif "vram_plan_error" in report:
         print(f"  VRAM plan          : {report['vram_plan_error']}")
@@ -775,21 +837,21 @@ def _stream_to_console(
             if ev["type"] == "delta":
                 if ev["phase"] == "thinking":
                     if not in_think_printed:
-                        print("\n[Размышление <think>]\n", end="", flush=True)
+                        print(tr("\n[Thinking <think>]\n", "\n[Размышление <think>]\n"), end="", flush=True)
                         in_think_printed = True
                     print(ev["text"], end="", flush=True)
                 else:
                     if in_think_printed and not in_ans_printed:
-                        print("\n\n[/think -> Ответ]\n", end="", flush=True)
+                        print(tr("\n\n[/think -> Answer]\n", "\n\n[/think -> Ответ]\n"), end="", flush=True)
                     elif not in_ans_printed:
-                        print("\n[Ответ]\n", end="", flush=True)
+                        print(tr("\n[Answer]\n", "\n[Ответ]\n"), end="", flush=True)
                     in_ans_printed = True
                     print(ev["text"], end="", flush=True)
             elif ev["type"] == "done":
                 done_packet = ev
     except KeyboardInterrupt:
         gen.close()
-        print("\n\n[Остановлено]", flush=True)
+        print(tr("\n\n[Stopped]", "\n\n[Остановлено]"), flush=True)
         return {}
     finally:
         gen.close()
@@ -837,7 +899,13 @@ def cmd_ask(args: argparse.Namespace) -> int:
     else:
         prompt_text = " ".join(raw_parts).strip()
     if not prompt_text:
-        print("Error: please provide a prompt, e.g. `quint ask \"Привет!\"` or pipe via stdin (`-`)", file=sys.stderr)
+        print(
+            tr(
+                'Error: please provide a prompt, e.g. `quint ask "Hello!"` or pipe via stdin (`-`)',
+                'Ошибка: укажите запрос, например `quint ask "Привет!"` или передайте через stdin (`-`)',
+            ),
+            file=sys.stderr,
+        )
         return EXIT_USAGE
 
     thinking = not args.no_think
@@ -894,39 +962,144 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 eng.calibrate_hardware_limits(verbose=True)
         b_lbl = eng.profile.get("backend", "auto")
         wf_lbl = eng.profile.get("weight_format", "auto")
+        k_lbl = (
+            f" k={eng.q1_planes}/{getattr(eng, 'q1_planes_loaded', eng.q1_planes)} root={getattr(eng, 'cube_root_bits', 8)}"
+            if wf_lbl == "q1_cubes"
+            else ""
+        )
         print(
-            f"\n[Quintessentia Interactive Chat | mode={cur_mode} | {b_lbl} ({wf_lbl})] "
-            "Commands: `/reset`, `/think on|off`, `/mode default|custom`, `/balance`, `/hud`, `/status`, `/exit`. "
-            "Ctrl+C stops the current answer.\n",
+            tr(
+                "\n[Quintessentia Interactive Chat | mode={mode} | {backend} ({wf}{k})] "
+                "Commands: `/k <1..max>`, `/compact <summary>`, `/reset`, `/think on|off`, `/mode default|custom`, "
+                "`/lang en|ru`, `/balance`, `/hud`, `/status`, `/exit`. Ctrl+C stops the current answer.\n",
+                "\n[Quintessentia Интерактивный чат | режим={mode} | {backend} ({wf}{k})] "
+                "Команды: `/k <1..max>`, `/compact <сводка>`, `/reset`, `/think on|off`, `/mode default|custom`, "
+                "`/lang en|ru`, `/balance`, `/hud`, `/status`, `/exit`. Ctrl+C останавливает текущий ответ.\n",
+                mode=cur_mode,
+                backend=b_lbl,
+                wf=wf_lbl,
+                k=k_lbl,
+            ),
             flush=True,
         )
         while True:
             try:
-                user_in = input("\nВы > ").strip()
+                user_in = input(tr("\nYou > ", "\nВы > ")).strip()
             except (EOFError, KeyboardInterrupt):
-                print("\nВыход.", flush=True)
+                print(tr("\nExiting.", "\nВыход."), flush=True)
                 break
             if not user_in:
                 continue
             if user_in.lower() in ("/exit", "/quit", "exit", "quit"):
                 break
+            if user_in.lower().startswith("/lang"):
+                parts = user_in.split()
+                if len(parts) >= 2 and normalize_lang(parts[1]):
+                    new_l = set_lang(parts[1])
+                    print(
+                        tr(
+                            "[Language switched to English (en)]",
+                            "[Язык переключён на русский (ru)]",
+                            lang=new_l,
+                        ),
+                        flush=True,
+                    )
+                else:
+                    print(
+                        tr(
+                            "[Current language: {l}. Usage: /lang en|ru]",
+                            "[Текущий язык: {l}. Использование: /lang en|ru]",
+                            l=get_lang(),
+                        ),
+                        flush=True,
+                    )
+                continue
+            if user_in.lower().startswith("/k"):
+                parts = user_in.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    try:
+                        res_k = eng.set_active_q1_planes(int(parts[1]))
+                        print(
+                            tr(
+                                "[Active K switched in 0 ms: k={k}/{loaded}, root_bits={rb}, modules={mods}]",
+                                "[Активное K переключено за 0 мс: k={k}/{loaded}, root_bits={rb}, модулей={mods}]",
+                                k=res_k["q1_planes"],
+                                loaded=res_k["q1_planes_loaded"],
+                                rb=res_k["cube_root_bits"],
+                                mods=res_k["updated_modules"],
+                            ),
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(tr("[Failed to switch K: {e}]", "[Ошибка смены K: {e}]", e=exc), flush=True)
+                else:
+                    print(
+                        tr(
+                            "[Current K={k}/{loaded}, root_bits={rb}. Usage: /k <1..loaded>]",
+                            "[Текущее K={k}/{loaded}, root_bits={rb}. Использование: /k <1..loaded>]",
+                            k=getattr(eng, "q1_planes", "?"),
+                            loaded=getattr(eng, "q1_planes_loaded", "?"),
+                            rb=getattr(eng, "cube_root_bits", "?"),
+                        ),
+                        flush=True,
+                    )
+                continue
+            if user_in.lower().startswith("/compact"):
+                summary = user_in[len("/compact"):].strip()
+                if not summary:
+                    print(
+                        tr(
+                            "[Usage: /compact <brief summary of prior context>]",
+                            "[Использование: /compact <краткая сводка прошлого контекста>]",
+                        ),
+                        flush=True,
+                    )
+                else:
+                    rep = eng.compact_session(summary, keep_last_turns=1)
+                    messages = list(rep.get("compacted_messages") or [])
+                    print(
+                        tr(
+                            "[Epoch {old_e} -> {new_e} compacted: {old_t} -> {new_t} tokens; archive preserved in ledger.jsonl]",
+                            "[Эпоха {old_e} -> {new_e} сжата: {old_t} -> {new_t} токенов; архив сохранён в ledger.jsonl]",
+                            old_e=rep["closed_epoch"],
+                            new_e=rep["new_epoch"],
+                            old_t=rep["old_tokens"],
+                            new_t=rep["new_tokens"],
+                        ),
+                        flush=True,
+                    )
+                continue
             if user_in.lower() == "/reset":
                 eng.reset_session()
                 messages = [{"role": "system", "content": args.system}] if args.system else []
-                print("[Сессия и KV-кэш очищены]", flush=True)
+                print(tr("[Session and KV cache cleared]", "[Сессия и KV-кэш очищены]"), flush=True)
                 continue
             if user_in.lower().startswith("/think"):
                 parts = user_in.split()
                 thinking = (parts[1].lower() == "on") if len(parts) > 1 else (not thinking)
-                print(f"[Режим <think>: {'ON' if thinking else 'OFF'}]", flush=True)
+                print(
+                    tr(
+                        "[<think> mode: {st}]",
+                        "[Режим <think>: {st}]",
+                        st="ON" if thinking else "OFF",
+                    ),
+                    flush=True,
+                )
                 continue
             if user_in.lower().startswith("/mode"):
                 parts = user_in.split()
                 if len(parts) > 1 and parts[1].lower() in PROFILE_MODE_CHOICES:
                     cur_mode = parts[1].lower()
-                    print(f"[Режим профиля: {cur_mode}]", flush=True)
+                    print(tr("[Profile mode: {m}]", "[Режим профиля: {m}]", m=cur_mode), flush=True)
                 else:
-                    print(f"[Текущий режим: {cur_mode}. Использование: /mode default|custom]", flush=True)
+                    print(
+                        tr(
+                            "[Current mode: {m}. Usage: /mode default|custom]",
+                            "[Текущий режим: {m}. Использование: /mode default|custom]",
+                            m=cur_mode,
+                        ),
+                        flush=True,
+                    )
                 continue
             if user_in.lower() == "/balance":
                 lm = getattr(eng, "last_metrics", None) or {}
@@ -1126,11 +1299,144 @@ def stop_desktop_hud(*, quiet: bool = False) -> bool:
     return True
 
 
-def launch_desktop_hud(*, quiet: bool = False) -> bool:
-    """Launch (or focus if already running) the native Quintessentia Live HUD window.
+def open_url_in_browser(url: str) -> bool:
+    """Open a URL in the host default browser (native Windows or WSL2 -> Windows host)."""
+    import shutil
+    import subprocess
+    import webbrowser
 
-    Works both natively on Windows and transparently from WSL 2 Linux via host `powershell.exe`
-    (staging onto local Windows `%USERPROFILE%\\.quintessentia\\hud` to avoid UNC zone blocks).
+    if os.name == "nt":
+        try:
+            return bool(webbrowser.open(url))
+        except Exception:
+            return False
+    cmd_exe = shutil.which("cmd.exe")
+    if cmd_exe:
+        try:
+            subprocess.Popen(
+                [cmd_exe, "/c", "start", "", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception:
+            return False
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
+
+
+def _all_hud_cache_dirs() -> list[Path]:
+    """Return every known HUD cache directory (both `.quintessentia/hud_cache` and `Desktop/Quintessentia HUD/.cache`)."""
+    dirs: list[Path] = []
+    if os.name == "nt":
+        roots = [Path.home()]
+    else:
+        wp = _resolve_win_userprofile_from_wsl()
+        roots = [wp] if wp is not None else []
+    for base in roots:
+        dirs.append(base / ".quintessentia" / "hud_cache")
+        dirs.append(base / "Desktop" / "Quintessentia HUD" / ".cache")
+    return dirs
+
+
+_HUD_HEARTBEAT_LOCK = None
+_HUD_HEARTBEAT_STOP = None
+_HUD_HEARTBEAT_THREAD = None
+_HUD_BOUND_TO_CONSOLE = False
+
+
+def _touch_hud_owner_flags(cache_dirs: list[Path]) -> None:
+    import time
+    payload = f"{os.getpid()}:{time.time():.3f}"
+    for cd in cache_dirs:
+        if cd.is_dir():
+            try:
+                (cd / "console_owner_alive.flag").write_text(payload, encoding="ascii")
+            except OSError:
+                pass
+
+
+def stop_hud_console_heartbeat(*, signal_stop: bool = False) -> None:
+    """Stop console-bound HUD heartbeat and optionally signal the HUD to close immediately."""
+    global _HUD_HEARTBEAT_STOP, _HUD_HEARTBEAT_THREAD, _HUD_BOUND_TO_CONSOLE
+    was_bound = _HUD_BOUND_TO_CONSOLE
+    _HUD_BOUND_TO_CONSOLE = False
+    ev = _HUD_HEARTBEAT_STOP
+    if ev is not None:
+        ev.set()
+    _HUD_HEARTBEAT_STOP = None
+    _HUD_HEARTBEAT_THREAD = None
+    cache_dirs = _all_hud_cache_dirs()
+    for cd in cache_dirs:
+        if cd.is_dir():
+            try:
+                of = cd / "console_owner_alive.flag"
+                if of.is_file():
+                    of.unlink()
+            except OSError:
+                pass
+            if signal_stop and was_bound:
+                try:
+                    (cd / "stop_hud.flag").write_text("1", encoding="ascii")
+                except OSError:
+                    pass
+
+
+def start_hud_console_heartbeat() -> None:
+    """Bind the Desktop HUD lifetime to the current console process.
+
+    Updates `console_owner_alive.flag` every 0.8s and registers atexit + SIGHUP/SIGTERM
+    handlers so closing the console (via Q, Ctrl+C, or window [X]) closes the HUD cleanly.
+    """
+    global _HUD_HEARTBEAT_LOCK, _HUD_HEARTBEAT_STOP, _HUD_HEARTBEAT_THREAD, _HUD_BOUND_TO_CONSOLE
+    import atexit
+    import signal
+    import threading
+
+    if _HUD_HEARTBEAT_LOCK is None:
+        _HUD_HEARTBEAT_LOCK = threading.Lock()
+    with _HUD_HEARTBEAT_LOCK:
+        cache_dirs = _all_hud_cache_dirs()
+        _HUD_BOUND_TO_CONSOLE = True
+        _touch_hud_owner_flags(cache_dirs)
+        if _HUD_HEARTBEAT_THREAD is not None and _HUD_HEARTBEAT_THREAD.is_alive():
+            return
+        stop_ev = threading.Event()
+        _HUD_HEARTBEAT_STOP = stop_ev
+
+        def _beat() -> None:
+            while not stop_ev.wait(0.8):
+                _touch_hud_owner_flags(cache_dirs)
+
+        t = threading.Thread(target=_beat, name="quint-hud-owner-heartbeat", daemon=True)
+        _HUD_HEARTBEAT_THREAD = t
+        t.start()
+
+        atexit.register(stop_hud_console_heartbeat, signal_stop=True)
+
+        def _on_term(signum, frame):
+            stop_hud_console_heartbeat(signal_stop=True)
+            raise SystemExit(0)
+
+        for sig_name in ("SIGHUP", "SIGTERM"):
+            sig = getattr(signal, sig_name, None)
+            if sig is not None:
+                try:
+                    signal.signal(sig, _on_term)
+                except Exception:
+                    pass
+
+
+def launch_desktop_hud(*, quiet: bool = False, bind_to_console: bool = False) -> bool:
+    """Launch (or wake/focus if already running) the native Quintessentia Live HUD window.
+
+    Works both natively on Windows and transparently from WSL 2 Linux via Windows host.
+    Resolves the Desktop HUD vs `.quintessentia/hud` single-instance mutex cache mismatch
+    by clearing stale `stop_hud.flag` and writing `show_window.flag` across all cache dirs.
+    When `bind_to_console=True`, closing this console automatically closes the HUD as well.
     """
     import shutil
     import subprocess
@@ -1141,11 +1447,35 @@ def launch_desktop_hud(*, quiet: bool = False) -> bool:
             print(f"[Quintessentia HUD] Script not found: {hud_script}", file=sys.stderr)
         return False
 
+    # 1. Clear stale stop flags and signal any already-running HUD (regardless of which folder launched it)
+    cache_dirs = _all_hud_cache_dirs()
+    for cd in cache_dirs:
+        if cd.is_dir():
+            try:
+                sf = cd / "stop_hud.flag"
+                if sf.is_file():
+                    sf.unlink()
+            except OSError:
+                pass
+            try:
+                (cd / "show_window.flag").write_text("1", encoding="ascii")
+            except OSError:
+                pass
+    if bind_to_console:
+        start_hud_console_heartbeat()
+
     if os.name == "nt":
+        desk_dir = Path.home() / "Desktop" / "Quintessentia HUD"
+        target_script = hud_script
+        if desk_dir.is_dir():
+            try:
+                target_script = _sync_hud_bundle_to(desk_dir, include_launchers=False)
+            except Exception:
+                target_script = desk_dir / "quintessentia_hud.ps1"
         ps_exe = shutil.which("powershell.exe") or r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         cmd = [
             ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
-            "-WindowStyle", "Hidden", "-File", str(hud_script),
+            "-WindowStyle", "Hidden", "-File", str(target_script),
         ]
         try:
             subprocess.Popen(
@@ -1162,26 +1492,58 @@ def launch_desktop_hud(*, quiet: bool = False) -> bool:
                 print(f"[Quintessentia HUD] Failed to start: {exc}", file=sys.stderr)
             return False
 
-    # WSL 2 Linux -> stage onto native Windows profile path so PowerShell avoids UNC zone warnings
+    # WSL 2 Linux -> prefer installed Desktop HUD folder (or stage into `%USERPROFILE%\.quintessentia\hud`)
+    wscript_exe = shutil.which("wscript.exe")
     ps_exe = shutil.which("powershell.exe")
+    cmd_exe = shutil.which("cmd.exe")
     wslpath = shutil.which("wslpath")
-    if ps_exe and wslpath:
+    if wslpath and (wscript_exe or ps_exe):
         try:
             win_prof = _resolve_win_userprofile_from_wsl()
+            target_dir = None
             if win_prof is not None:
-                staged = _sync_hud_bundle_to(win_prof / ".quintessentia" / "hud", include_launchers=False)
+                desk_dir = win_prof / "Desktop" / "Quintessentia HUD"
+                if desk_dir.is_dir():
+                    target_dir = desk_dir
+                    staged = _sync_hud_bundle_to(desk_dir, include_launchers=False)
+                else:
+                    target_dir = win_prof / ".quintessentia" / "hud"
+                    staged = _sync_hud_bundle_to(target_dir, include_launchers=False)
                 win_script = subprocess.check_output([wslpath, "-w", str(staged)], text=True).strip()
             else:
                 win_script = subprocess.check_output([wslpath, "-w", str(hud_script)], text=True).strip()
-            subprocess.Popen(
-                [
-                    ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
-                    "-WindowStyle", "Hidden", "-File", win_script,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+
+            # Prefer `wscript.exe launch.vbs` if present (100% detached Windows GUI process, zero console flash)
+            vbs_path = (target_dir / "launch.vbs") if target_dir is not None else None
+            if wscript_exe and vbs_path is not None and vbs_path.is_file():
+                win_vbs = subprocess.check_output([wslpath, "-w", str(vbs_path)], text=True).strip()
+                subprocess.Popen(
+                    [wscript_exe, win_vbs],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            elif cmd_exe and ps_exe:
+                subprocess.Popen(
+                    [
+                        cmd_exe, "/c", "start", "", "/B",
+                        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
+                        "-WindowStyle", "Hidden", "-File", win_script,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            else:
+                subprocess.Popen(
+                    [
+                        ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
+                        "-WindowStyle", "Hidden", "-File", win_script,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
             if not quiet:
                 print("[Quintessentia HUD] Live visual HUD opened on Windows host.", flush=True)
             return True
@@ -1319,41 +1681,114 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
-    print(f"[Quintessentia] Scanning LAN via UDP port {args.beacon_port} ({args.timeout:.1f}s)...", flush=True)
+    print(
+        tr(
+            "[Quintessentia] Scanning LAN via UDP port {port} ({t:.1f}s)...",
+            "[Quintessentia] Сканирование LAN по UDP-порту {port} ({t:.1f} с)...",
+            port=args.beacon_port,
+            t=args.timeout,
+        ),
+        flush=True,
+    )
     nodes = discover_lan_servers(timeout_s=args.timeout, beacon_port=args.beacon_port)
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(nodes, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if not nodes:
-        print("No active Quintessentia LAN servers responded on this subnet.", flush=True)
+        print(
+            tr(
+                "No active Quintessentia LAN servers responded on this subnet.",
+                "В этой подсети не обнаружено активных LAN-серверов Quintessentia.",
+            ),
+            flush=True,
+        )
         return EXIT_RUNTIME
 
-    print(f"Found {len(nodes)} active Quintessentia node(s) on the LAN:")
+    print(
+        tr(
+            "Found {n} active Quintessentia node(s) on the LAN:",
+            "Найдено активных узлов Quintessentia в LAN: {n}",
+            n=len(nodes),
+        )
+    )
     for n in nodes:
         print(format_connection_passport(n))
     return EXIT_OK
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _add_lang_arg(p: argparse.ArgumentParser, *, lang: str, is_root: bool = False) -> None:
+    p.add_argument(
+        "--lang",
+        "--language",
+        dest="lang",
+        choices=SUPPORTED_LANGS,
+        default=None if is_root else argparse.SUPPRESS,
+        help=tr(
+            "Interface language: en (English) or ru (Russian)",
+            "Язык интерфейса: en (английский) или ru (русский)",
+            lang=lang,
+        ),
+    )
+
+
+def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     from . import __version__
+
+    L = normalize_lang(lang) if lang is not None else get_lang()
     parser = argparse.ArgumentParser(
         prog="quintessentia",
-        description="Quintessentia: Q1-cubes V4 / Q4 / Q6 / BF16 CUDA & CPU streaming inference engine and LAN OpenAI-compatible server",
+        description=tr(
+            "Quintessentia: Q1-cubes V4 / Q4 / Q6 / BF16 CUDA & CPU streaming inference engine and LAN OpenAI-compatible server",
+            "Quintessentia: движок локального инференса (Q1-кубы V4 / Q4 / Q6 / BF16, CUDA и CPU) и OpenAI-совместимый LAN-сервер",
+            lang=L,
+        ),
     )
     parser.add_argument("--version", action="version", version=f"Quintessentia {__version__}")
+    _add_lang_arg(parser, lang=L, is_root=True)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_models = sub.add_parser("models", help="List local model files; select by number, folder name or path")
+    p_models = sub.add_parser(
+        "models",
+        help=tr(
+            "List local model files; select by number, folder name or path",
+            "Список локальных моделей; выбор по номеру, имени папки или пути",
+            lang=L,
+        ),
+    )
+    _add_lang_arg(p_models, lang=L)
     p_models.add_argument("--quintessentia-root", dest="quintessentia_root", default=None)
     p_models.add_argument("--json", action="store_true")
-    p_models.add_argument("--check", action="store_true", help="Check adaptation metadata; does not run generation")
+    p_models.add_argument(
+        "--check",
+        action="store_true",
+        help=tr(
+            "Check adaptation metadata; does not run generation",
+            "Проверить метаданные адаптации без запуска генерации",
+            lang=L,
+        ),
+    )
     p_models.set_defaults(func=cmd_models)
 
-    for command, callback in (("download",cmd_download),("prepare",cmd_prepare)):
-        p_model = sub.add_parser(command, help=("Download a Hugging Face model into a directory and verify automatic adaptation"
-                                               if command == "download" else "Verify a model's first forward and automatic runtime adaptation"))
+    for command, callback in (("download", cmd_download), ("prepare", cmd_prepare)):
+        p_model = sub.add_parser(
+            command,
+            help=(
+                tr(
+                    "Download a Hugging Face model into a directory and verify automatic adaptation",
+                    "Скачать модель с Hugging Face в папку и проверить автоматическую адаптацию",
+                    lang=L,
+                )
+                if command == "download"
+                else tr(
+                    "Verify a model's first forward and automatic runtime adaptation",
+                    "Проверить первый проход модели и автоматическую адаптацию движка",
+                    lang=L,
+                )
+            ),
+        )
+        _add_lang_arg(p_model, lang=L)
         p_model.add_argument("--quintessentia-root", dest="quintessentia_root", default=None)
-        p_model.add_argument("--device", choices=("auto","cpu"), default="auto")
+        p_model.add_argument("--device", choices=("auto", "cpu"), default="auto")
         p_model.add_argument("--weight-format", choices=WEIGHT_FORMAT_CHOICES, default="auto")
         p_model.add_argument("--feedback-mode", choices=FEEDBACK_MODE_CHOICES, default="auto")
         p_model.add_argument("--q1-planes", type=int, choices=tuple(range(1, 17)), default=None)
@@ -1361,16 +1796,47 @@ def build_parser() -> argparse.ArgumentParser:
         p_model.add_argument("--vram-mode", choices=list(VRAM_MODES), default="normal")
         p_model.add_argument("--json-out", default=None)
         if command == "download":
-            p_model.add_argument("reference", help="owner/repo, Hugging Face model page or GGUF file URL")
+            p_model.add_argument(
+                "reference",
+                help=tr(
+                    "owner/repo, Hugging Face model page or GGUF file URL",
+                    "owner/repo, страница модели Hugging Face или прямая ссылка на GGUF",
+                    lang=L,
+                ),
+            )
             p_model.add_argument("--directory", "--output-dir", dest="directory", default=None)
-            p_model.add_argument("--file", default=None, help="One GGUF variant; split parts are fetched together")
+            p_model.add_argument(
+                "--file",
+                default=None,
+                help=tr(
+                    "One GGUF variant; split parts are fetched together",
+                    "Конкретный вариант GGUF; части split-GGUF скачиваются вместе",
+                    lang=L,
+                ),
+            )
             p_model.add_argument("--revision", default=None)
-            p_model.add_argument("--no-verify", action="store_true", help="Download without the first-forward preparation check")
+            p_model.add_argument(
+                "--no-verify",
+                action="store_true",
+                help=tr(
+                    "Download without the first-forward preparation check",
+                    "Скачать без проверки первого прохода",
+                    lang=L,
+                ),
+            )
         else:
             p_model.add_argument("--model", default=None)
         p_model.set_defaults(func=callback)
 
-    p_doc = sub.add_parser("doctor", help="Check GPU, VRAM plan, model files, and LAN interfaces")
+    p_doc = sub.add_parser(
+        "doctor",
+        help=tr(
+            "Check GPU, VRAM plan, model files, and LAN interfaces",
+            "Проверить GPU, план VRAM, файлы модели, MTP и сетевые интерфейсы",
+            lang=L,
+        ),
+    )
+    _add_lang_arg(p_doc, lang=L)
     p_doc.add_argument("--model", "--model-dir", dest="model", type=str, default=None)
     p_doc.add_argument("--quintessentia-root", dest="quintessentia_root", type=str, default=None)
     p_doc.add_argument("--download-dir", default=None)
@@ -1384,79 +1850,180 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--json-out", type=str, default=None)
     p_doc.set_defaults(func=cmd_doctor)
 
-    p_ask = sub.add_parser("ask", help="Stream a single prompt (`<think>...</think>` -> `<|im_end|>`)")
+    p_ask = sub.add_parser(
+        "ask",
+        help=tr(
+            "Stream a single prompt (`<think>...</think>` -> answer)",
+            "Одноразовый потоковый запрос (`<think>...</think>` -> ответ)",
+            lang=L,
+        ),
+    )
+    _add_lang_arg(p_ask, lang=L)
     _add_engine_args(p_ask)
     _add_generation_args(p_ask)
-    p_ask.add_argument("--json-out", type=str, default=None, help="Save full response + telemetry JSON")
-    p_ask.add_argument("prompt", nargs="*", help="Prompt text (or `-` / piped stdin)")
+    p_ask.add_argument("--json-out", type=str, default=None, help=tr("Save full response + telemetry JSON", "Сохранить ответ и телеметрию в JSON", lang=L))
+    p_ask.add_argument("prompt", nargs="*", help=tr("Prompt text (or `-` / piped stdin)", "Текст запроса (или `-` / stdin)", lang=L))
     p_ask.set_defaults(func=cmd_ask)
 
-    p_bench = sub.add_parser("bench", help="Run a multi-run model stability & speed benchmark with balance telemetry")
+    p_bench = sub.add_parser(
+        "bench",
+        help=tr(
+            "Run a multi-run model stability & speed benchmark with balance telemetry",
+            "Прогнать многоходовой бенчмарк скорости, стабильности, KV и баланса",
+            lang=L,
+        ),
+    )
+    _add_lang_arg(p_bench, lang=L)
     _add_engine_args(p_bench)
-    p_bench.add_argument("--runs", type=int, default=3, help="Number of benchmark runs (default: 3, run 2 tests KV reuse)")
-    p_bench.add_argument("--max-tokens", type=int, default=64, help="Max new tokens per run (default: 64)")
-    p_bench.add_argument("--no-think", action="store_true", help="Disable `<think>` reasoning block")
-    p_bench.add_argument("--json-out", type=str, default=None, help="Save benchmark JSON report")
+    p_bench.add_argument("--runs", type=int, default=3, help=tr("Number of benchmark runs (default: 3, run 2 tests KV reuse)", "Число прогонов (по умолчанию 3; 2-й проверяет KV-префикс)", lang=L))
+    p_bench.add_argument("--max-tokens", type=int, default=64, help=tr("Max new tokens per run (default: 64)", "Максимум новых токенов за прогон (по умолчанию 64)", lang=L))
+    p_bench.add_argument("--no-think", action="store_true", help=tr("Disable `<think>` reasoning block", "Отключить блок рассуждений `<think>`", lang=L))
+    p_bench.add_argument("--json-out", type=str, default=None, help=tr("Save benchmark JSON report", "Сохранить отчёт бенчмарка в JSON", lang=L))
     p_bench.set_defaults(func=cmd_bench)
 
-    p_chat = sub.add_parser("chat", help="Interactive terminal chat with `kv_prefix` reuse & RAM parking")
+    p_chat = sub.add_parser(
+        "chat",
+        help=tr(
+            "Interactive terminal chat with KV-prefix reuse, Token Ledger & live /k switching",
+            "Интерактивный чат в терминале с KV-префиксом, Token Ledger и живым переключением /k",
+            lang=L,
+        ),
+    )
+    _add_lang_arg(p_chat, lang=L)
     _add_engine_args(p_chat)
     _add_generation_args(p_chat)
     p_chat.set_defaults(func=cmd_chat)
 
-    p_srv = sub.add_parser("serve", help="Start LAN HTTP/SSE server + UDP LAN self-broadcaster")
-    _add_engine_args(p_srv)
-    p_srv.add_argument("--host", type=str, default="0.0.0.0", help="Bind address (default: 0.0.0.0 for LAN)")
-    p_srv.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT, help=f"HTTP/SSE port (default: {DEFAULT_HTTP_PORT})")
-    p_srv.add_argument(
-        "--beacon-port", type=int, default=DEFAULT_BEACON_PORT, help=f"UDP LAN beacon port (default: {DEFAULT_BEACON_PORT})"
+    p_srv = sub.add_parser(
+        "serve",
+        help=tr(
+            "Start LAN HTTP/SSE server + built-in Web UI + UDP LAN self-broadcaster",
+            "Запустить LAN HTTP/SSE сервер + встроенный Web UI + UDP-маяк обнаружения",
+            lang=L,
+        ),
     )
-    p_srv.add_argument("--api-key", type=str, default=None, help="API key shown in the Connection Passport")
-    p_srv.add_argument("--require-auth", action="store_true", help="Enforce `Authorization: Bearer <api-key>`")
-    p_srv.add_argument("--no-beacon", action="store_true", help="Disable UDP LAN broadcast beacon")
+    _add_lang_arg(p_srv, lang=L)
+    _add_engine_args(p_srv)
+    p_srv.add_argument("--host", type=str, default="0.0.0.0", help=tr("Bind address (default: 0.0.0.0 for LAN)", "Адрес привязки (по умолчанию 0.0.0.0 для LAN)", lang=L))
+    p_srv.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT, help=tr(f"HTTP/SSE port (default: {DEFAULT_HTTP_PORT})", f"Порт HTTP/SSE (по умолчанию {DEFAULT_HTTP_PORT})", lang=L))
+    p_srv.add_argument(
+        "--beacon-port", type=int, default=DEFAULT_BEACON_PORT, help=tr(f"UDP LAN beacon port (default: {DEFAULT_BEACON_PORT})", f"Порт UDP-маяка LAN (по умолчанию {DEFAULT_BEACON_PORT})", lang=L)
+    )
+    p_srv.add_argument("--api-key", type=str, default=None, help=tr("API key shown in the Connection Passport", "API-ключ, отображаемый в паспорте подключения", lang=L))
+    p_srv.add_argument("--require-auth", action="store_true", help=tr("Enforce `Authorization: Bearer <api-key>`", "Требовать `Authorization: Bearer <api-key>`", lang=L))
+    p_srv.add_argument("--no-beacon", action="store_true", help=tr("Disable UDP LAN broadcast beacon", "Отключить UDP-рассылку обнаружения в LAN", lang=L))
     p_srv.add_argument(
         "--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES,
-        help=f"Reject larger request bodies with 413 (default: {DEFAULT_MAX_REQUEST_BYTES} = 8 MiB)",
+        help=tr(f"Reject larger request bodies with 413 (default: {DEFAULT_MAX_REQUEST_BYTES})", f"Отклонять тела запросов крупнее лимита с 413 (по умолчанию {DEFAULT_MAX_REQUEST_BYTES})", lang=L),
     )
-    p_srv.add_argument("--log-file", type=str, default=None, help=f"Server log path (default: <root>/{DEFAULT_LOG_FILE})")
-    p_srv.add_argument("--no-log-file", action="store_true", help="Do not write a server log file")
+    p_srv.add_argument("--log-file", type=str, default=None, help=tr(f"Server log path (default: <root>/{DEFAULT_LOG_FILE})", f"Путь к логу сервера (по умолчанию <root>/{DEFAULT_LOG_FILE})", lang=L))
+    p_srv.add_argument("--no-log-file", action="store_true", help=tr("Do not write a server log file", "Не записывать файл лога сервера", lang=L))
     p_srv.add_argument(
         "--no-preempt", action="store_true",
-        help="Queue concurrent requests instead of cancelling the running generation",
+        help=tr("Queue concurrent requests instead of cancelling the running generation", "Ставить параллельные запросы в очередь вместо отмены текущей генерации", lang=L),
     )
     p_srv.set_defaults(func=cmd_serve)
 
-    p_disc = sub.add_parser("discover", help="Discover Quintessentia servers broadcasting on the LAN")
+    p_disc = sub.add_parser(
+        "discover",
+        help=tr(
+            "Discover Quintessentia servers broadcasting on the LAN",
+            "Найти серверы Quintessentia в локальной сети",
+            lang=L,
+        ),
+    )
+    _add_lang_arg(p_disc, lang=L)
     p_disc.add_argument("--beacon-port", type=int, default=DEFAULT_BEACON_PORT)
-    p_disc.add_argument("--timeout", type=float, default=2.0, help="Scan duration in seconds (default: 2.0)")
+    p_disc.add_argument("--timeout", type=float, default=2.0, help=tr("Scan duration in seconds (default: 2.0)", "Длительность сканирования в секундах (по умолчанию 2.0)", lang=L))
     p_disc.add_argument("--json-out", type=str, default=None)
     p_disc.set_defaults(func=cmd_discover)
 
-    p_hud = sub.add_parser("hud", help="Open, inspect, stop, or install the native Quintessentia Live HUD widget")
-    p_hud.add_argument("--stop", action="store_true", help="Stop any running HUD window and collector")
-    p_hud.add_argument("--status", action="store_true", help="Print live telemetry & HUD status JSON")
-    p_hud.add_argument("--install-desktop", action="store_true", help="Install/update the Windows Desktop HUD launcher folder")
+    p_hud = sub.add_parser(
+        "hud",
+        help=tr(
+            "Open, inspect, stop, or install the native Quintessentia Live HUD widget",
+            "Открыть, проверить, остановить или установить виджет Quintessentia Live HUD",
+            lang=L,
+        ),
+    )
+    _add_lang_arg(p_hud, lang=L)
+    p_hud.add_argument("--stop", action="store_true", help=tr("Stop any running HUD window and collector", "Остановить запущенное окно HUD и сборщик телеметрии", lang=L))
+    p_hud.add_argument("--status", action="store_true", help=tr("Print live telemetry & HUD status JSON", "Вывести JSON со статусом HUD и живой телеметрией", lang=L))
+    p_hud.add_argument("--install-desktop", action="store_true", help=tr("Install/update the Windows Desktop HUD launcher folder", "Установить/обновить папку запуска HUD на рабочем столе Windows", lang=L))
     p_hud.set_defaults(func=cmd_hud)
+
+    p_menu = sub.add_parser(
+        "menu",
+        aliases=["ui", "tui"],
+        help=tr(
+            "Interactive button-driven terminal menu (arrow keys, EN/RU switcher, model picker, Q1 K, auto-KL, chat/server)",
+            "Интерактивное кнопочное меню в терминале (стрелки, EN/RU, выбор модели, Q1 K, auto-KL, чат/сервер)",
+            lang=L,
+        ),
+    )
+    _add_lang_arg(p_menu, lang=L)
+    p_menu.add_argument("--quintessentia-root", dest="quintessentia_root", type=str, default=None)
+    p_menu.set_defaults(func=cmd_menu)
 
     return parser
 
 
+def cmd_menu(args: argparse.Namespace) -> int:
+    from .tui import run_tui
+    return int(
+        run_tui(
+            quintessentia_root=getattr(args, "quintessentia_root", None),
+            lang=getattr(args, "lang", None),
+        )
+    )
+
+
+def _is_bare_lang_only_argv(raw_argv: list[str]) -> str | None:
+    """Return normalized lang if `raw_argv` contains ONLY `--lang <val>` (e.g. `quint --lang ru`)."""
+    if len(raw_argv) == 1:
+        for pref in ("--lang=", "--language="):
+            if raw_argv[0].startswith(pref):
+                return normalize_lang(raw_argv[0][len(pref):])
+    elif len(raw_argv) == 2 and raw_argv[0] in ("--lang", "--language"):
+        return normalize_lang(raw_argv[1])
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:]) if argv is None else list(argv)
+    try:
+        cfg_path = find_quintessentia_root(None) / "cli_config.json"
+    except Exception:
+        cfg_path = None
+    active_lang = resolve_cli_lang(raw_argv, config_path=cfg_path)
+    set_lang(active_lang)
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        if not raw_argv:
+            from .tui import run_tui
+            return int(run_tui())
+        bare_lang = _is_bare_lang_only_argv(raw_argv)
+        if bare_lang is not None:
+            from .tui import run_tui
+            return int(run_tui(lang=bare_lang))
+
+    parser = build_parser(lang=active_lang)
+    args = parser.parse_args(raw_argv)
+    if getattr(args, "lang", None):
+        set_lang(args.lang)
     try:
         return int(args.func(args))
     except (ModelNotFoundError, UnsupportedModelError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(tr("Error: {e}", "Ошибка: {e}", e=exc), file=sys.stderr)
         return EXIT_MODEL
     except GenerationCancelled:
-        print("\n[Остановлено]", file=sys.stderr)
+        print(tr("\n[Stopped]", "\n[Остановлено]"), file=sys.stderr)
         return EXIT_OK
     except KeyboardInterrupt:
-        print("\n[Прервано]", file=sys.stderr)
+        print(tr("\n[Interrupted]", "\n[Прервано]"), file=sys.stderr)
         return EXIT_RUNTIME
     except (RuntimeError, ValueError, OSError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(tr("Error: {e}", "Ошибка: {e}", e=exc), file=sys.stderr)
         return EXIT_RUNTIME
 
 

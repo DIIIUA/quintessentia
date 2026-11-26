@@ -187,7 +187,9 @@ class MirrorSpeculationScale:
         if best_k <= 0:
             return 0
 
-        # Canonical L4 evaluation between immutable past (P0, P1), Strategy_t, and proposed wing (P2, P3)
+        # Canonical L4 evaluation between immutable past (P0, P1), Strategy_t, and proposed wing (P2, P3).
+        # Note: redundant M7 observe_speculation_step_balance branch removed after audit (L4 SPLIT
+        # already triggers at logp_gap > ln(2) ~= 0.69, strictly tighter than SCALE_BREAK at gap ~= 2.5-3).
         mean_p = sum(float(p) for p in probs[:best_k]) / float(best_k)
         p2_next = (float(best_k) / float(self.max_drafts), 2.0 * mean_p - 1.0)
         p3_next = (expected_acc / float(self.max_drafts), 2.0 * cum_p - 1.0)
@@ -197,18 +199,6 @@ class MirrorSpeculationScale:
         self._last_tau_core = tau_core
         self._last_tau_wing = tau_wing
         self._last_delta_res = delta_res
-
-        # Solver-free 8-pair force balance on the speculative token scale (I = draft confidence & acceptance archive)
-        spec_bal = observe_speculation_step_balance(
-            depth_ratio=float(best_k) / float(self.max_drafts),
-            mean_prob=mean_p,
-            accept_ema=self._accept_ema,
-            logp_gap=self.last_logp_gap,
-        )
-        self._last_balance = spec_bal
-        if spec_bal.regime == "SCALE_BREAK":
-            self.balance_scale_breaks += 1
-            return 1
 
         if self._last_state == "SPLIT" or state == "SPLIT":
             return 1
@@ -247,12 +237,6 @@ class MirrorSpeculationScale:
                 logp_gap = max(0.0, float((flat_lg[ver_tok] - flat_lg[draft_tok]).item()))
         self.last_logp_gap = logp_gap
         self._accept_ema = 0.7 * self._accept_ema + 0.3 * accept_ratio
-        self._last_balance = observe_speculation_step_balance(
-            depth_ratio=depth_ratio,
-            mean_prob=max(0.05, accept_ratio),
-            accept_ema=self._accept_ema,
-            logp_gap=logp_gap,
-        )
 
         # Capture reversible (x_draft, y_draft) tensor scar instead of discarding rejected compute
         if rejected and reject_hidden is not None and reject_out is not None:
@@ -492,7 +476,7 @@ class Q1SkeletonDrafter:
 
 
 class GeneralSpeculation:
-    def __init__(self, runtime, mode="auto", head_path=None, head_budget_bytes=128*2**20, *, mirror_mode: bool = False):
+    def __init__(self, runtime, mode="auto", head_path=None, head_budget_bytes=512*2**20, *, mirror_mode: bool = False):
         from src.quintessentia_integrated import _NORM_WEIGHT_CANDIDATES
         self.runtime, self.mode = runtime, mode
         self.mirror_mode = bool(mirror_mode)
@@ -505,7 +489,17 @@ class GeneralSpeculation:
         self.native_error = None
         self.q1_drafter = Q1SkeletonDrafter(runtime, active_planes=2) if mode in ("auto", "q1") else None
         self.counters = Counter()
-        self.state_budget_bytes = 64*2**20
+        # Scale state snapshot budget dynamically with available VRAM (minimum 64 MiB, up to 512 MiB on CUDA
+        # so 24-layer Qwen3.5 GatedDeltaNet recurrent states ~50 MiB can verify depth=2..3 drafts cleanly).
+        state_budget = 64 * 2**20
+        eng_dev = getattr(runtime.engine, "device", None)
+        if eng_dev is not None and torch.device(eng_dev).type == "cuda" and torch.cuda.is_available():
+            try:
+                free_b, _ = torch.cuda.mem_get_info(eng_dev)
+                state_budget = max(64 * 2**20, min(512 * 2**20, int(free_b // 6)))
+            except Exception:
+                pass
+        self.state_budget_bytes = state_budget
         self.snapshot_peak_bytes = 0
         self.hidden = None
         self.capturing = False
@@ -733,6 +727,19 @@ class GeneralSpeculation:
                     check("decode")
                     past = self._boundary(past)
                     remaining = max_new_tokens-generated
+                    fast_snap_mgr = getattr(eng, "_q1_snap_mgr", None)
+                    use_fast_batched = bool(
+                        fast_snap_mgr is not None
+                        and getattr(getattr(u, "plan", None), "full_residency", False)
+                        and past is not None
+                        and hasattr(past, "layers")
+                        and len(past.layers) > max(fast_snap_mgr.linear_layers, default=-1)
+                        and all(
+                            past.get_conv_state(li, state_idx=0) is not None
+                            and past.get_recurrent_state(li, state_idx=0) is not None
+                            for li in fast_snap_mgr.linear_layers
+                        )
+                    )
                     # Recurrent anchor mixing changes state after each token;
                     # stochastic sampling also runs plain 1-token steps to preserve exact distribution.
                     depth = (
@@ -743,12 +750,14 @@ class GeneralSpeculation:
                         )
                         else min(u.max_drafts, remaining-1)
                     )
+                    if use_fast_batched and depth:
+                        depth = min(depth, int(fast_snap_mgr.max_slots))
                     if depth and not self.rowwise.supported:
                         depth = 0
                         self.counters["decoder_contract_plain_steps"] += 1
                     # Guard state_budget BEFORE proposing Q1 skeleton drafts so long contexts
                     # never clone a multi-hundred-MiB KV cache only to discard the draft right after.
-                    if depth:
+                    if depth and not use_fast_batched:
                         needed_pre = self._snapshot_bytes(past)
                         contour_pre = getattr(u, "stanok_contour", None)
                         while depth and (
@@ -772,7 +781,7 @@ class GeneralSpeculation:
                         depth = min(len(drafts), gate.pick_depth(gate_src, probs)) if drafts else 0
                     drafts, probs = drafts[:depth], probs[:depth]
                     snapshot = None
-                    if depth:
+                    if depth and not use_fast_batched:
                         try:
                             needed = self._snapshot_bytes(past)
                             contour = getattr(u, "stanok_contour", None)
@@ -798,9 +807,15 @@ class GeneralSpeculation:
                     t_forward = time.perf_counter()
                     # Tentative rows must not rewrite task maps or move a layer
                     # between devices before a rejection can restore its cache.
-                    with self._verification() if depth else nullcontext(), self.rowwise.execution(past, len(inputs)):
+                    row_ctx = nullcontext() if (use_fast_batched and depth) else self.rowwise.execution(past, len(inputs))
+                    if use_fast_batched and depth:
+                        fast_snap_mgr.begin_capture()
+                    try:
+                      with self._verification() if depth else nullcontext(), row_ctx:
                         self.rowwise.position = cursor
                         logits, past, hidden = self._run(inputs, past, cursor, all_logits=True, prefetch=remaining > 1)
+                        if use_fast_batched and depth:
+                            fast_snap_mgr.end_capture()
                         route_trace = routes.finish_capture() if routes is not None and depth else None
                         rows, emitted, accepted, hit_eos = [], [], 0, False
                         for j in range(len(inputs)):
@@ -840,7 +855,9 @@ class GeneralSpeculation:
                                 )
                                 # Rejected forward already seeded fresh (x_last, y_last) anchors in Q1 trunk layers
                                 self.mirror_spec.q1_anchors_retained += 1
-                            if not self._crop_append_only(past, cursor+keep):
+                            if use_fast_batched and depth and fast_snap_mgr.rollback_to_accepted(past, keep - 1, len(inputs) - 1):
+                                self.counters["row_state_restores"] += 1
+                            elif not self._crop_append_only(past, cursor+keep):
                                 if self.rowwise.restore(past, keep):
                                     self.counters["row_state_restores"] += 1
                                 else:
@@ -858,6 +875,9 @@ class GeneralSpeculation:
                                 drafts=drafts,
                                 verified_token=emitted[-1],
                             )
+                    finally:
+                        if use_fast_batched:
+                            fast_snap_mgr.end_capture()
                     if routes is not None and depth:
                         routes.commit_capture(route_trace, keep)
                     gate.record_forward(len(inputs), time.perf_counter()-t_forward)

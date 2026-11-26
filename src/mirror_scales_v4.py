@@ -74,9 +74,9 @@ from src.rssf_dynamic_operators import (
     RSSFCollapseDetector,
     StrategyCollapseReport,
     VolterraFDSMonitor,
+    is_rssf_balance_enabled,
     observe_hardware_load_balance,
     observe_post_prefill_region_balance,
-    observe_q1_cube_balance,
     observe_region_breathing_balance,
     observe_warmup_fds_balance,
 )
@@ -493,15 +493,19 @@ class MirrorLoadDispatcher:
             self.max_observed_mem_util = mem_u
 
         reserve = self.safety_reserve_bytes
-        ec_diag = self._ec_fds.update(free_bytes=free_b, total_bytes=total_b, reserve_bytes=reserve)
-        collapse = self._collapse_det.evaluate(free_bytes=free_b, total_bytes=total_b, ec_fds=ec_diag)
-        self.last_fds_t_end_steps = (
-            ec_diag.fds_t_end_steps if math.isfinite(ec_diag.fds_t_end_steps) else None
-        )
-        self.last_volterra_archive = ec_diag.volterra_archive
-        self.last_collapse = collapse
-        if collapse.any_collapse:
-            self.collapse_events += 1
+        rssf_on = is_rssf_balance_enabled()
+        ec_diag = None
+        collapse = None
+        if rssf_on:
+            ec_diag = self._ec_fds.update(free_bytes=free_b, total_bytes=total_b, reserve_bytes=reserve)
+            collapse = self._collapse_det.evaluate(free_bytes=free_b, total_bytes=total_b, ec_fds=ec_diag)
+            self.last_fds_t_end_steps = (
+                ec_diag.fds_t_end_steps if math.isfinite(ec_diag.fds_t_end_steps) else None
+            )
+            self.last_volterra_archive = ec_diag.volterra_archive
+            self.last_collapse = collapse
+            if collapse.any_collapse:
+                self.collapse_events += 1
 
         # 1. Hard physical wall contact -> SHED_PROTECT (0 OOM, 0 WDDM spill)
         if free_b < reserve:
@@ -546,40 +550,48 @@ class MirrorLoadDispatcher:
 
         delta_free_drop = max(0, prev_free - free_b)
         projected_free_next = free_b - delta_free_drop
-        proj_headroom = ec_diag.projected_headroom_ec
         load_rise = max(0.0, load_frac - prev_load)
         proj_calm = calm_frac - load_rise
 
-        # Direct solver-free 8-pair force balance observation (~4 us, 0 iterations)
-        bal8 = observe_hardware_load_balance(
-            used_frac=used_frac,
-            headroom_frac=headroom_frac,
-            load_frac=load_frac,
-            calm_frac=calm_frac,
-            drop_frac=delta_free_drop / float(usable_span),
-            load_rise=load_rise,
-            sustained_drain=ec_diag.sustained_drain_rate,
-        )
-        self.last_balance = bal8
+        if rssf_on and ec_diag is not None and collapse is not None:
+            proj_headroom = ec_diag.projected_headroom_ec
+            bal8 = observe_hardware_load_balance(
+                used_frac=used_frac,
+                headroom_frac=headroom_frac,
+                load_frac=load_frac,
+                calm_frac=calm_frac,
+                drop_frac=delta_free_drop / float(usable_span),
+                load_rise=load_rise,
+                sustained_drain=ec_diag.sustained_drain_rate,
+            )
+            self.last_balance = bal8
+            ec_fds_drift_breach = (self.evaluations >= 3) and collapse.unbounded_result_drift
+            scale_break = bal8.regime == "SCALE_BREAK"
+            sustained_drain_cur = ec_diag.sustained_drain_rate
+        else:
+            proj_headroom = (projected_free_next - reserve) / usable_span
+            bal8 = None
+            self.last_balance = None
+            ec_fds_drift_breach = False
+            scale_break = False
+            sustained_drain_cur = 0.0
 
         # Feed EC/FDS horizon, 8-force scale break, and physical wall projection INTO the future wing P2
         # so canonical 2D L4 itself evaluates the true coupled trajectory (an idle bus cannot stay "calm"
         # when VRAM is projected to breach reserve or enter sustained FDS/Term-3 scale break).
         physical_pred_breach = (not is_first_step) and (projected_free_next <= reserve)
-        ec_fds_drift_breach = (self.evaluations >= 3) and collapse.unbounded_result_drift
-        scale_break = bal8.regime == "SCALE_BREAK"
 
         p2_h = proj_headroom
         p2_c = proj_calm
         if physical_pred_breach:
             p2_h = min(p2_h, (projected_free_next - reserve) / usable_span, -1e-3)
             p2_c = min(p2_c, p2_h)
-        if ec_fds_drift_breach:
+        if ec_fds_drift_breach and ec_diag is not None:
             fds_pull = -max(1e-3, headroom_frac * (4.0 / max(0.1, ec_diag.fds_t_end_steps) - 1.0) + 1e-3)
             p2_h = min(p2_h, fds_pull)
             p2_c = min(p2_c, p2_h)
             self.ec_fds_damp_steps += 1
-        if scale_break:
+        if scale_break and bal8 is not None:
             p2_h = min(p2_h, bal8.d3_margin - 1e-3)
             p2_c = min(p2_c, p2_h)
             self.balance_scale_break_steps += 1
@@ -598,7 +610,7 @@ class MirrorLoadDispatcher:
                 and not ec_fds_drift_breach
                 and not scale_break
                 and headroom_frac >= 0.45
-                and ec_diag.sustained_drain_rate < 0.005
+                and sustained_drain_cur < 0.005
             ):
                 joint_state = "TENSION"
             else:
@@ -993,26 +1005,28 @@ class MirrorRegionBreathingPool:
         reg_frac = reg.gpu_bytes / max(1, self.max_pool_bytes)
         warm_count = sum(1 for r in self._regions.values() if r.state == "WARM")
 
-        ec_m2 = self._volterra_fds.update(
-            free_bytes=max(0, self.max_pool_bytes - self._live_bytes),
-            total_bytes=self.max_pool_bytes,
-            reserve_bytes=max(1, int(self.max_pool_bytes * 0.15)),
-        )
-        rssf_m2 = observe_region_breathing_balance(
-            occ_frac=occ_frac,
-            reuse_rate=reuse_rate,
-            reg_frac=reg_frac,
-            sustained_drain=ec_m2.sustained_drain_rate,
-            warm_fill_frac=float(warm_count) / float(max(1, self.max_warm_regions)),
-        )
-        self._last_rssf_balance = rssf_m2
-
         proj_free = (free_frac - reg_frac) if occ_frac <= 0.5 else -2.0 * (occ_frac - 0.5)
-        if rssf_m2.regime == "SCALE_BREAK":
-            self.rssf_scale_breaks += 1
-            proj_free = min(proj_free, -max(0.25, occ_frac))
-        elif ec_m2.sustained_drain_rate >= 0.015 and ec_m2.fds_t_end_steps <= 3.0:
-            proj_free = min(proj_free, -max(0.15, ec_m2.sustained_drain_rate * 4.0))
+        if is_rssf_balance_enabled():
+            ec_m2 = self._volterra_fds.update(
+                free_bytes=max(0, self.max_pool_bytes - self._live_bytes),
+                total_bytes=self.max_pool_bytes,
+                reserve_bytes=max(1, int(self.max_pool_bytes * 0.15)),
+            )
+            rssf_m2 = observe_region_breathing_balance(
+                occ_frac=occ_frac,
+                reuse_rate=reuse_rate,
+                reg_frac=reg_frac,
+                sustained_drain=ec_m2.sustained_drain_rate,
+                warm_fill_frac=float(warm_count) / float(max(1, self.max_warm_regions)),
+            )
+            self._last_rssf_balance = rssf_m2
+            if rssf_m2.regime == "SCALE_BREAK":
+                self.rssf_scale_breaks += 1
+                proj_free = min(proj_free, -max(0.25, occ_frac))
+            elif ec_m2.sustained_drain_rate >= 0.015 and ec_m2.fds_t_end_steps <= 3.0:
+                proj_free = min(proj_free, -max(0.15, ec_m2.sustained_drain_rate * 4.0))
+        else:
+            self._last_rssf_balance = None
 
         out_prev = (0.0, 0.0) if self._step_clock <= 1 else (reuse_prev, prev_free_frac)
         obs_prev = (reuse_obs, free_frac)
@@ -1173,18 +1187,19 @@ class MirrorColdWarmupScale:
         p_norm = self._prev_ms / scale_ref
         c_norm = dt / scale_ref
         ratio = dt / max(self._prev_ms, 1e-4)
-        # EC Volterra latency drift + FDS power + 8-pair balance confirmation
-        inst_rel = (dt - self._prev_ms) / scale_ref
-        self._ema_ms = dt if self._ema_ms is None else (0.65 * self._ema_ms + 0.35 * dt)
-        self._volterra_latency_drift = 0.75 * self._volterra_latency_drift + inst_rel
-        fds_power = abs(inst_rel) * (1.0 + 0.25 / max(0.05, done_frac))
-        rssf_m3 = observe_warmup_fds_balance(
-            step_ms=dt,
-            ema_ms=self._ema_ms,
-            prev_ms=self._prev_ms,
-            done_frac=done_frac,
-            fds_power=fds_power,
-        )
+        rssf_m3 = None
+        if is_rssf_balance_enabled():
+            inst_rel = (dt - self._prev_ms) / scale_ref
+            self._ema_ms = dt if self._ema_ms is None else (0.65 * self._ema_ms + 0.35 * dt)
+            self._volterra_latency_drift = 0.75 * self._volterra_latency_drift + inst_rel
+            fds_power = abs(inst_rel) * (1.0 + 0.25 / max(0.05, done_frac))
+            rssf_m3 = observe_warmup_fds_balance(
+                step_ms=dt,
+                ema_ms=self._ema_ms,
+                prev_ms=self._prev_ms,
+                done_frac=done_frac,
+                fds_power=fds_power,
+            )
         self._last_rssf_balance = rssf_m3
 
         # Signed speed delta along natural 1/2 mirror scale: sharp drop (<0.5x or >1.5x) pushes into TENSION/SPLIT; plateau -> EQUAL
@@ -1197,14 +1212,15 @@ class MirrorColdWarmupScale:
         self._prev_ms = dt
         self.last_mirror_state = bal.state
 
-        if rssf_m3.regime == "SCALE_BREAK":
+        if rssf_m3 is not None and rssf_m3.regime == "SCALE_BREAK":
             self.rssf_scale_breaks += 1
             self._plateau_streak = 0
         elif bal.state == "EQUAL":
             self._plateau_streak += 1
-            sustained_rel_drift = 0.25 * self._volterra_latency_drift
-            if rssf_m3.d3_margin > 0.0 and abs(sustained_rel_drift) <= 0.20:
-                self.fds_equilibrium_confirmations += 1
+            if rssf_m3 is not None:
+                sustained_rel_drift = 0.25 * self._volterra_latency_drift
+                if rssf_m3.d3_margin > 0.0 and abs(sustained_rel_drift) <= 0.20:
+                    self.fds_equilibrium_confirmations += 1
         else:
             self._plateau_streak = 0
 
@@ -1422,18 +1438,23 @@ class MirrorPostPrefillRegionWarmupScale:
             self._prev_cov[li] = cur_cov
             self._prev_scar[li] = cur_scar
 
-        rssf_m4 = observe_post_prefill_region_balance(
-            cur_cov=cur_cov,
-            cur_scar=cur_scar,
-            hit_rate=(self._prev_hit_rate[li] if 0 <= li < self.num_layers else 0.5),
-            miss_streak=(self._miss_streak[li] if 0 <= li < self.num_layers else 0),
-            scar_ratio=float(len(self._scar_weights[li])) / float(max(1, self.max_region_experts)),
-        )
+        rssf_m4 = None
+        if is_rssf_balance_enabled():
+            rssf_m4 = observe_post_prefill_region_balance(
+                cur_cov=cur_cov,
+                cur_scar=cur_scar,
+                hit_rate=(self._prev_hit_rate[li] if 0 <= li < self.num_layers else 0.5),
+                miss_streak=(self._miss_streak[li] if 0 <= li < self.num_layers else 0),
+                scar_ratio=float(len(self._scar_weights[li])) / float(max(1, self.max_region_experts)),
+            )
+            if rssf_m4.regime == "SCALE_BREAK":
+                self.rssf_scale_breaks += 1
         self._last_rssf_balance = rssf_m4
-        if rssf_m4.regime == "SCALE_BREAK":
-            self.rssf_scale_breaks += 1
 
-        if scar_eids and (bal.state in ("TENSION", "SPLIT") or rssf_m4.regime == "SCALE_BREAK"):
+        if scar_eids and (
+            bal.state in ("TENSION", "SPLIT")
+            or (rssf_m4 is not None and rssf_m4.regime == "SCALE_BREAK")
+        ):
             sc_map = self._scar_weights[li]
             sh_map = self._scar_hits[li]
             for k in list(sc_map.keys()):
@@ -1479,7 +1500,7 @@ class MirrorPostPrefillRegionWarmupScale:
             cold_cands = [e for e in ordered_cands if not is_physically_resident_fn(target_l, e)]
             if cold_cands:
                 w_cap = self._width[target_l] if 0 <= target_l < self.num_layers else 1
-                if rssf_m4.regime == "SCALE_BREAK":
+                if rssf_m4 is not None and rssf_m4.regime == "SCALE_BREAK":
                     w_cap = 1
                 chosen = tuple(cold_cands[:w_cap])
                 self.plans_emitted += 1
@@ -1652,13 +1673,13 @@ def _reattach_q1_scar(
 
 
 def mirror_cube_depth_math(p_body: float, p_tail: float, min_k: int, max_k: int) -> int:
-    """Pure-math M5b cube depth from bracketless center-read probability balance + 8-pair Q1 cube balance.
+    """Pure-math M5b cube depth from bracketless center-read probability balance.
 
+    (Dead M5b `observe_q1_cube_balance` branch removed after audit: 0/100k SCALE_BREAK reachability.)
     Given past body density `p_body in [0, 1]` and future tail density `p_tail in [0, 1]`:
         s = 0.5 * (p_body + p_tail)
         d = |p_body - p_tail| / (p_body + p_tail + 1e-8)
         rho = min(1.0, max(s, p_tail) * (1.0 + 0.5 * d * I[p_tail > p_body]))
-        + observe_q1_cube_balance(...): protects plane depth under SCALE_BREAK impulse.
         k = clamp(floor(min_k + rho * (max_k - min_k) + 0.5), min_k, max_k)
     """
     pb = max(0.0, min(1.0, float(p_body)))
@@ -1667,15 +1688,6 @@ def mirror_cube_depth_math(p_body: float, p_tail: float, min_k: int, max_k: int)
     d = abs(pb - pt) / (pb + pt + 1e-8)
     growth_boost = (1.0 + 0.5 * d) if pt > pb else 1.0
     rho = min(1.0, max(s, pt) * growth_boost)
-    q1_bal = observe_q1_cube_balance(
-        info_density=max(0.02, max(pb, pt)),
-        weight_mass_frac=max(0.05, s),
-        input_impulse=max(0.02, pt + (0.5 * d if pt > pb else 0.0)),
-        residual_entropy=max(0.05, 1.0 - max(pb, pt)),
-        output_coherence=max(0.10, 1.0 - 0.5 * abs(pb - pt)),
-    )
-    if q1_bal.regime == "SCALE_BREAK":
-        rho = min(1.0, max(rho, 0.75 + 0.25 * q1_bal.info_efficiency))
     k = int(math.floor(min_k + rho * max(0, max_k - min_k) + 0.5))
     return max(int(min_k), min(int(max_k), k))
 
